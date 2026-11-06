@@ -643,7 +643,7 @@ static void QueueRelease(const std::string &release,const std::string &name,cons
             for(int i=0;i<count;++i)
             {
                 const cJSON *c=cJSON_GetArrayItem(components,i);ids.push_back(Text(c,"component_id"));kinds.push_back(Text(c,"kind"));names.push_back(Text(c,"name"));
-                selected[i]=kinds[i]=="god"||kinds[i]=="xbla";
+                selected[i]=digital?(kinds[i]=="dlc"||kinds[i]=="xbla"):(kinds[i]=="god"||kinds[i]=="xbla");
             }
             for(;;)
             {

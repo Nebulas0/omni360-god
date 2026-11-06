@@ -144,6 +144,39 @@ def test_prepared_manifest_hashes_range_and_immutable_snapshot(setup):
     assert client.get(path, headers=h2).status_code == 410
 
 
+def test_legacy_completed_job_resolves_identity_without_catalog_title_id(setup):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    release, _ = seed_game(s)
+    with s.connect() as c:
+        c.execute("UPDATE catalog_items SET title_id=NULL")
+    resolved = client.get(PREFIX + "/releases/" + release, headers=h).json
+    assert resolved["title_id"] == "415607E1"
+    assert resolved["metadata_status"] == "known"
+    assert resolved["components"][0]["kind"] == "god"
+    assert prepare(client, s, h, release)["state"] == "ready"
+
+
+def test_digital_release_contains_only_its_own_dlc_without_redownloading_base_game(setup):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    _, god = seed_game(s)
+    dlc = god.parent.parent / "00000002" / "one-addon"
+    raw = bytearray(write_tu(dlc))
+    raw[0x344:0x348] = (2).to_bytes(4, "big")
+    raw[0x32C:0x340] = hashlib.sha1(raw[0x344:0xB000]).digest()
+    dlc.write_bytes(raw)
+    db = s.database
+    db.upsert_catalog("digital", [{"name": "One DLC.zip", "source_path": "roms/dlc.zip", "size": 1}])
+    job = db.enqueue_items([2])[0]
+    with s.connect() as c:
+        c.execute("UPDATE catalog_items SET status='complete' WHERE id=2")
+        c.execute("UPDATE jobs SET status='complete',artifact_paths=? WHERE id=?", (json.dumps([str(dlc)]), job["job_id"]))
+    resolved = client.get(PREFIX + "/releases/catalog-2", headers=h).json
+    assert resolved["title_id"] == "415607E1"
+    assert [c["kind"] for c in resolved["components"]] == ["dlc"]
+
+
 def test_idempotency_and_private_requests(setup):
     app, client, s = setup
     h, _ = pair(app, client, s)

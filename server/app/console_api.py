@@ -191,17 +191,66 @@ class ConsoleService:
             raise ConsoleError("NOT_FOUND", "Release not found", 404)
         return item
 
+    def title_ids(self, item):
+        """Resolve legacy jobs whose catalog title_id was never populated.
+
+        Use actual package headers and saved validation reports, never names.
+        One source archive may legitimately contain more than one title.
+        """
+        if "_title_ids" in item:
+            return item["_title_ids"]
+        result = set()
+        if re.fullmatch(r"[0-9A-Fa-f]{8}", item.get("title_id") or ""):
+            result.add(item["title_id"].upper())
+        if item.get("id"):
+            with self.connect() as c:
+                row = c.execute("SELECT artifact_paths,checks_json,output_path FROM jobs WHERE item_id=? AND status='complete' ORDER BY id DESC LIMIT 1", (item["id"],)).fetchone()
+            if row:
+                produced = set()
+                for name in Database.decode_output_paths(row["artifact_paths"]):
+                    path = Path(name)
+                    if not path.is_file() or path.is_symlink() or not path.resolve().is_relative_to(self.config.output_dir.resolve()):
+                        continue
+                    info = parse_stfs_header(path)
+                    if info and info.title_id != "00000000":
+                        result.add(info.title_id)
+                        produced.add(str(path.resolve()))
+                item["_produced_paths"] = produced
+                report = Database.decode_report(row["checks_json"]) or {}
+                if not report:
+                    for archive in Database.decode_output_paths(row["output_path"]):
+                        report = self.database.get_bundle_report(archive) or {}
+                        if report:
+                            break
+                for title in report.get("titles", []):
+                    tid = title.get("title_id", "")
+                    if re.fullmatch(r"[0-9A-Fa-f]{8}", tid):
+                        result.add(tid.upper())
+        item["_title_ids"] = sorted(result)
+        return item["_title_ids"]
+
     def summary(self, item):
+        ids = self.title_ids(item)
         return {"release_id": f"catalog-{item['id']}", "name": item["name"],
                 "kind": "game" if item["source_kind"] == "disc" else "digital",
-                "title_id": item.get("title_id"), "source_bytes": str(item["remote_size"]),
+                "title_id": ids[0] if len(ids) == 1 else None, "title_ids": ids,
+                "source_bytes": str(item["remote_size"]),
                 "availability": "prepared" if item["status"] == "complete" else item["status"],
-                "metadata_status": "known" if item.get("title_id") else "unknown"}
+                "metadata_status": "known" if ids else "unknown"}
 
     def components(self, item):
-        if not item.get("title_id"):
-            return []
-        title = self.database.get_title(item["title_id"])
+        result = []
+        for title_id in self.title_ids(item):
+            result.extend(self.components_for_title(title_id))
+        if item.get("source_kind") == "digital":
+            # A DLC source must not silently offer its entire base game or
+            # unrelated add-ons merely because they share a Title ID.
+            produced = item.get("_produced_paths", set())
+            result = [c for c in result if str(c["_path"].resolve()) in produced]
+        return result
+
+    def components_for_title(self, title_id):
+        title = self.database.get_title(title_id)
         if not title:
             return []
         root = Path(title["output_dir"]).resolve()
@@ -214,7 +263,7 @@ class ConsoleService:
                 if not p.is_file() or p.is_symlink() or p.name.endswith((".bak", ".partial", ".previous")):
                     continue
                 info = parse_stfs_header(p)
-                if info is None or info.title_id != item["title_id"]:
+                if info is None or info.title_id != title_id:
                     continue
                 kinds = {CONTENT_GOD: "god", CONTENT_ARCADE: "xbla", CONTENT_DLC: "dlc", CONTENT_TITLE_UPDATE: "title_update"}
                 if info.content_type not in kinds:
@@ -223,7 +272,7 @@ class ConsoleService:
                     continue
                 with p.open("rb") as f:
                     head = f.read(0x368)
-                result.append({"component_id": digest(str(p.relative_to(root)))[:32],
+                result.append({"component_id": digest(title_id + "/" + str(p.relative_to(root)))[:32],
                                "kind": kinds[info.content_type], "name": info.display_name or p.name,
                                "title_id": info.title_id, "media_id": info.media_id,
                                "content_type": info.content_folder, "content_id": head[0x32C:0x340].hex().upper(),
@@ -365,6 +414,15 @@ class ConsoleService:
             raise ConsoleError("CONVERSION_FAILED", "Server processing failed; inspect the job in Foundry", 409)
         self.update(row["id"], state="preparing", message="Copying and checking an immutable installation")
         components = self.components(item)
+        if not components and not payload["component_ids"] and job.get("reprocess_of") is None:
+            # Older browser jobs may be marked complete after their loose
+            # output was cleaned up. An explicit install can rebuild once.
+            result = self.database.enqueue_items([item["id"]],
+                {item["id"]: Database.decode_output_paths(job.get("target_title_ids"))},
+                reprocess_of=job["id"], options={"unlock_packages": payload["unlock_packages"]})[0]
+            self.update(row["id"], state="waiting", job_id=result["job_id"], message="Rebuilding missing prepared files from the original source")
+            self.runner.wake()
+            return
         selected = set(payload["component_ids"])
         if selected - {c["component_id"] for c in components}:
             raise ConsoleError("COMPONENT_CHANGED", "Selected components changed; refresh the release", 409)
