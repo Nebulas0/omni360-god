@@ -1,0 +1,8181 @@
+/*
+FILE : main.cpp
+PROJECT : Omni360
+DESCRIPTION : entry point. Flow: mount drives -> scan installed games (STFS,
+              local, no network) -> icon-list picker -> archive.org IAS3 key
+              auth (cached after first run) -> look up + download DLC for the
+              chosen game -> write into the matching Content folder.
+
+Rewritten from X-Store's original main.cpp, which drove a typed Vimm's Lair
+search + full-game/ISO download flow - none of that is reused here since this
+fork's whole point is browsing your own installed library instead of typing
+a search query. CheckGameMounted() is the one piece kept close to verbatim,
+since drive mounting has nothing to do with Vimm specifically.
+
+The full pipeline below (STFS library scan -> picker -> IAS3 auth ->
+archive.org lookup -> RAR member walk -> download into Content) is proven
+end-to-end on real hardware against a real 27-game library.
+*/
+
+#include "OutputConsole.h"
+#include "AtgConsole.h"
+#include "AtgUtil.h"
+#include "driveMount.h"
+#include "settings.h"
+#include "Keyboard.h"
+#include "StfsParser.h"
+#include "FolderGames.h"
+#include "Launch.h"
+#include "LibraryCache.h"
+#include "Recents.h"
+#include "UiSound.h"
+#include "Featured.h"
+#include "SpeedTest.h"
+#include "GameListUI.h"
+#include "DownloadQueue.h"
+#include "SearchWorker.h"
+#include "CoverArt.h"
+#include "StoreArt.h"
+#include "StoreCatalog.h"
+#include "DiscWorker.h"
+#include "GameInstaller.h"
+#include "Foundry.h"
+#include "UpdateCheck.h"
+#include "ArchiveOrgDLC.h"
+#include "downloadFile.h" // DownloadProgressFn + FormatBytes, for the progress callback
+#include "GodConvert.h"
+#include "DiscSource.h"
+#include "ReadAhead.h"
+#include "TitleNames.h"
+#define HOMEBREW_CATALOG_DATA
+#include "HomebrewCatalog.h"
+#include "dns.h"         // StartNetwork, LogNetworkStatus
+#include "ImageDecode.h" // ImageTimerMs, for the startup timing lines
+
+// Kernel exports with no XDK header.
+extern "C" BOOL XexCheckExecutablePrivilege(DWORD privilege);
+extern "C" NTSTATUS XexGetModuleHandle(PSZ moduleName, PHANDLE outHandle);
+
+#include <xtl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h> // fabsf, for the featured tiles
+#include <string>
+
+#define SETTINGS_FILE "game:\\settings.txt"
+#define SETTINGS_TEMP_FILE "game:\\settings.tmp"
+#define GAMES_PATH_KEY "games-path: "
+#define UPDATE_CHECK_KEY "check-updates: " // "off" stops the check at start
+#define SOUNDS_KEY "nav-sounds: "         // "off" silences the interface
+#define DISC_SPEED_KEY "disc-speed: "       // 1 to 4, DiscWorker's spindle speed for installs
+#define STORE_FILTER_KEY "store-filter: "   // the Store letters' filters and order: "sort=a-z;regions=usa,eur;..."
+#define HOMEBREW_MIRROR_KEY "homebrew-mirror: " // for testing: homebrew from "http://PC:8000", a folder of the repo's .7z files
+#define CREDENTIALS_FILE "game:\\ArchiveOrgKeys.txt"
+#define CONTENT_PATH_KEY "xbla-path: "   // X-Store's name for it, kept so an old settings.txt still works
+#define CONTENT_BASE_SUFFIX "\\Content\\0000000000000000" // the layout the dashboard and Aurora read content from
+#define CONTENT_BASE_PATH_DEFAULT "Hdd1:" CONTENT_BASE_SUFFIX
+#define GAMES_PATH_DEFAULT CONTENT_BASE_PATH_DEFAULT // where the dashboard itself keeps installed games
+#define MAX_INSTALLED_GAMES 256
+
+// (There is deliberately no auto-select threshold here any more - see the
+// comment above the pickers.)
+
+// ---------------------------------------------------------------------------
+// Drive mounting - kept close to X-Store's original CheckGameMounted(),
+// since this has nothing to do with Vimm specifically.
+// ---------------------------------------------------------------------------
+
+bool CheckGameMounted()
+{
+    FILE *fd;
+    FILE *fd1;
+    if (fopen_s(&fd, "game:\\test.tmp", "w") != 0)
+    {
+        dprintf("GAME_NOT_MOUNTED_TRYING_USB\n");
+        if (mount("game:", "\\Device\\Mass0") != 0)
+        {
+            dprintf("GAME_NOT_MOUNTED_TRYING_HDD\n");
+            if (mount("game:", "\\Device\\Harddisk0\\Partition1") != 0)
+            {
+                dprintf("GAME_NOT_MOUNTED\n");
+            }
+        }
+    }
+    else
+    {
+        fclose(fd);
+        remove("game:\\test.tmp");
+    }
+
+    fd = NULL;
+    fd1 = NULL;
+
+    if (fopen_s(&fd1, "Hdd1:\\test.tmp", "w") != 0)
+    {
+        dprintf("Hdd1 not mounted, mounting...\n");
+        if (mount("Hdd1:", "\\Device\\Harddisk0\\Partition1") != 0)
+        {
+            dprintf("Warning: failed to mount Hdd1:\n");
+        }
+    }
+    else
+    {
+        fclose(fd1);
+        remove("Hdd1:\\test.tmp");
+    }
+
+    // The USB ports, by Aurora's names, for library folders and installs on
+    // a USB drive formatted FAT32. A port with nothing in it just reads as
+    // empty. (A drive the dashboard formatted as Xbox storage keeps its
+    // files inside a container these don't reach.)
+    static const char *const usbDrives[][2] = {
+        { "Usb0:", "\\Device\\Mass0" },
+        { "Usb1:", "\\Device\\Mass1" },
+        { "Usb2:", "\\Device\\Mass2" },
+    };
+    for (int i = 0; i < 3; ++i)
+        mount(usbDrives[i][0], (char *)usbDrives[i][1]);
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Text from the on-screen keyboard
+// ---------------------------------------------------------------------------
+
+// Strips leading and trailing whitespace. A key or path typed on the on-screen
+// keyboard easily picks up a stray trailing space, and for a key that's
+// enough to make every request fail with nothing on screen to show why.
+static void TrimInPlace(std::string &s)
+{
+    size_t start = s.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos)
+    {
+        s.clear();
+        return;
+    }
+    size_t end = s.find_last_not_of(" \t\r\n");
+    s = s.substr(start, end - start + 1);
+}
+
+// For prefilling the on-screen keyboard. Everything this is used on - keys,
+// drive paths - is plain ASCII, so widening byte by byte is exact.
+static void NarrowToWide(const char *in, WCHAR *out, int outSize)
+{
+    int i = 0;
+    for (; i < outSize - 1 && in[i] != '\0'; ++i)
+        out[i] = (WCHAR)(unsigned char)in[i];
+    out[i] = L'\0';
+}
+
+// ---------------------------------------------------------------------------
+// settings.txt - two separate paths matter for this fork, and they can be
+// genuinely different locations:
+//   - the GAMES path: where EnumerateInstalledGames looks for your existing
+//     library, to populate the picker. Defaults to the Content folder, which
+//     is where the dashboard installs Games on Demand and arcade titles.
+//     Some people keep GOD games in a folder of their own instead (e.g.
+//     Hdd1:\Games, with the same TitleID\ContentType\ContentID layout under
+//     a different root) and point Aurora at it - this key is for them.
+//   - the CONTENT path: where downloaded DLC, title updates and arcade and
+//     indie games actually get written. This is always the standard
+//     Content\0000000000000000 layout, since that's where Xbox/Aurora expect
+//     content to be installed - but it follows the games path's DRIVE, so
+//     someone who moves their install folder to a USB drive gets their
+//     downloads on that drive too instead of on the internal disk, which is
+//     the whole point of moving it. Reuses the "xbla-path:" key so an existing X-Store
+//     settings.txt still works without editing.
+// ---------------------------------------------------------------------------
+
+// Returns whether settings.txt actually had the key - the caller can then
+// tell a value someone set from the default it would have got anyway.
+static bool GetSettingsPath(const char *key, const char *defaultValue, char *outPath, size_t outPathSize)
+{
+    strncpy(outPath, defaultValue, outPathSize - 1);
+    outPath[outPathSize - 1] = '\0';
+
+    FILE *fd = fopen(SETTINGS_FILE, "r");
+    if (fd == NULL)
+        return false;
+
+    char line[512];
+    size_t keyLen = strlen(key);
+    bool found = false;
+
+    while (fgets(line, sizeof(line), fd) != NULL)
+    {
+        if (line[0] == '#')
+            continue;
+
+        if (strncmp(line, key, keyLen) == 0)
+        {
+            char *value = line + keyLen;
+            value[strcspn(value, "\r\n")] = '\0';
+
+            if (strlen(value) >= 3)
+            {
+                strncpy(outPath, value, outPathSize - 1);
+                outPath[outPathSize - 1] = '\0';
+                found = true;
+            }
+            break;
+        }
+    }
+
+    fclose(fd);
+    return found;
+}
+
+// "Hdd1:" from "Hdd1:\Content\0000000000000000". Empty if the path names no
+// drive at all, which NormaliseGamesPath already rules out for anything
+// typed in Settings.
+static void DriveOfPath(const char *path, char *out, size_t outSize)
+{
+    const char *colon = strchr(path, ':');
+    size_t driveLen = (colon != NULL) ? (size_t)(colon - path) + 1 : 0;
+
+    if (driveLen == 0 || driveLen >= outSize)
+    {
+        out[0] = '\0';
+        return;
+    }
+
+    memcpy(out, path, driveLen);
+    out[driveLen] = '\0';
+}
+
+// Where DLC, title updates and arcade and indie games install: the standard
+// Content\0000000000000000 folder on whichever drive the install folder is
+// on. A hand-written "xbla-path:" line still wins, for anyone who set the
+// two to different drives on purpose.
+static void GetContentBasePath(const char *gamesPath, char *outPath, size_t outPathSize)
+{
+    if (GetSettingsPath(CONTENT_PATH_KEY, CONTENT_BASE_PATH_DEFAULT, outPath, outPathSize))
+        return;
+
+    char drive[16];
+    DriveOfPath(gamesPath, drive, sizeof(drive));
+
+    if (drive[0] == '\0')
+        return; // left at the default
+
+    _snprintf(outPath, outPathSize, "%s" CONTENT_BASE_SUFFIX, drive);
+    outPath[outPathSize - 1] = '\0';
+}
+
+// The content folder, where DLC, title updates and arcade and indie games
+// install. Set at startup and again whenever Settings moves the install
+// folder, so a download started afterwards goes to the new drive without
+// restarting the app.
+static char g_contentBase[MAX_TEXT_LENGTH] = CONTENT_BASE_PATH_DEFAULT;
+
+static void GetGamesPath(char *outPath, size_t outPathSize)
+{
+    GetSettingsPath(GAMES_PATH_KEY, GAMES_PATH_DEFAULT, outPath, outPathSize);
+}
+
+// More library folders: every "games-path:" line after the first. The first
+// is where games install to, and the one Settings changes; these are only
+// scanned - games spread across drives, a USB drive's Content folder or a
+// Games folder of Games on Demand. Added by editing settings.txt.
+#define MAX_MORE_GAMES_PATHS 7
+static char g_moreGamesPaths[MAX_MORE_GAMES_PATHS][MAX_TEXT_LENGTH];
+static int g_moreGamesPathCount = 0;
+
+static void ReadMoreGamesPaths()
+{
+    g_moreGamesPathCount = 0;
+    FILE *fd = fopen(SETTINGS_FILE, "r");
+    if (fd == NULL)
+        return;
+
+    char line[512];
+    const size_t keyLen = strlen(GAMES_PATH_KEY);
+    bool first = true;
+    while (fgets(line, sizeof(line), fd) != NULL && g_moreGamesPathCount < MAX_MORE_GAMES_PATHS)
+    {
+        if (line[0] == '#' || strncmp(line, GAMES_PATH_KEY, keyLen) != 0)
+            continue;
+        char *value = line + keyLen;
+        value[strcspn(value, "\r\n")] = '\0';
+        if (strlen(value) < 3)
+            continue;
+        if (first)
+        {
+            first = false; // GetGamesPath's
+            continue;
+        }
+        _snprintf(g_moreGamesPaths[g_moreGamesPathCount], MAX_TEXT_LENGTH, "%s", value);
+        g_moreGamesPaths[g_moreGamesPathCount][MAX_TEXT_LENGTH - 1] = '\0';
+        g_moreGamesPathCount++;
+    }
+    fclose(fd);
+}
+
+// Whether the interface makes sounds. On unless turned off.
+static bool UiSoundsSetting()
+{
+    char value[16];
+    GetSettingsPath(SOUNDS_KEY, "yes", value, sizeof(value));
+    return _stricmp(value, "off") != 0;
+}
+
+// Whether to ask GitHub for a newer version at start. On unless turned off.
+static bool UpdateChecksOn()
+{
+    char value[16];
+    GetSettingsPath(UPDATE_CHECK_KEY, "yes", value, sizeof(value));
+    return _stricmp(value, "off") != 0;
+}
+
+// Writes one key into settings.txt - replacing its existing line, or adding
+// one - and leaves every other line exactly as it was, comments and the
+// content path included. Someone who hand-edited the file keeps their edits.
+//
+// Written in full to a temporary file first and only then swapped in, so a
+// write that fails partway can't leave settings.txt truncated.
+static bool SetSettingsValue(const char *key, const char *value)
+{
+    std::string contents;
+    bool replaced = false;
+    const size_t keyLen = strlen(key);
+
+    FILE *in = fopen(SETTINGS_FILE, "r");
+    if (in != NULL)
+    {
+        char line[512];
+        while (fgets(line, sizeof(line), in) != NULL)
+        {
+            // Same matching rule as GetSettingsPath, so the line replaced here
+            // is the line that would have been read.
+            if (!replaced && line[0] != '#' && strncmp(line, key, keyLen) == 0)
+            {
+                contents += key;
+                contents += value;
+                contents += "\n";
+                replaced = true;
+                continue;
+            }
+            contents += line;
+        }
+        fclose(in);
+
+        if (!contents.empty() && contents[contents.size() - 1] != '\n')
+            contents += "\n";
+    }
+
+    if (!replaced)
+    {
+        contents += key;
+        contents += value;
+        contents += "\n";
+    }
+
+    FILE *out = fopen(SETTINGS_TEMP_FILE, "w");
+    if (out == NULL)
+        return false;
+
+    bool ok = fwrite(contents.data(), 1, contents.size(), out) == contents.size();
+    ok = (fclose(out) == 0) && ok;
+
+    if (!ok)
+    {
+        remove(SETTINGS_TEMP_FILE);
+        return false;
+    }
+
+    remove(SETTINGS_FILE); // rename won't replace an existing file
+    return rename(SETTINGS_TEMP_FILE, SETTINGS_FILE) == 0;
+}
+
+// Tidies a typed folder path into the form the library scan expects: no
+// surrounding spaces, backslashes rather than forward slashes, and no trailing
+// backslash, since the scan appends its own separator. Returns false if what
+// is left has no drive (Hdd1:, Usb0:...) and so can't be a console path.
+static bool NormaliseGamesPath(const std::string &typed, char *out, size_t outSize)
+{
+    std::string path = typed;
+    TrimInPlace(path);
+
+    for (size_t i = 0; i < path.size(); ++i)
+    {
+        if (path[i] == '/')
+            path[i] = '\\';
+    }
+
+    while (!path.empty() && path[path.size() - 1] == '\\')
+        path.erase(path.size() - 1);
+
+    size_t colon = path.find(':');
+    if (colon == std::string::npos || colon == 0)
+        return false;
+
+    // Under 3 characters would also be ignored when settings.txt is next read
+    // (see GetSettingsPath), so refusing it here keeps the two in agreement.
+    if (path.size() < 3 || path.size() >= outSize)
+        return false;
+
+    memcpy(out, path.c_str(), path.size() + 1);
+    return true;
+}
+
+static bool FolderExists(const char *path)
+{
+    // A bare drive ("Hdd1:") needs its root separator to be looked up at all.
+    char probe[MAX_TEXT_LENGTH + 2];
+    size_t len = strlen(path);
+    if (len + 2 > sizeof(probe))
+        return false;
+
+    memcpy(probe, path, len + 1);
+    if (len > 0 && probe[len - 1] == ':')
+    {
+        probe[len] = '\\';
+        probe[len + 1] = '\0';
+    }
+
+    // (DWORD)-1 is GetFileAttributes' failure value. Win32 names it
+    // INVALID_FILE_ATTRIBUTES, but the XDK's headers don't define that.
+    DWORD attributes = GetFileAttributesA(probe);
+    return attributes != (DWORD)-1 && (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+}
+
+// Rewrites every key line in settings.txt as values, one line each - in
+// place of every one there was, where the first of them was, or at the end;
+// none removes them all. Every other line stays as it was. Written to a
+// temporary file and swapped in, as SetSettingsValue does.
+static bool WriteSettingsLines(const char *key, const char *const *values, int count)
+{
+    std::string paths;
+    for (int i = 0; i < count; ++i)
+        paths += std::string(key) + values[i] + "\n";
+
+    std::string contents;
+    bool placed = false;
+    const size_t keyLen = strlen(key);
+    FILE *in = fopen(SETTINGS_FILE, "r");
+    if (in != NULL)
+    {
+        char line[512];
+        while (fgets(line, sizeof(line), in) != NULL)
+        {
+            if (line[0] != '#' && strncmp(line, key, keyLen) == 0)
+            {
+                if (!placed)
+                    contents += paths;
+                placed = true;
+                continue;
+            }
+            contents += line;
+        }
+        fclose(in);
+        if (!contents.empty() && contents[contents.size() - 1] != '\n')
+            contents += "\n";
+    }
+    if (!placed)
+        contents += paths;
+
+    FILE *out = fopen(SETTINGS_TEMP_FILE, "w");
+    if (out == NULL)
+        return false;
+    bool ok = fwrite(contents.data(), 1, contents.size(), out) == contents.size();
+    ok = (fclose(out) == 0) && ok;
+    if (!ok)
+    {
+        remove(SETTINGS_TEMP_FILE);
+        return false;
+    }
+    remove(SETTINGS_FILE); // rename won't replace an existing file
+    return rename(SETTINGS_TEMP_FILE, SETTINGS_FILE) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// Apps, Homebrew and Emulators
+// ---------------------------------------------------------------------------
+//
+// Three pages laid out as the library is, of what's in the folders named by
+// settings.txt's "apps-path:" lines - Aurora, file managers, tools - its
+// "homebrew-path:" lines - homebrew games - and its "emulators-path:" lines.
+// Each key can be given more than once, and Settings writes them; a page
+// with no folders isn't in the sidebar. Read by the startup thread, after
+// the library, and again when Settings changes them; A starts one as the
+// Exit menu's "app:" lines are started.
+
+#define APPS_PATH_KEY "apps-path: "
+#define HOMEBREW_PATH_KEY "homebrew-path: "
+#define EMULATORS_PATH_KEY "emulators-path: "
+#define MAX_SHELF_PATHS 8
+#define MAX_SHELF_ITEMS 64
+
+enum ShelfKind
+{
+    SHELF_APPS,
+    SHELF_HOMEBREW,
+    SHELF_EMULATORS,
+    SHELF_COUNT
+};
+
+struct Shelf
+{
+    InstalledGame items[MAX_SHELF_ITEMS]; // no images: an app's folder has none to keep
+    int count;
+    char paths[MAX_SHELF_PATHS][MAX_TEXT_LENGTH];
+    int found[MAX_SHELF_PATHS]; // each folder's, at the last scan
+    unsigned long coverKeys[MAX_SHELF_ITEMS]; // each item's cover, by its name - CoverArt.h's HomebrewCoverKey
+    int pathCount;
+    char pathList[MAX_TEXT_LENGTH]; // the folders, for an empty page: "Hdd1:\Apps, Usb0:\Apps"
+    int selected;
+    int scroll; // -1 until placed - see LibraryPageView
+};
+
+static Shelf g_shelves[SHELF_COUNT];
+static const char *const kShelfKeys[SHELF_COUNT] = { APPS_PATH_KEY, HOMEBREW_PATH_KEY, EMULATORS_PATH_KEY };
+
+// Each shelf's sidebar page, and the other way round.
+static const ShellPage kShelfPages[SHELF_COUNT] = { SHELL_PAGE_APPS, SHELL_PAGE_HOMEBREW, SHELL_PAGE_EMULATORS };
+
+static bool ShelfForPage(int page, ShelfKind *out)
+{
+    for (int s = 0; s < SHELF_COUNT; ++s)
+    {
+        if (kShelfPages[s] == page)
+        {
+            *out = (ShelfKind)s;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Set by the startup thread once the shelves are scanned. Until then their
+// pages say they're still looking, and nothing else scans them.
+static volatile LONG g_shelvesRead = 0;
+
+// The shelf's folders from settings.txt. On the UI thread, before the startup
+// thread scans them, so nothing reads settings.txt while Settings rewrites it.
+static void ReadShelfPaths(Shelf &shelf, const char *key)
+{
+    shelf.pathCount = 0;
+    shelf.pathList[0] = '\0';
+    shelf.selected = 0;
+    shelf.scroll = -1;
+    FILE *fd = fopen(SETTINGS_FILE, "r");
+    if (fd == NULL)
+        return;
+
+    char line[512];
+    const size_t keyLen = strlen(key);
+    while (fgets(line, sizeof(line), fd) != NULL && shelf.pathCount < MAX_SHELF_PATHS)
+    {
+        if (line[0] == '#' || strncmp(line, key, keyLen) != 0)
+            continue;
+        char *value = line + keyLen;
+        value[strcspn(value, "\r\n")] = '\0';
+
+        // The scan adds its own separator.
+        size_t len = strlen(value);
+        while (len > 0 && (value[len - 1] == '\\' || value[len - 1] == ' '))
+            value[--len] = '\0';
+        if (len < 3)
+            continue;
+
+        _snprintf(shelf.paths[shelf.pathCount], MAX_TEXT_LENGTH, "%s", value);
+        shelf.paths[shelf.pathCount][MAX_TEXT_LENGTH - 1] = '\0';
+        shelf.found[shelf.pathCount] = 0;
+        const size_t used = strlen(shelf.pathList);
+        _snprintf(shelf.pathList + used, sizeof(shelf.pathList) - used, "%s%s", used > 0 ? ", " : "", value);
+        shelf.pathList[sizeof(shelf.pathList) - 1] = '\0';
+        shelf.pathCount++;
+    }
+    fclose(fd);
+}
+
+static int CompareGamesByName(const void *a, const void *b);
+
+static void ScanShelf(Shelf &shelf)
+{
+    shelf.count = 0;
+    for (int p = 0; p < shelf.pathCount; ++p)
+    {
+        shelf.found[p] = 0;
+        if (shelf.count < MAX_SHELF_ITEMS)
+            shelf.found[p] = EnumerateFolderApps(shelf.paths[p], shelf.items + shelf.count,
+                                                 MAX_SHELF_ITEMS - shelf.count, dprintf);
+        shelf.count += shelf.found[p];
+    }
+    if (shelf.count > 1)
+        qsort(shelf.items, shelf.count, sizeof(InstalledGame), CompareGamesByName);
+
+    // Homebrew rarely carries a title ID to find its cover by, so it's found
+    // by its name - its folder's, or an Original Xbox one's own.
+    for (int i = 0; i < shelf.count; ++i)
+        shelf.coverKeys[i] = HomebrewCoverKey(shelf.items[i].displayName);
+}
+
+// ---------------------------------------------------------------------------
+// The folders Settings lists
+// ---------------------------------------------------------------------------
+
+// What a folder holds, which is the page that shows it and the settings.txt
+// key that names it. In the order left and right step through them on its
+// row in Settings.
+enum FolderKind
+{
+    FOLDER_GAMES,
+    FOLDER_HOMEBREW,
+    FOLDER_APPS,
+    FOLDER_EMULATORS,
+    FOLDER_KIND_COUNT
+};
+
+static const char *const kFolderKindNames[FOLDER_KIND_COUNT] = { "Games", "Homebrew", "Apps", "Emulators" };
+static const char *const kFolderKindKeys[FOLDER_KIND_COUNT] = { GAMES_PATH_KEY, HOMEBREW_PATH_KEY, APPS_PATH_KEY,
+                                                                EMULATORS_PATH_KEY };
+static const char *const kFolderKindPages[FOLDER_KIND_COUNT] = { "Games", "Homebrew", "Apps", "Emulators" };
+
+// Every kind but games has a shelf.
+static Shelf &ShelfFor(FolderKind kind)
+{
+    switch (kind)
+    {
+    case FOLDER_HOMEBREW:  return g_shelves[SHELF_HOMEBREW];
+    case FOLDER_EMULATORS: return g_shelves[SHELF_EMULATORS];
+    default:               return g_shelves[SHELF_APPS];
+    }
+}
+
+// The folders Settings lists, after the one games install to: those added -
+// games, homebrew, apps and emulators - then the likely places on each drive
+// that aren't, that exist.
+struct LibraryFolderRow
+{
+    char path[MAX_TEXT_LENGTH];
+    FolderKind kind;
+    bool scanned;   // a line of its kind's key has it
+    bool suggested; // one of the likely places, listed whether it's scanned or not
+    bool exists;
+    int games;      // found there at the last scan, when scanned; -1 while the first scan is still going
+};
+
+// A Content folder and a Games folder on each drive hold games; a Homebrew
+// folder homebrew, an Apps folder apps and an Emulators folder emulators.
+struct LikelyFolder
+{
+    const char *place;
+    FolderKind kind;
+};
+
+static const char *const kFolderDrives[] = { "Hdd1:", "Usb0:", "Usb1:", "Usb2:" };
+static const LikelyFolder kFolderPlaces[] = {
+    { "\\Content\\0000000000000000", FOLDER_GAMES },
+    { "\\Games", FOLDER_GAMES },
+    { "\\Homebrew", FOLDER_HOMEBREW },
+    { "\\Apps", FOLDER_APPS },
+    { "\\Emulators", FOLDER_EMULATORS },
+};
+#define FOLDER_DRIVE_COUNT (sizeof(kFolderDrives) / sizeof(kFolderDrives[0]))
+#define FOLDER_PLACE_COUNT (sizeof(kFolderPlaces) / sizeof(kFolderPlaces[0]))
+
+#define MAX_FOLDER_ROWS (MAX_MORE_GAMES_PATHS + SHELF_COUNT * MAX_SHELF_PATHS + FOLDER_DRIVE_COUNT * FOLDER_PLACE_COUNT)
+static LibraryFolderRow g_folderRows[MAX_FOLDER_ROWS];
+static int g_folderRowCount = 0;
+
+// What a likely folder that isn't scanned yet was set to hold, on its row -
+// A then adds it as that. Kept by path, as the rows are built again.
+#define MAX_KIND_CHOICES 8
+static char g_kindChoicePaths[MAX_KIND_CHOICES][MAX_TEXT_LENGTH];
+static FolderKind g_kindChoices[MAX_KIND_CHOICES];
+static int g_kindChoiceCount = 0;
+
+static void ChooseUnscannedKind(const char *path, FolderKind kind)
+{
+    int i = 0;
+    while (i < g_kindChoiceCount && _stricmp(g_kindChoicePaths[i], path) != 0)
+        ++i;
+    if (i == g_kindChoiceCount)
+    {
+        if (g_kindChoiceCount == MAX_KIND_CHOICES)
+            i = 0; // the oldest goes
+        else
+            g_kindChoiceCount++;
+        _snprintf(g_kindChoicePaths[i], MAX_TEXT_LENGTH, "%s", path);
+        g_kindChoicePaths[i][MAX_TEXT_LENGTH - 1] = '\0';
+    }
+    g_kindChoices[i] = kind;
+}
+
+static FolderKind UnscannedKind(const char *path, FolderKind likely)
+{
+    for (int i = 0; i < g_kindChoiceCount; ++i)
+    {
+        if (_stricmp(g_kindChoicePaths[i], path) == 0)
+            return g_kindChoices[i];
+    }
+    return likely;
+}
+
+static bool FolderListed(const char *path, const char *gamesPath)
+{
+    if (_stricmp(path, gamesPath) == 0)
+        return true;
+    for (int i = 0; i < g_folderRowCount; ++i)
+    {
+        if (_stricmp(g_folderRows[i].path, path) == 0)
+            return true;
+    }
+    return false;
+}
+
+static bool IsSuggestedFolder(const char *path)
+{
+    for (size_t d = 0; d < FOLDER_DRIVE_COUNT; ++d)
+    {
+        for (size_t f = 0; f < FOLDER_PLACE_COUNT; ++f)
+        {
+            char candidate[MAX_TEXT_LENGTH];
+            _snprintf(candidate, sizeof(candidate), "%s%s", kFolderDrives[d], kFolderPlaces[f].place);
+            candidate[sizeof(candidate) - 1] = '\0';
+            if (_stricmp(candidate, path) == 0)
+                return true;
+        }
+    }
+    return false;
+}
+
+static void AddScannedFolderRow(const char *path, FolderKind kind, int found, const char *gamesPath)
+{
+    if (g_folderRowCount >= MAX_FOLDER_ROWS || FolderListed(path, gamesPath))
+        return;
+    LibraryFolderRow &row = g_folderRows[g_folderRowCount++];
+    _snprintf(row.path, sizeof(row.path), "%s", path);
+    row.path[sizeof(row.path) - 1] = '\0';
+    row.kind = kind;
+    row.scanned = true;
+    row.suggested = IsSuggestedFolder(row.path);
+    row.exists = FolderExists(row.path);
+    row.games = found;
+}
+
+// moreFound: how many games each of g_moreGamesPaths added at the last scan.
+static void FindLibraryFolders(const char *gamesPath, const int *moreFound)
+{
+    g_folderRowCount = 0;
+    for (int p = 0; p < g_moreGamesPathCount; ++p)
+        AddScannedFolderRow(g_moreGamesPaths[p], FOLDER_GAMES, moreFound[p], gamesPath);
+    for (int k = FOLDER_HOMEBREW; k < FOLDER_KIND_COUNT; ++k)
+    {
+        const Shelf &shelf = ShelfFor((FolderKind)k);
+        for (int p = 0; p < shelf.pathCount; ++p)
+            AddScannedFolderRow(shelf.paths[p], (FolderKind)k, g_shelvesRead ? shelf.found[p] : -1, gamesPath);
+    }
+
+    for (size_t d = 0; d < FOLDER_DRIVE_COUNT; ++d)
+    {
+        for (size_t f = 0; f < FOLDER_PLACE_COUNT && g_folderRowCount < MAX_FOLDER_ROWS; ++f)
+        {
+            char path[MAX_TEXT_LENGTH];
+            _snprintf(path, sizeof(path), "%s%s", kFolderDrives[d], kFolderPlaces[f].place);
+            path[sizeof(path) - 1] = '\0';
+            if (FolderListed(path, gamesPath) || !FolderExists(path))
+                continue;
+            LibraryFolderRow &row = g_folderRows[g_folderRowCount++];
+            memcpy(row.path, path, strlen(path) + 1);
+            row.kind = UnscannedKind(path, kFolderPlaces[f].kind);
+            row.scanned = false;
+            row.suggested = true;
+            row.exists = true;
+            row.games = 0;
+        }
+    }
+}
+
+// Whether path is under any kind's key already - where games install
+// included.
+static bool FolderScannedAsAnything(const char *path, const char *gamesPath)
+{
+    if (_stricmp(path, gamesPath) == 0)
+        return true;
+    for (int p = 0; p < g_moreGamesPathCount; ++p)
+        if (_stricmp(g_moreGamesPaths[p], path) == 0)
+            return true;
+    for (int s = 0; s < SHELF_COUNT; ++s)
+        for (int p = 0; p < g_shelves[s].pathCount; ++p)
+            if (_stricmp(g_shelves[s].paths[p], path) == 0)
+                return true;
+    return false;
+}
+
+// How many more folders kind's key can take.
+static int FolderKindRoom(FolderKind kind)
+{
+    if (kind == FOLDER_GAMES)
+        return MAX_MORE_GAMES_PATHS - g_moreGamesPathCount;
+    return MAX_SHELF_PATHS - ShelfFor(kind).pathCount;
+}
+
+// Writes kind's folders back to settings.txt as they are now, less remove and
+// plus add - either may be NULL. The games key's first line stays the folder
+// games install to.
+static bool WriteFolderKind(FolderKind kind, const char *gamesPath, const char *remove, const char *add)
+{
+    const char *values[1 + MAX_MORE_GAMES_PATHS + MAX_SHELF_PATHS + 1];
+    int n = 0;
+    if (kind == FOLDER_GAMES)
+    {
+        values[n++] = gamesPath;
+        for (int p = 0; p < g_moreGamesPathCount; ++p)
+            if (remove == NULL || _stricmp(g_moreGamesPaths[p], remove) != 0)
+                values[n++] = g_moreGamesPaths[p];
+    }
+    else
+    {
+        const Shelf &shelf = ShelfFor(kind);
+        for (int p = 0; p < shelf.pathCount; ++p)
+            if (remove == NULL || _stricmp(shelf.paths[p], remove) != 0)
+                values[n++] = shelf.paths[p];
+    }
+    if (add != NULL)
+        values[n++] = add;
+    return WriteSettingsLines(kFolderKindKeys[kind], values, n);
+}
+
+// ---------------------------------------------------------------------------
+// Game list ordering
+// ---------------------------------------------------------------------------
+
+// EnumerateInstalledGames returns titles in raw FATX directory order, which is
+// roughly the order they were written to the drive - so the list came out
+// looking shuffled, with titles sharing a name prefix scattered apart rather
+// than sitting together. Sorted by display name instead, which is the only
+// order someone scanning for a specific game can actually predict.
+//
+// Case-insensitive, because FATX preserves whatever case the package's
+// metadata used and a case-sensitive sort would file every lowercase title
+// after every uppercase one. Ties break on title ID so the order is total and
+// stable across launches: two titles genuinely can share a display name, and
+// the ID is the thing that tells them apart (which is why the row draws it).
+static int CompareGamesByName(const void *a, const void *b)
+{
+    const InstalledGame *ga = (const InstalledGame *)a;
+    const InstalledGame *gb = (const InstalledGame *)b;
+
+    int byName = _stricmp(ga->displayName, gb->displayName);
+    if (byName != 0)
+        return byName;
+
+    if (ga->titleId < gb->titleId)
+        return -1;
+    if (ga->titleId > gb->titleId)
+        return 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// "Already installed" detection for the game list
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Archive.org auth - IAS3 access key + secret key (archive.org's official,
+// script-friendly S3-like API auth: archive.org/services/docs/api/ias3.html),
+// not a scraped browser login session.
+//
+// A from-scratch email/password login (POST /account/login, scrape the
+// Set-Cookie session) was tried first and worked right up until the actual
+// DLC download, which came back 401 even with a real, well-formed session
+// cookie. Turned out every file in msx360gcdlc is marked "private":"true" in
+// its own metadata, and archive.org's REAL login is a JS single-page app
+// hitting a JSON API (/services/account/login/) with a CSRF token from
+// /services/csrf-token - a completely different endpoint/shape than the
+// classic form POST this used to do, discovered by inspecting the real
+// login page's network traffic. Worse, that page's Content-Security-Policy
+// references Google reCAPTCHA, so a scripted login could hit a bot check
+// with no way for a console app to solve it.
+//
+// IAS3 keys sidestep all of that: a permanent access+secret key pair the
+// user fetches once, in their own real logged-in browser, from
+// archive.org/account/s3.php - the same mechanism archive.org's own "ia"
+// CLI tool uses - sent as one "Authorization: LOW <access>:<secret>" header
+// (built by BuildIas3AuthHeader). No cookies, no CSRF, no session expiry.
+//
+// Same plaintext-cache tradeoff as this project's earlier Aurora Lua
+// prototype (see the fork's plan notes): convenient on your own console,
+// not something to do if others have access to it.
+// ---------------------------------------------------------------------------
+
+static bool LoadSavedKeys(std::string &accessKey, std::string &secretKey)
+{
+    FILE *f = fopen(CREDENTIALS_FILE, "rb");
+    if (f == NULL)
+        return false;
+
+    char line1[256] = "";
+    char line2[256] = "";
+    bool ok = (fgets(line1, sizeof(line1), f) != NULL) && (fgets(line2, sizeof(line2), f) != NULL);
+    fclose(f);
+
+    if (!ok)
+        return false;
+
+    line1[strcspn(line1, "\r\n")] = '\0';
+    line2[strcspn(line2, "\r\n")] = '\0';
+
+    if (line1[0] == '\0' || line2[0] == '\0')
+        return false;
+
+    accessKey = line1;
+    secretKey = line2;
+    return true;
+}
+
+static bool SaveKeys(const std::string &accessKey, const std::string &secretKey)
+{
+    FILE *f = fopen(CREDENTIALS_FILE, "wb");
+    if (f == NULL)
+        return false;
+
+    bool ok = fprintf(f, "%s\n%s\n", accessKey.c_str(), secretKey.c_str()) > 0;
+    ok = (fclose(f) == 0) && ok;
+    return ok;
+}
+
+// Asks for both keys with the on-screen keyboard. accessKey and secretKey come
+// in as the current keys (empty when there are none) and go out as the new
+// ones.
+//
+// The access key is offered for editing. The secret key never is - it is not
+// put on screen at all - and leaving it blank keeps the current one, so
+// correcting a typo in the access key doesn't mean retyping ~40 characters of
+// secret. Returns false if either prompt is cancelled or a key ends up empty,
+// leaving both strings as they came in.
+static bool PromptKeys(std::string &accessKey, std::string &secretKey)
+{
+    WCHAR currentAccess[128];
+    NarrowToWide(accessKey.c_str(), currentAccess, 128);
+
+    std::string typedAccess;
+    if (OpenKeyboardToString(XUSER_INDEX_ANY, &typedAccess, L"Archive.org Access Key",
+                             L"From archive.org/account/s3.php", currentAccess) != ERROR_SUCCESS)
+        return false;
+    TrimInPlace(typedAccess);
+
+    const bool haveSecret = !secretKey.empty();
+
+    std::string typedSecret;
+    if (OpenKeyboardToString(XUSER_INDEX_ANY, &typedSecret, L"Archive.org Secret Key",
+                             haveSecret ? L"Leave blank to keep your current secret key"
+                                        : L"From archive.org/account/s3.php",
+                             L"") != ERROR_SUCCESS)
+        return false;
+    TrimInPlace(typedSecret);
+
+    if (typedSecret.empty())
+        typedSecret = secretKey;
+
+    if (typedAccess.empty() || typedSecret.empty())
+        return false;
+
+    accessKey = typedAccess;
+    secretKey = typedSecret;
+    return true;
+}
+
+enum KeyEntryOutcome
+{
+    KEY_ENTRY_SAVED,     // new keys are saved
+    KEY_ENTRY_CANCELLED, // backed out of the keyboard - nothing shown yet, the caller may want to say so
+    KEY_ENTRY_FAILED     // didn't save, and a screen already said why
+};
+
+// The one way keys get entered, from Settings or from a first download: ask
+// for them, check them with archive.org, then save them.
+//
+// Checked before saving so a typo is caught while the keys are still on the
+// user's mind, rather than as a failed download later. What happens next
+// depends on the verdict:
+//   accepted  - saved.
+//   rejected  - not saved, since archive.org has said they won't work. Offers
+//               to try again with what was typed still in the keyboard, so
+//               fixing one character doesn't mean retyping both keys.
+//   unchecked - saved anyway. An offline console isn't a reason to refuse
+//               keys, and treating "no answer" as "wrong keys" would send
+//               someone off to fix the wrong thing.
+//
+// accessKey and secretKey come in as the current keys (empty if none) and
+// go out as whatever was last typed.
+static KeyEntryOutcome EnterCheckAndSaveKeys(std::string &accessKey, std::string &secretKey)
+{
+    for (;;)
+    {
+        if (!PromptKeys(accessKey, secretKey))
+            return KEY_ENTRY_CANCELLED;
+
+        char header[IAS3_AUTH_HEADER_MAX];
+        if (!BuildIas3AuthHeader(accessKey, secretKey, header, sizeof(header)))
+        {
+            if (ShowConfirmUI("Keys too long", "Those are too long to be archive.org keys.",
+                              "Copy them again from archive.org/account/s3.php.", "Try again"))
+                continue;
+            return KEY_ENTRY_FAILED;
+        }
+
+        RenderStatusFrame("Checking keys", "Asking archive.org whether these keys work", NULL);
+
+        char reason[160] = "";
+        KeyCheckResult check = CheckArchiveOrgKeys(header, reason, sizeof(reason), dprintf);
+
+        if (check == KEYS_REJECTED)
+        {
+            // archive.org's own wording where it gave one - it can say which
+            // of the two keys it objects to.
+            if (ShowConfirmUI("Keys not accepted", "archive.org didn't accept those keys.",
+                              reason[0] != '\0' ? reason : "Check them at archive.org/account/s3.php.",
+                              "Try again"))
+                continue;
+            return KEY_ENTRY_FAILED;
+        }
+
+        if (!SaveKeys(accessKey, secretKey))
+        {
+            ShowMessageUI("Keys not saved", "ArchiveOrgKeys.txt could not be written.",
+                          "Your previous keys, if any, are unchanged.");
+            return KEY_ENTRY_FAILED;
+        }
+
+        if (check == KEYS_ACCEPTED)
+            ShowMessageUI("Keys saved", "archive.org accepted your keys.",
+                          "They're saved on this console for your next download.");
+        else
+            ShowMessageUI("Keys saved", "Saved, but not checked - archive.org didn't answer.",
+                          "If a download fails, check them again in Settings.");
+
+        return KEY_ENTRY_SAVED;
+    }
+}
+
+// A full drive, said plainly with both numbers. It used to show up only as a
+// disk write error in the log, under a generic "download failed" - after the
+// download had already filled what space there was.
+// "Hdd1:" from "Hdd1:\Content\...", or the fallback if the path names no drive.
+static void DriveLabel(const char *path, char *out, size_t outSize, const char *fallback)
+{
+    DriveOfPath(path, out, outSize);
+
+    if (out[0] == '\0')
+    {
+        _snprintf(out, outSize, "%s", fallback);
+        out[outSize - 1] = '\0';
+    }
+}
+
+// The sidebar's storage: how full the drive content installs to is, its name
+// ("Hdd1"), "402 GB free" and "of 931 GB" - three short lines, since one
+// long one doesn't fit beside the ring. used stays negative if the drive
+// can't say, which hides it rather than showing a wrong number.
+struct StorageStatus
+{
+    float used;
+    char label[16];
+    char detail[32];
+    char total[32];
+};
+
+static void ReadStorageStatus(const char *path, StorageStatus *out)
+{
+    out->used = -1.0f;
+    out->label[0] = '\0';
+    out->detail[0] = '\0';
+    out->total[0] = '\0';
+
+    const char *colon = strchr(path, ':');
+    if (colon == NULL)
+        return;
+
+    size_t nameLen = (size_t)(colon - path);
+    if (nameLen == 0 || nameLen >= sizeof(out->label) || nameLen + 3 > 32)
+        return;
+
+    char root[32];
+    memcpy(root, path, nameLen + 1); // through the colon
+    root[nameLen + 1] = '\\';
+    root[nameLen + 2] = '\0';
+
+    ULARGE_INTEGER freeToCaller, total;
+    if (!GetDiskFreeSpaceExA(root, &freeToCaller, &total, NULL) || total.QuadPart == 0)
+        return;
+
+    memcpy(out->label, path, nameLen);
+    out->label[nameLen] = '\0';
+
+    char freeText[64] = "", totalText[64] = "";
+    FormatBytes(freeToCaller.QuadPart, freeText, sizeof(freeText));
+    FormatBytes(total.QuadPart, totalText, sizeof(totalText));
+    _snprintf(out->detail, sizeof(out->detail), "%s free", freeText);
+    out->detail[sizeof(out->detail) - 1] = '\0';
+    _snprintf(out->total, sizeof(out->total), "of %s", totalText);
+    out->total[sizeof(out->total) - 1] = '\0';
+
+    out->used = (float)(1.0 - (double)freeToCaller.QuadPart / (double)total.QuadPart);
+}
+
+static void ShowNotEnoughSpace(const char *path, unsigned long long needed, unsigned long long freeSpace)
+{
+    char drive[16];
+    DriveLabel(path, drive, sizeof(drive), "The drive");
+
+    char neededText[64] = "", freeText[64] = "";
+    FormatBytes(needed, neededText, sizeof(neededText));
+    FormatBytes(freeSpace, freeText, sizeof(freeText));
+
+    char message[160];
+    _snprintf(message, sizeof(message), "This needs %s, but %s has %s free.", neededText, drive, freeText);
+    message[sizeof(message) - 1] = '\0';
+
+    ShowMessageUI("Not enough space", message, "Free up some space on the drive and try again.");
+}
+
+static bool GetArchiveOrgAuthHeader(char *authHeader, unsigned long long authHeaderSize)
+{
+    std::string accessKey, secretKey;
+
+    if (!LoadSavedKeys(accessKey, secretKey))
+    {
+        // Typing a ~40-character secret key with an on-screen keyboard and a
+        // controller is painful - FTPing %s onto the console yourself ahead
+        // of time (access key on line 1, secret key on line 2, plain text)
+        // skips this prompt entirely, since LoadSavedKeys() above already
+        // succeeds if the file is there. The keyboard is only a fallback for
+        // when that's not convenient in the moment.
+        dprintf("Archive.org IAS3 keys required.\n");
+        dprintf("Get them (logged in to your own account) at: archive.org/account/s3.php\n");
+        dprintf("Tip: FTP them directly into %s (access key on line 1, secret key on\n", CREDENTIALS_FILE);
+        dprintf("line 2) ahead of time to skip typing them in on the console.\n");
+
+        // Drawn, not printed. By this point the console no longer paints to
+        // the screen (see SetConsoleQuiet), and this is the one piece of
+        // guidance the user genuinely cannot act without - it tells them
+        // where to get the keys they're about to be asked for.
+        ShowMessageUI("archive.org keys needed",
+                      "Get your access and secret key at archive.org/account/s3.php",
+                      "Press A to type them in, or put them in ArchiveOrgKeys.txt beforehand.");
+
+        KeyEntryOutcome entry = EnterCheckAndSaveKeys(accessKey, secretKey);
+
+        if (entry == KEY_ENTRY_CANCELLED)
+        {
+            dprintf("ERROR: no keys entered\n");
+            ShowMessageUI("No keys entered", "Both keys are required to download from archive.org.",
+                          "You can add them any time in Settings - press Y on the game list.");
+        }
+
+        if (entry != KEY_ENTRY_SAVED)
+            return false; // every other outcome has already shown its own screen
+    }
+
+    // Saved keys that can't even form a header - hand-edited into something
+    // far too long. Said on screen, since the caller now leaves explaining
+    // failures to this function.
+    if (!BuildIas3AuthHeader(accessKey, secretKey, authHeader, authHeaderSize))
+    {
+        dprintf("ERROR: could not build auth header from saved keys - delete %s and re-enter them\n", CREDENTIALS_FILE);
+        ShowMessageUI("Saved keys unusable", "The saved keys are too long to be archive.org keys.",
+                      "Re-enter them in Settings - press Y on the game list.");
+        return false;
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// The DLC pack and title update pickers
+// ---------------------------------------------------------------------------
+//
+// A game page's Find DLC and Title updates buttons - over the Store or the
+// library - and the installed disc's tile search for a game's DLC or title
+// updates; either way a picker opens over the page straight away, fills in
+// when the search comes back, and B steps back to the page at any point.
+//
+// ALWAYS a picker, even for a single perfectly-scored result. The DLC side
+// briefly auto-selected an unambiguous match and skipped straight to
+// downloading. That was removed after actually living with it: the picker is
+// not friction, it is the one place you can see the real filename and size
+// before committing to a download that may be gigabytes, and the one place to
+// back out of a game selected by mistake. For title updates it's also the
+// point: one game routinely has v1/v2/v3 across several regions, and "newest"
+// is not always what someone wants - a specific version is sometimes needed
+// for mods or for matchmaking compatibility.
+//
+// A in the picker adds the row to the download queue and leaves the picker
+// open, so a game with several separate packs - Call of Duty 2 has three -
+// can have them all queued in one visit.
+
+enum PickerKind
+{
+    PICKER_NONE,
+    PICKER_DLC,
+    PICKER_TITLE_UPDATE
+};
+
+// The picker opens the moment A or X is pressed, while the search runs on the
+// search worker, and fills in when the result arrives.
+enum PickerStatus
+{
+    PICKER_SEARCHING,
+    PICKER_READY,       // results to choose from
+    PICKER_NOTHING,     // the search worked, and matched nothing
+    PICKER_UNREACHABLE  // archive.org couldn't be reached - A tries again
+};
+
+#define MAX_PICKER_ROWS (MAX_DLC_RAR_MATCHES > MAX_TITLE_UPDATE_MATCHES ? MAX_DLC_RAR_MATCHES : MAX_TITLE_UPDATE_MATCHES)
+
+struct Picker
+{
+    PickerKind kind;
+    PickerStatus status;
+    int requestId; // the search it's waiting on, while PICKER_SEARCHING
+    ShellPage page; // the page it's open over: the library, or a game in the Store
+
+    // The game it's for - copied, since it may be the disc in the drive,
+    // which isn't in the library.
+    char gameName[256];
+    unsigned long titleId;
+    int count;
+    int selected;
+    int scroll;
+
+    DlcRarMatch packs[MAX_DLC_RAR_MATCHES];
+    TitleUpdateMatch updates[MAX_TITLE_UPDATE_MATCHES];
+
+    // What the list page draws. labels point into packs/updates.
+    const char *labels[MAX_PICKER_ROWS];
+    const char *sublabels[MAX_PICKER_ROWS];
+    char subText[MAX_PICKER_ROWS][96];
+};
+
+// Where SearchResults land - static, as they're 8KB.
+static SearchResult g_searchResult;
+
+// Opens the picker for a game and starts its search.
+static void OpenPicker(Picker &picker, PickerKind kind, const char *gameName, unsigned long titleId,
+                       ShellPage page = SHELL_PAGE_LIBRARY)
+{
+    picker.kind = kind;
+    picker.page = page;
+    strncpy(picker.gameName, gameName, sizeof(picker.gameName) - 1);
+    picker.gameName[sizeof(picker.gameName) - 1] = '\0';
+    picker.titleId = titleId;
+    picker.count = 0;
+    picker.selected = 0;
+    picker.scroll = -1;
+    picker.requestId = BeginSearch(kind == PICKER_DLC ? SEARCH_DLC : SEARCH_TITLE_UPDATES, picker.gameName);
+
+    // 0 means the search worker never started; the log says why.
+    picker.status = (picker.requestId != 0) ? PICKER_SEARCHING : PICKER_UNREACHABLE;
+}
+
+// The rows for a DLC search. The filename is what actually identifies a pack,
+// and the size plus match confidence are what let someone judge between two
+// similar-looking entries.
+static void FillDlcRows(Picker &picker)
+{
+    for (int i = 0; i < picker.count; ++i)
+    {
+        picker.labels[i] = picker.packs[i].filename;
+
+        char sizeText[64] = "";
+        FormatBytes(picker.packs[i].size, sizeText, sizeof(sizeText));
+
+        _snprintf(picker.subText[i], sizeof(picker.subText[i]), "%s   %d%% name match",
+                  sizeText, picker.packs[i].score);
+        picker.subText[i][sizeof(picker.subText[i]) - 1] = '\0';
+        picker.sublabels[i] = picker.subText[i];
+    }
+}
+
+static void FillTitleUpdateRows(Picker &picker)
+{
+    for (int i = 0; i < picker.count; ++i)
+    {
+        const TitleUpdateMatch &update = picker.updates[i];
+
+        // "score N", not "N%" - a literal percent sign does not survive this
+        // logging path (see LogEscapePercent in parsing.h), which is why an
+        // earlier run of this printed "100v1" instead of "100%  v1".
+        dprintf("[TU]   score %d  v%d  region \"%s\"  %I64u bytes  %s\n",
+                update.score, update.version, update.region, update.size, update.filename);
+
+        picker.labels[i] = update.filename;
+
+        char sizeText[64] = "";
+        FormatBytes(update.size, sizeText, sizeof(sizeText));
+
+        _snprintf(picker.subText[i], sizeof(picker.subText[i]), "%s   v%d   %s   %d%% name match",
+                  sizeText, update.version,
+                  update.region[0] != '\0' ? update.region : "unknown region",
+                  update.score);
+        picker.subText[i][sizeof(picker.subText[i]) - 1] = '\0';
+        picker.sublabels[i] = picker.subText[i];
+    }
+}
+
+// Collects the picker's search result, if it has arrived. Called every frame
+// while the picker is searching.
+static void PollPickerSearch(Picker &picker)
+{
+    if (picker.kind == PICKER_NONE || picker.status != PICKER_SEARCHING)
+        return;
+
+    if (!TakeSearchResult(picker.requestId, &g_searchResult))
+        return;
+
+    const SearchResult &result = g_searchResult;
+
+    if (result.count < 0)
+    {
+        picker.status = PICKER_UNREACHABLE;
+        return;
+    }
+
+    if (result.count == 0)
+    {
+        picker.status = PICKER_NOTHING;
+        return;
+    }
+
+    picker.count = result.count;
+
+    if (picker.kind == PICKER_DLC)
+    {
+        memcpy(picker.packs, result.packs, sizeof(picker.packs));
+        FillDlcRows(picker);
+    }
+    else
+    {
+        // Sorted score-first then version-descending, so the first row is the
+        // newest update for the best-matching name - the right default to
+        // land on, but still shown rather than assumed.
+        memcpy(picker.updates, result.updates, sizeof(picker.updates));
+        FillTitleUpdateRows(picker);
+    }
+
+    picker.status = PICKER_READY;
+}
+
+// ---------------------------------------------------------------------------
+// The installed library
+// ---------------------------------------------------------------------------
+
+// The scanned library, replaced whenever the games folder changes.
+struct Library
+{
+    InstalledGame *games; // MAX_INSTALLED_GAMES entries, allocated once
+    int count;
+
+    // How many games each folder added at the scan: the install folder's,
+    // then each more folder's, as g_moreGamesPaths lists them.
+    int folderFound[1 + MAX_MORE_GAMES_PATHS];
+
+    // Changed since Library.cache was written - kept again at the next refresh.
+    bool cacheDirty;
+};
+
+// Goes up with every scan on the UI thread, so a scan startup left running
+// behind the library can tell it's been overtaken.
+static int g_libraryGeneration = 0;
+
+// The disc in the drive's title ID, while there's a game disc in it - its
+// box art is asked for ahead of the library's, as it's the first tile.
+static unsigned long g_coverDiscTitleId = 0;
+
+static void NameHomebrewCovers(); // with the Store's Homebrew page
+
+static void RequestLibraryCovers(const Library &lib)
+{
+    static unsigned long titleIds[MAX_INSTALLED_GAMES + 1 + SHELF_COUNT * MAX_SHELF_ITEMS];
+    int n = 0;
+    if (g_coverDiscTitleId != 0)
+        titleIds[n++] = g_coverDiscTitleId;
+    for (int i = 0; i < lib.count; ++i)
+        titleIds[n++] = lib.games[i].titleId;
+
+    // Then the apps', once they're read - xboxunity has covers for some.
+    if (g_shelvesRead)
+    {
+        for (int s = 0; s < SHELF_COUNT; ++s)
+            for (int i = 0; i < g_shelves[s].count; ++i)
+                titleIds[n++] = g_shelves[s].coverKeys[i];
+    }
+    NameHomebrewCovers(); // by name, which the cover worker searches xboxunity for
+    RequestCoverArt(titleIds, n);
+}
+
+// The games found at lib.games[from..from+found), less any whose title is
+// already listed before them, kept at the end of the list. How many were kept.
+static int KeepNewTitles(Library &lib, int from, int found)
+{
+    int kept = from;
+    for (int i = from; i < from + found; ++i)
+    {
+        bool seen = false;
+        for (int j = 0; j < from && !seen; ++j)
+            seen = (lib.games[j].titleId == lib.games[i].titleId);
+        if (seen)
+        {
+            FreeInstalledGames(&lib.games[i], 1);
+            continue;
+        }
+        if (kept != i)
+            lib.games[kept] = lib.games[i];
+        kept++;
+    }
+    lib.count = kept;
+    return kept - from;
+}
+
+// One library folder's games into the list: its packages - a Content
+// folder's - then its extracted games' folders. How many it added.
+static int ScanLibraryFolder(Library &lib, const char *path)
+{
+    int added = 0;
+    const double start = ImageTimerMs();
+    int found = EnumerateInstalledGames(path, lib.games + lib.count, MAX_INSTALLED_GAMES - lib.count, dprintf);
+    if (found > 0)
+        added += KeepNewTitles(lib, lib.count, found);
+    const double packagesDone = ImageTimerMs();
+    found = EnumerateFolderGames(path, lib.games + lib.count, MAX_INSTALLED_GAMES - lib.count, dprintf);
+    if (found > 0)
+        added += KeepNewTitles(lib, lib.count, found);
+    dprintf("[timing] scan %s: packages %.1f + folder games %.1f ms (%d games)\n", path,
+            packagesDone - start, ImageTimerMs() - packagesDone, added);
+    return added;
+}
+
+// The library's folders read into the list, named and sorted. Nothing drawn
+// and nothing asked of the UI, so startup runs it on a thread of its own
+// while the loading screen animates, or behind the library kept from last
+// time; the icons made from the old list must already be released.
+// morePaths are the more folders from settings.txt, a copy of them for a
+// scan on another thread, as Settings can change g_moreGamesPaths meanwhile.
+static void ReadLibrary(Library &lib, const char *gamesPath, const char (*morePaths)[MAX_TEXT_LENGTH], int moreCount)
+{
+    FreeInstalledGames(lib.games, lib.count);
+    lib.count = 0;
+    memset(lib.folderFound, 0, sizeof(lib.folderFound));
+
+    lib.folderFound[0] = ScanLibraryFolder(lib, gamesPath);
+
+    // Then each more folder. A game in two of them - copied to a USB drive,
+    // say - is listed once, from the first.
+    for (int p = 0; p < moreCount && lib.count < MAX_INSTALLED_GAMES; ++p)
+    {
+        lib.folderFound[1 + p] = ScanLibraryFolder(lib, morePaths[p]);
+        if (lib.folderFound[1 + p] == 0)
+            dprintf("No installed games found under %s\n", morePaths[p]);
+        else
+            dprintf("Found %d more installed games under %s\n", lib.folderFound[1 + p], morePaths[p]);
+    }
+
+    // A folder game is named for its folder, which may be anything - the
+    // bundled list's name, or the Store's, where they have it.
+    const double namingStart = ImageTimerMs();
+    for (int i = 0; i < lib.count; ++i)
+    {
+        InstalledGame &game = lib.games[i];
+        if (!game.folder)
+            continue;
+        const char *listed = LookupTitleName(game.titleId);
+        StoreGame store;
+        if (listed == NULL && StoreGameByTitleId(game.titleId, &store) && store.name != NULL && store.name[0] != '\0')
+            listed = store.name;
+        if (listed != NULL)
+        {
+            _snprintf(game.displayName, sizeof(game.displayName), "%s", listed);
+            game.displayName[sizeof(game.displayName) - 1] = '\0';
+        }
+    }
+
+    // Sorted here rather than inside EnumerateInstalledGames - that
+    // function's job is to walk the filesystem, and leaving presentation order
+    // to the caller keeps it that way. Everything downstream (the installed
+    // flags, the library selection) indexes into this array after the sort, so nothing
+    // else has to know it happened.
+    if (lib.count > 1)
+        qsort(lib.games, lib.count, sizeof(InstalledGame), CompareGamesByName);
+
+    if (lib.count > 0)
+        dprintf("Found %d installed games under %s\n", lib.count, gamesPath);
+    else
+        dprintf("No installed games found under %s\n", gamesPath);
+    dprintf("[timing] scan: names + sort %.1f ms\n", ImageTimerMs() - namingStart);
+}
+
+// The folders a library is read from, as one string - Library.cache keeps
+// the one it was read with, and is only used for the same.
+static void LibraryFoldersKey(const char *gamesPath, char *out, size_t outSize)
+{
+    _snprintf(out, outSize, "%s", gamesPath);
+    out[outSize - 1] = '\0';
+    for (int p = 0; p < g_moreGamesPathCount; ++p)
+    {
+        const size_t len = strlen(out);
+        _snprintf(out + len, outSize - len, "|%s", g_moreGamesPaths[p]);
+        out[outSize - 1] = '\0';
+    }
+}
+
+static void SaveLibrary(Library &lib, const char *gamesPath)
+{
+    char folders[2048];
+    LibraryFoldersKey(gamesPath, folders, sizeof(folders));
+    SaveLibraryCache(folders, lib.games, lib.count, lib.folderFound, 1 + g_moreGamesPathCount);
+    lib.cacheDirty = false;
+}
+
+static void ScanLibrary(Library &lib, const char *gamesPath)
+{
+    RenderStatusFrame("Scanning", "Reading your installed games", gamesPath);
+
+    // The cover cache was built from the old scan's images - drop both.
+    ReleaseGameListIcons();
+    ReadMoreGamesPaths();
+    ReadLibrary(lib, gamesPath, g_moreGamesPaths, g_moreGamesPathCount);
+    g_libraryGeneration++;
+    lib.cacheDirty = true;
+
+    // Box art, in the library's order so the first screenful comes first.
+    RequestLibraryCovers(lib);
+}
+
+// ---------------------------------------------------------------------------
+// Settings
+// ---------------------------------------------------------------------------
+
+struct SettingsOutcome
+{
+    bool libraryChanged; // the games folder changed and the library was rescanned
+    bool keysChanged;    // the saved keys were replaced or removed
+};
+
+enum SettingsRow
+{
+    SETTINGS_ROW_NONE,
+    SETTINGS_ROW_GAMES_FOLDER,
+    SETTINGS_ROW_KEYS,
+    SETTINGS_ROW_REMOVE_KEYS,
+    SETTINGS_ROW_UPDATES,      // the version, and what's newer
+    SETTINGS_ROW_UPDATE_CHECKS, // checking at start, on or off
+    SETTINGS_ROW_LIBRARY_FOLDER, // one of g_folderRows: A adds or removes it
+    SETTINGS_ROW_ADD_FOLDER,   // another library folder, typed
+    SETTINGS_ROW_SOUNDS,       // the interface's sounds, on or off
+    SETTINGS_ROW_SPEED_TEST    // where a download's speed goes - SpeedTest.h
+};
+
+// Rescans with the library folders now in settings.txt.
+static void RescanFolders(Library &lib, const char *gamesPath, SettingsOutcome &outcome)
+{
+    ScanLibrary(lib, gamesPath);
+    outcome.libraryChanged = true;
+}
+
+// The Apps and Homebrew pages read again from settings.txt - once the startup
+// thread's first read is done, which usually it long is.
+static void RescanShelves(const Library &lib)
+{
+    RenderStatusFrame("Scanning", "Looking for apps, homebrew and emulators", NULL);
+    while (!g_shelvesRead)
+        Sleep(20);
+    for (int s = 0; s < SHELF_COUNT; ++s)
+    {
+        ReadShelfPaths(g_shelves[s], kShelfKeys[s]);
+        ScanShelf(g_shelves[s]);
+    }
+    RequestLibraryCovers(lib); // theirs are asked for after the library's
+}
+
+// Reads again whatever kind's folders feed.
+static void RescanKind(FolderKind kind, Library &lib, const char *gamesPath, SettingsOutcome &outcome)
+{
+    if (kind == FOLDER_GAMES)
+        RescanFolders(lib, gamesPath, outcome);
+    else
+        RescanShelves(lib);
+}
+
+static void TooManyFolders(FolderKind kind)
+{
+    char detail[64];
+    _snprintf(detail, sizeof(detail), "Up to %d %s folders can be added.",
+              kind == FOLDER_GAMES ? MAX_MORE_GAMES_PATHS : MAX_SHELF_PATHS,
+              kind == FOLDER_GAMES       ? "more games"
+              : kind == FOLDER_HOMEBREW  ? "homebrew"
+              : kind == FOLDER_EMULATORS ? "emulators"
+                                         : "apps");
+    detail[sizeof(detail) - 1] = '\0';
+    ShowMessageUI("Too many folders", "Remove one of them first.", detail);
+}
+
+// A on a folder's row: scanned, it's removed - what's in it stays where it
+// is - and not, it's added as whatever its row says it holds.
+static void ToggleLibraryFolder(int index, Library &lib, const char *gamesPath, SettingsOutcome &outcome)
+{
+    if (index < 0 || index >= g_folderRowCount)
+        return;
+    const LibraryFolderRow row = g_folderRows[index]; // a copy - the rescan rebuilds the list
+
+    if (row.scanned)
+    {
+        // One of the likely places stays listed, unticked, so it's only
+        // asked about when it's one that was typed - it goes from the list.
+        if (!row.suggested)
+        {
+            char message[MAX_TEXT_LENGTH + 64];
+            _snprintf(message, sizeof(message), "Stop looking in %s?", row.path);
+            message[sizeof(message) - 1] = '\0';
+            if (!ShowConfirmUI("Folder", message, "What's in it stays where it is.", "Remove"))
+                return;
+        }
+    }
+    else if (FolderKindRoom(row.kind) <= 0)
+    {
+        TooManyFolders(row.kind);
+        return;
+    }
+
+    if (!WriteFolderKind(row.kind, gamesPath, row.scanned ? row.path : NULL, row.scanned ? NULL : row.path))
+    {
+        ShowMessageUI("Not saved", "settings.txt could not be written.", row.path);
+        return;
+    }
+    dprintf("%s folder %s %s\n", kFolderKindNames[row.kind], row.path, row.scanned ? "removed" : "added");
+    RescanKind(row.kind, lib, gamesPath, outcome);
+}
+
+// Left and right on a folder's row: what it holds. A scanned folder moves to
+// the other kind's key at once, and both kinds are read again; one that isn't
+// only remembers it, for when A adds it.
+static void StepFolderKind(int index, int step, Library &lib, const char *gamesPath, SettingsOutcome &outcome)
+{
+    if (index < 0 || index >= g_folderRowCount)
+        return;
+    const LibraryFolderRow row = g_folderRows[index];
+    const int next = (int)row.kind + step;
+    if (next < 0 || next >= FOLDER_KIND_COUNT)
+        return;
+    const FolderKind kind = (FolderKind)next;
+
+    if (!row.scanned)
+    {
+        ChooseUnscannedKind(row.path, kind);
+        return;
+    }
+    if (FolderKindRoom(kind) <= 0)
+    {
+        TooManyFolders(kind);
+        return;
+    }
+
+    // Added under the new key first, so a write that fails leaves it under
+    // one of them rather than neither.
+    if (!WriteFolderKind(kind, gamesPath, NULL, row.path) || !WriteFolderKind(row.kind, gamesPath, row.path, NULL))
+    {
+        ShowMessageUI("Not saved", "settings.txt could not be written.", row.path);
+        return;
+    }
+    dprintf("Folder %s now holds %s, was %s\n", row.path, kFolderKindNames[kind], kFolderKindNames[row.kind]);
+
+    if (row.kind == FOLDER_GAMES || kind == FOLDER_GAMES)
+        RescanFolders(lib, gamesPath, outcome);
+    if (row.kind != FOLDER_GAMES || kind != FOLDER_GAMES)
+        RescanShelves(lib);
+}
+
+// "Add folder": one typed, for a folder somewhere the list doesn't look -
+// then what's in it, as Aurora asks.
+static void AddLibraryFolder(Library &lib, const char *gamesPath, SettingsOutcome &outcome)
+{
+    std::string typed;
+    if (OpenKeyboardToString(XUSER_INDEX_ANY, &typed, L"Add Folder",
+                             L"A folder of games, homebrew or apps, like Usb0:\\Games", L"Usb0:\\") != ERROR_SUCCESS)
+        return; // cancelled
+
+    char newPath[MAX_TEXT_LENGTH];
+    if (!NormaliseGamesPath(typed, newPath, sizeof(newPath)))
+    {
+        ShowMessageUI("Not a folder path", "Include the drive, like Hdd1:\\Games or Usb0:\\Games.", typed.c_str());
+        return;
+    }
+    if (!FolderExists(newPath))
+    {
+        ShowMessageUI("Folder not found", "There is no folder at that path.", newPath);
+        return;
+    }
+    if (FolderScannedAsAnything(newPath, gamesPath))
+    {
+        ShowMessageUI("Already added", "That folder is looked in already. Its row in Settings says what for.",
+                      newPath);
+        return;
+    }
+
+    static const char *labels[FOLDER_KIND_COUNT] = { "Games", "Homebrew", "Apps", "Emulators" };
+    static const char *sublabels[FOLDER_KIND_COUNT] = {
+        "Games on Demand, arcade games and extracted games - Your Library",
+        "Homebrew games - the Homebrew page",
+        "Dashboards, file managers and tools - the Apps page",
+        "Emulators - the Emulators page",
+    };
+    const int chosen = ShowChoiceUI("What's in this folder?", newPath, labels, sublabels, FOLDER_KIND_COUNT, L"Choose");
+    if (chosen < 0)
+        return;
+    const FolderKind kind = (FolderKind)chosen;
+    if (FolderKindRoom(kind) <= 0)
+    {
+        TooManyFolders(kind);
+        return;
+    }
+
+    if (!WriteFolderKind(kind, gamesPath, NULL, newPath))
+    {
+        ShowMessageUI("Not saved", "settings.txt could not be written.", newPath);
+        return;
+    }
+    dprintf("%s folder %s added\n", kFolderKindNames[kind], newPath);
+    RescanKind(kind, lib, gamesPath, outcome);
+}
+
+static void ChangeGamesFolder(Library &lib, char *gamesPath, size_t gamesPathSize, SettingsOutcome &outcome)
+{
+    WCHAR current[MAX_TEXT_LENGTH];
+    NarrowToWide(gamesPath, current, MAX_TEXT_LENGTH);
+
+    std::string typed;
+    if (OpenKeyboardToString(XUSER_INDEX_ANY, &typed, L"Games Folder",
+                             L"Where your installed games are - usually Hdd1:\\Content\\0000000000000000", current) != ERROR_SUCCESS)
+        return; // cancelled
+
+    char newPath[MAX_TEXT_LENGTH];
+    if (!NormaliseGamesPath(typed, newPath, sizeof(newPath)) || strlen(newPath) >= gamesPathSize)
+    {
+        ShowMessageUI("Not a folder path", "Include the drive, like Hdd1:\\Games or Usb0:\\Games.",
+                      typed.c_str());
+        return;
+    }
+
+    if (_stricmp(newPath, gamesPath) == 0)
+        return; // unchanged - nothing to save or rescan
+
+    // Checked before saving, so a typo is caught while the old, working path
+    // is still in place rather than after it has been overwritten.
+    if (!FolderExists(newPath))
+    {
+        ShowMessageUI("Folder not found", "There is no folder at that path.", newPath);
+        return;
+    }
+
+    bool saved = SetSettingsValue(GAMES_PATH_KEY, newPath);
+    dprintf("Games path changed to %s (%s)\n", newPath, saved ? "saved" : "NOT saved");
+
+    // Used for this session either way - the user asked for it and the folder
+    // exists. Only remembering it is in question if the write failed.
+    memcpy(gamesPath, newPath, strlen(newPath) + 1);
+    SetDiscWorkerGamesPath(gamesPath);
+    SetGameInstallerGamesPath(gamesPath);
+
+    // Downloads move with it. DLC, title updates and arcade and indie games
+    // have to live in Content\0000000000000000 for the dashboard and Aurora
+    // to see them, but that folder on the new drive - otherwise someone who
+    // moves their library to a USB drive still has every download land on
+    // the internal disk, which is the thing they were moving away from.
+    GetContentBasePath(gamesPath, g_contentBase, sizeof(g_contentBase));
+    SetDownloadQueueContentPath(g_contentBase);
+    dprintf("Content path now %s\n", g_contentBase);
+
+    ScanLibrary(lib, gamesPath);
+    outcome.libraryChanged = true;
+
+    if (!saved)
+    {
+        ShowMessageUI("Not saved", "Using this folder for now, but settings.txt could not be written.",
+                      "It will go back to the old folder next time Omni360 starts.");
+    }
+}
+
+static void ChangeKeys(SettingsOutcome &outcome)
+{
+    std::string accessKey, secretKey;
+    LoadSavedKeys(accessKey, secretKey); // leaves both empty if there are none yet
+
+    // Cancelling here needs no message - the user is already on the screen
+    // that says what's saved.
+    if (EnterCheckAndSaveKeys(accessKey, secretKey) == KEY_ENTRY_SAVED)
+        outcome.keysChanged = true;
+}
+
+// The download's progress, drawn while InstallUpdate works.
+static char g_updatingTo[32];
+
+static void DrawUpdateProgress(unsigned long long done, unsigned long long total)
+{
+    char message[64], detail[96], doneText[32] = "", totalText[32] = "";
+    _snprintf(message, sizeof(message), "Downloading Omni360 %s", g_updatingTo);
+    message[sizeof(message) - 1] = '\0';
+    FormatBytes(done, doneText, sizeof(doneText));
+    if (total > 0)
+    {
+        FormatBytes(total, totalText, sizeof(totalText));
+        _snprintf(detail, sizeof(detail), "%s of %s", doneText, totalText);
+    }
+    else
+    {
+        _snprintf(detail, sizeof(detail), "%s", doneText);
+    }
+    detail[sizeof(detail) - 1] = '\0';
+    RenderStatusFrame("Updating", message, detail);
+}
+
+// Restarting ends whatever's running, so updating waits for the Queue.
+static bool AnythingQueued()
+{
+    return PendingDownloadCount() > 0 || PendingGameJobCount() > 0 || PendingDiscJobCount() > 0;
+}
+
+// The Updates row: what's new in a newer version - and, for a signed one,
+// installing it and restarting into it - or a check now.
+static void ShowUpdate()
+{
+    UpdateInfo info;
+    if (GetUpdateState(&info, NULL) != UPDATE_AVAILABLE)
+    {
+        StartUpdateCheck();
+        ShowShellToast("Checking for updates", "Asking GitHub for the latest version", UI_TOAST_INFO);
+        return;
+    }
+
+    char heading[64];
+    _snprintf(heading, sizeof(heading), "Omni360 %s", info.version);
+    heading[sizeof(heading) - 1] = '\0';
+
+    const bool installable = UpdateInstallable(info);
+    const bool busy = AnythingQueued();
+    const char *foot = !installable ? "Get it from " UPDATE_RELEASES_PAGE
+                     : busy        ? "To update, let what's in the Queue finish, or stop it, first."
+                                   : "Update installs it and restarts Omni360. Your settings, keys and games stay.";
+    if (!ShowNotesUI(heading, info.title, info.notes, foot, installable && !busy ? L"Update" : NULL))
+        return;
+
+    _snprintf(g_updatingTo, sizeof(g_updatingTo), "%s", info.version);
+    g_updatingTo[sizeof(g_updatingTo) - 1] = '\0';
+    DrawUpdateProgress(0, info.xexSize);
+
+    char xexPath[MAX_PATH + 16] = "";
+    const UpdateInstallResult result = InstallUpdate(info, DrawUpdateProgress, xexPath, sizeof(xexPath));
+    if (result != UPDATE_INSTALL_OK)
+    {
+        ShowMessageUI("Couldn't update", UpdateInstallResultText(result), "Omni360 hasn't changed.");
+        return;
+    }
+
+    char message[96];
+    _snprintf(message, sizeof(message), "Omni360 %s is installed.", info.version);
+    message[sizeof(message) - 1] = '\0';
+    ShowMessageUI("Updated", message, "It starts when you continue. The previous version is kept as .old beside it.");
+
+    dprintf("Restarting into %s\n", xexPath);
+    XLaunchNewImage(xexPath, 0);
+}
+
+// The disc read speed from settings.txt, 1 to 4; full when it isn't set.
+static int DiscSpeedSetting()
+{
+    // Read here rather than by GetSettingsPath, which takes a value of three
+    // characters or more - a path's - and so would never see "3".
+    int speed = DISC_SPEED_FULL;
+    FILE *fd = fopen(SETTINGS_FILE, "r");
+    if (fd != NULL)
+    {
+        char line[128];
+        const size_t keyLen = strlen(DISC_SPEED_KEY);
+        while (fgets(line, sizeof(line), fd) != NULL)
+        {
+            if (line[0] != '#' && strncmp(line, DISC_SPEED_KEY, keyLen) == 0)
+            {
+                speed = atoi(line + keyLen);
+                break;
+            }
+        }
+        fclose(fd);
+    }
+    if (speed < DISC_SPEED_SLOWEST || speed > DISC_SPEED_FULL)
+        speed = DISC_SPEED_FULL;
+    return speed;
+}
+
+static const char *DiscSpeedName(int speed)
+{
+    switch (speed)
+    {
+    case 1:  return "Slowest";
+    case 2:  return "Slow";
+    case 3:  return "Fast";
+    default: return "Full";
+    }
+}
+
+// Left and right on the disc speed's row: one slower or faster, saved.
+static void StepDiscSpeed(int step)
+{
+    const int speed = DiscSpeedSetting() + step;
+    if (speed < DISC_SPEED_SLOWEST || speed > DISC_SPEED_FULL)
+        return;
+    char value[8];
+    _snprintf(value, sizeof(value), "%d", speed);
+    value[sizeof(value) - 1] = '\0';
+    if (!SetSettingsValue(DISC_SPEED_KEY, value))
+        ShowMessageUI("Not saved", "settings.txt could not be written.", NULL);
+    SetDiscReadSpeed(speed);
+    dprintf("Disc read speed set to %d (%s)\n", speed, DiscSpeedName(speed));
+}
+
+static void ToggleUiSounds()
+{
+    const bool on = !UiSoundsSetting();
+    if (!SetSettingsValue(SOUNDS_KEY, on ? "yes" : "off"))
+        ShowMessageUI("Not saved", "settings.txt could not be written.", NULL);
+    SetUiSoundsOn(on);
+}
+
+static void ToggleUpdateChecks()
+{
+    const bool on = !UpdateChecksOn();
+    if (!SetSettingsValue(UPDATE_CHECK_KEY, on ? "yes" : "off"))
+        ShowMessageUI("Not saved", "settings.txt could not be written.", NULL);
+}
+
+static void RemoveKeys(SettingsOutcome &outcome)
+{
+    if (!ShowConfirmUI("Remove keys", "Remove the archive.org keys saved on this console?",
+                       "You'll need to add them again before you can download.", "Remove"))
+        return;
+
+    if (remove(CREDENTIALS_FILE) != 0)
+    {
+        ShowMessageUI("Could not remove", "ArchiveOrgKeys.txt could not be deleted.", NULL);
+        return;
+    }
+
+    dprintf("Saved archive.org keys removed\n");
+    outcome.keysChanged = true;
+    ShowMessageUI("Keys removed", "Your archive.org keys have been removed from this console.", NULL);
+}
+
+// The settings page, as GameListUI's SettingsRowView rows: the library
+// folders under a heading with Add folder and Change install folder, then
+// one line a setting. Rebuilt whenever something may have changed it, rather
+// than every frame - each rebuild reads the keys file.
+#define MAX_SETTINGS_ROWS (8 + MAX_FOLDER_ROWS)
+#define SETTINGS_MIDDOT "  \xC2\xB7  "
+
+struct SettingsPage
+{
+    int count;
+    SettingsRowView rows[MAX_SETTINGS_ROWS];
+    SettingsRow actions[MAX_SETTINGS_ROWS][SETTINGS_MAX_CONTROLS]; // what A on each control does
+    int args[MAX_SETTINGS_ROWS]; // a library folder row's index into g_folderRows
+
+    char installHelp[MAX_TEXT_LENGTH + 64];
+    char installStatus[64];
+    char folderStatus[MAX_FOLDER_ROWS][48];
+    char folderHelp[MAX_FOLDER_ROWS][128];
+    char keysStatus[64];
+    char updatesStatus[96];
+    char updatesHelp[96];
+
+    int focusRow;
+    int focusCol;
+    float scroll;
+};
+
+static SettingsRowView &AddSettingsRow(SettingsPage &page, SettingsRowKind kind, const char *label)
+{
+    SettingsRowView &row = page.rows[page.count];
+    memset(&row, 0, sizeof(row));
+    row.kind = kind;
+    row.label = label;
+    for (int c = 0; c < SETTINGS_MAX_CONTROLS; ++c)
+        page.actions[page.count][c] = SETTINGS_ROW_NONE;
+    page.args[page.count] = -1;
+    page.count++;
+    return row;
+}
+
+static void AddSettingsControl(SettingsPage &page, SettingsControlKind kind, const char *label, SettingsRow action,
+                               const char *help)
+{
+    SettingsRowView &row = page.rows[page.count - 1];
+    if (row.controlCount >= SETTINGS_MAX_CONTROLS)
+        return;
+    SettingsControlView &c = row.controls[row.controlCount];
+    memset(&c, 0, sizeof(c));
+    c.kind = kind;
+    c.label = label;
+    c.help = help;
+    page.actions[page.count - 1][row.controlCount] = action;
+    row.controlCount++;
+}
+
+// A row the D-pad stops on: anything but a heading with nothing on it.
+static bool SettingsRowFocusable(const SettingsRowView &row)
+{
+    return row.kind != SETTINGS_VIEW_HEADING || row.controlCount > 0;
+}
+
+static void BuildSettingsPage(SettingsPage &page, const Library &lib, const char *gamesPath)
+{
+    std::string accessKey, secretKey;
+    const bool haveKeys = LoadSavedKeys(accessKey, secretKey);
+    page.count = 0;
+
+    // --- The library's folders ---
+    // Names the content folder as well when it isn't the games folder
+    // itself, so it's clear where DLC, updates and arcade games land - they
+    // follow this drive, but always in its Content folder.
+    if (_stricmp(g_contentBase, gamesPath) == 0)
+        _snprintf(page.installHelp, sizeof(page.installHelp), "Where Store and disc installs go - now %s",
+                  gamesPath);
+    else
+        _snprintf(page.installHelp, sizeof(page.installHelp),
+                  "Where Store and disc installs go - now %s, with DLC and arcade games in %s",
+                  gamesPath, g_contentBase);
+    page.installHelp[sizeof(page.installHelp) - 1] = '\0';
+    AddSettingsRow(page, SETTINGS_VIEW_HEADING, "Folders");
+    AddSettingsControl(page, SETTINGS_CONTROL_BUTTON, "Add folder", SETTINGS_ROW_ADD_FOLDER,
+                       "Type the path of another folder of games, homebrew or apps, like Usb0:\\Games");
+    AddSettingsControl(page, SETTINGS_CONTROL_BUTTON, "Change install folder", SETTINGS_ROW_GAMES_FOLDER,
+                       page.installHelp);
+
+    // Where games install: always scanned.
+    _snprintf(page.installStatus, sizeof(page.installStatus), "Installs here" SETTINGS_MIDDOT "%d game%s",
+              lib.folderFound[0], lib.folderFound[0] == 1 ? "" : "s");
+    page.installStatus[sizeof(page.installStatus) - 1] = '\0';
+    {
+        SettingsRowView &row = AddSettingsRow(page, SETTINGS_VIEW_FOLDER, gamesPath);
+        row.status = page.installStatus;
+        row.statusGreen = true;
+        row.checked = true;
+        row.locked = true;
+        row.help = "Games install here, so it's always scanned. Change install folder, above, moves it.";
+    }
+
+    // The other folders looked in - games, homebrew and apps - and the likely
+    // ones that could be. Each says what it holds on its right, which left
+    // and right change.
+    FindLibraryFolders(gamesPath, lib.folderFound + 1);
+    for (int i = 0; i < g_folderRowCount; ++i)
+    {
+        const LibraryFolderRow &folder = g_folderRows[i];
+        char *status = page.folderStatus[i];
+        const size_t statusSize = sizeof(page.folderStatus[i]);
+        char *help = page.folderHelp[i];
+        const size_t helpSize = sizeof(page.folderHelp[i]);
+        const char *kindName = kFolderKindNames[folder.kind];
+        SettingsRowView &row = AddSettingsRow(page, SETTINGS_VIEW_FOLDER, folder.path);
+        page.args[page.count - 1] = i;
+        page.actions[page.count - 1][0] = SETTINGS_ROW_LIBRARY_FOLDER;
+        row.checked = folder.scanned;
+        if (!folder.scanned)
+        {
+            _snprintf(status, statusSize, "Not scanned");
+            _snprintf(help, helpSize, "Not scanned. A adds it to %s - left and right change what it holds.",
+                      kFolderKindPages[folder.kind]);
+        }
+        else if (!folder.exists)
+        {
+            _snprintf(status, statusSize, "Not found");
+            row.missing = true;
+            _snprintf(help, helpSize, "This folder isn't there any more. A stops looking for it.");
+        }
+        else
+        {
+            if (folder.games < 0)
+                _snprintf(status, statusSize, "Scanning\xE2\x80\xA6");
+            else if (folder.kind == FOLDER_GAMES)
+                _snprintf(status, statusSize, "%d game%s", folder.games, folder.games == 1 ? "" : "s");
+            else if (folder.kind == FOLDER_APPS)
+                _snprintf(status, statusSize, "%d app%s", folder.games, folder.games == 1 ? "" : "s");
+            else if (folder.kind == FOLDER_EMULATORS)
+                _snprintf(status, statusSize, "%d emulator%s", folder.games, folder.games == 1 ? "" : "s");
+            else
+                _snprintf(status, statusSize, "%d found", folder.games);
+            _snprintf(help, helpSize, "Shown in %s. A %s - left and right change what it holds.",
+                      kFolderKindPages[folder.kind], folder.suggested ? "stops scanning it" : "removes it");
+        }
+        status[statusSize - 1] = '\0';
+        help[helpSize - 1] = '\0';
+        row.status = status;
+        row.help = help;
+
+        // What it holds, beside it, as Disc read speed's value is.
+        SettingsControlView &c = row.controls[0];
+        memset(&c, 0, sizeof(c));
+        c.kind = SETTINGS_CONTROL_VALUE;
+        c.label = kindName;
+        c.valueIndex = folder.kind;
+        c.valueCount = FOLDER_KIND_COUNT;
+        c.compact = true;
+        row.controlCount = 1;
+    }
+
+    // --- One line a setting ---
+    AddSettingsRow(page, SETTINGS_VIEW_HEADING, "General");
+
+    // Only the start of the access key is shown - enough to tell which keys
+    // are saved. The secret key is never shown anywhere.
+    if (haveKeys)
+    {
+        char shown[5] = "";
+        strncpy(shown, accessKey.c_str(), 4);
+        shown[4] = '\0';
+        _snprintf(page.keysStatus, sizeof(page.keysStatus), "Saved" SETTINGS_MIDDOT "access key %s\xE2\x80\xA6", shown);
+    }
+    else
+    {
+        _snprintf(page.keysStatus, sizeof(page.keysStatus), "Not set" SETTINGS_MIDDOT "needed to download");
+    }
+    page.keysStatus[sizeof(page.keysStatus) - 1] = '\0';
+    AddSettingsRow(page, SETTINGS_VIEW_LINE, "archive.org keys").status = page.keysStatus;
+    AddSettingsControl(page, SETTINGS_CONTROL_BUTTON, haveKeys ? "Change" : "Add keys", SETTINGS_ROW_KEYS,
+                       "Type your access key and secret key, from archive.org/account/s3.php");
+    if (haveKeys)
+        AddSettingsControl(page, SETTINGS_CONTROL_BUTTON, "Remove", SETTINGS_ROW_REMOVE_KEYS,
+                           "Deletes the saved keys from this console. Store installs stop until new ones are added.");
+
+    // How fast a disc install reads: left and right change it.
+    static const char *const speedNames[DISC_SPEED_FULL] = { "Slowest", "Slow", "Fast", "Full" };
+    const int speed = DiscSpeedSetting();
+    AddSettingsRow(page, SETTINGS_VIEW_LINE, "Disc read speed");
+    AddSettingsControl(page, SETTINGS_CONTROL_VALUE, speedNames[speed - 1], SETTINGS_ROW_NONE,
+                       speed == DISC_SPEED_FULL
+                           ? "The fastest. If a disc fails partway through, try a slower speed - left and right change it."
+                           : "Slower, and gentler on a scratched disc. Full is the fastest - left and right change it.");
+    {
+        SettingsControlView &c = page.rows[page.count - 1].controls[0];
+        c.valueIndex = speed - 1;
+        c.valueCount = DISC_SPEED_FULL;
+    }
+
+    AddSettingsRow(page, SETTINGS_VIEW_LINE, "Download speed");
+    AddSettingsControl(page, SETTINGS_CONTROL_BUTTON, "Run test", SETTINGS_ROW_SPEED_TEST,
+                       "Checks how fast your internet, your console and archive.org are, to see what slows "
+                       "downloads down. About a minute.");
+
+    // The version, and whether there's a newer one.
+    UpdateInfo update;
+    const UpdateState state = GetUpdateState(&update, NULL);
+    switch (state)
+    {
+    case UPDATE_AVAILABLE:
+        _snprintf(page.updatesStatus, sizeof(page.updatesStatus), "%s" SETTINGS_MIDDOT "%s is available", CURRENT_VERSION,
+                  update.version);
+        _snprintf(page.updatesHelp, sizeof(page.updatesHelp), "What's new in %s - and updating to it.", update.version);
+        break;
+    case UPDATE_CHECKING:
+        _snprintf(page.updatesStatus, sizeof(page.updatesStatus), "%s" SETTINGS_MIDDOT "checking\xE2\x80\xA6", CURRENT_VERSION);
+        break;
+    case UPDATE_CURRENT:
+        _snprintf(page.updatesStatus, sizeof(page.updatesStatus), "%s" SETTINGS_MIDDOT "up to date", CURRENT_VERSION);
+        break;
+    case UPDATE_FAILED:
+        _snprintf(page.updatesStatus, sizeof(page.updatesStatus), "%s" SETTINGS_MIDDOT "couldn't reach GitHub", CURRENT_VERSION);
+        break;
+    default:
+        _snprintf(page.updatesStatus, sizeof(page.updatesStatus), "%s", CURRENT_VERSION);
+        break;
+    }
+    page.updatesStatus[sizeof(page.updatesStatus) - 1] = '\0';
+    page.updatesHelp[sizeof(page.updatesHelp) - 1] = '\0';
+    AddSettingsRow(page, SETTINGS_VIEW_LINE, "Updates").status = page.updatesStatus;
+    if (state == UPDATE_AVAILABLE)
+        AddSettingsControl(page, SETTINGS_CONTROL_BUTTON, "What's new", SETTINGS_ROW_UPDATES, page.updatesHelp);
+    else
+        AddSettingsControl(page, SETTINGS_CONTROL_BUTTON, "Check now", SETTINGS_ROW_UPDATES,
+                           "Asks GitHub for the latest version now.");
+    AddSettingsControl(page, SETTINGS_CONTROL_CHECK, "At start", SETTINGS_ROW_UPDATE_CHECKS,
+                       "Asks GitHub for the latest version each time Omni360 starts.");
+    page.rows[page.count - 1].controls[1].on = UpdateChecksOn();
+
+    AddSettingsRow(page, SETTINGS_VIEW_LINE, "Navigation sounds");
+    AddSettingsControl(page, SETTINGS_CONTROL_CHECK, NULL, SETTINGS_ROW_SOUNDS,
+                       "A soft tick as you move around, and a sound for A and B.");
+    page.rows[page.count - 1].controls[0].on = UiSoundsSetting();
+
+    // The focus where it was, on a row that's still there.
+    if (page.focusRow > page.count - 1)
+        page.focusRow = page.count - 1;
+    if (page.focusRow < 0)
+        page.focusRow = 0;
+    while (page.focusRow < page.count - 1 && !SettingsRowFocusable(page.rows[page.focusRow]))
+        page.focusRow++;
+    const int controls = page.rows[page.focusRow].controlCount;
+    if (page.focusCol > controls - 1)
+        page.focusCol = controls > 0 ? controls - 1 : 0;
+}
+
+// Up and down: the next row that takes focus.
+static void StepSettingsRow(SettingsPage &page, int direction)
+{
+    for (int i = page.focusRow + direction; i >= 0 && i < page.count; i += direction)
+    {
+        if (SettingsRowFocusable(page.rows[i]))
+        {
+            page.focusRow = i;
+            page.focusCol = 0;
+            return;
+        }
+    }
+}
+
+// Settings' speed test, with the saved keys if there are any - without them
+// it leaves archive.org out rather than asking for them.
+static void RunSpeedTest(const char *gamesPath)
+{
+    std::string accessKey, secretKey;
+    char header[IAS3_AUTH_HEADER_MAX];
+    const bool keys = LoadSavedKeys(accessKey, secretKey) &&
+                      BuildIas3AuthHeader(accessKey, secretKey, header, sizeof(header));
+    RunSpeedTestUI(keys ? header : NULL, gamesPath);
+}
+
+static SettingsOutcome RunSettingsRow(SettingsRow row, int arg, Library &lib, char *gamesPath, size_t gamesPathSize)
+{
+    SettingsOutcome outcome = {false, false};
+
+    switch (row)
+    {
+    case SETTINGS_ROW_GAMES_FOLDER: ChangeGamesFolder(lib, gamesPath, gamesPathSize, outcome); break;
+    case SETTINGS_ROW_KEYS:         ChangeKeys(outcome); break;
+    case SETTINGS_ROW_REMOVE_KEYS:  RemoveKeys(outcome); break;
+    case SETTINGS_ROW_UPDATES:      ShowUpdate(); break;
+    case SETTINGS_ROW_UPDATE_CHECKS: ToggleUpdateChecks(); break;
+    case SETTINGS_ROW_LIBRARY_FOLDER: ToggleLibraryFolder(arg, lib, gamesPath, outcome); break;
+    case SETTINGS_ROW_ADD_FOLDER:   AddLibraryFolder(lib, gamesPath, outcome); break;
+    case SETTINGS_ROW_SOUNDS:       ToggleUiSounds(); break;
+    case SETTINGS_ROW_SPEED_TEST:   RunSpeedTest(gamesPath); break;
+    default:                        break;
+    }
+
+    return outcome;
+}
+
+// ---------------------------------------------------------------------------
+// Installing a disc as Games on Demand
+// ---------------------------------------------------------------------------
+
+// UTF-8 into the keyboard's WCHAR default text. Characters outside the BMP
+// become '?'.
+static void Utf8ToWideText(const char *in, WCHAR *out, int outSize)
+{
+    int n = 0;
+    const unsigned char *s = (const unsigned char *)in;
+    while (*s != 0 && n < outSize - 1)
+    {
+        unsigned long c = *s++;
+        int extra = (c >= 0xF0) ? 3 : (c >= 0xE0) ? 2 : (c >= 0xC0) ? 1 : 0;
+        if (extra > 0)
+            c &= (0x3F >> extra);
+        else if (c >= 0x80)
+            c = '?';
+        for (; extra > 0 && (*s & 0xC0) == 0x80; --extra)
+            c = (c << 6) | (*s++ & 0x3F);
+        out[n++] = (extra > 0 || c > 0xFFFF) ? L'?' : (WCHAR)c;
+    }
+    out[n] = L'\0';
+}
+
+// What OpenKeyboardToString hands back for text: one byte per character, and
+// '?' for anything past U+00FF. Used to tell whether a name came back from
+// the keyboard unchanged.
+static std::string Utf8AsKeyboardText(const char *utf8)
+{
+    WCHAR wide[128];
+    Utf8ToWideText(utf8, wide, 128);
+    std::string out;
+    for (int i = 0; wide[i] != L'\0'; ++i)
+        out += (wide[i] <= 0xFF) ? (char)wide[i] : '?';
+    return out;
+}
+
+static std::string Latin1ToUtf8(const std::string &in)
+{
+    std::string out;
+    for (size_t i = 0; i < in.length(); ++i)
+    {
+        unsigned char c = (unsigned char)in[i];
+        if (c < 0x80)
+            out += (char)c;
+        else
+        {
+            out += (char)(0xC0 | (c >> 6));
+            out += (char)(0x80 | (c & 0x3F));
+        }
+    }
+    return out;
+}
+
+static WORD AnyPadButtons()
+{
+    WORD buttons = 0;
+    for (DWORD i = 0; i < XUSER_MAX_COUNT; ++i)
+    {
+        XINPUT_STATE state;
+        ZeroMemory(&state, sizeof(state));
+        if (XInputGetState(i, &state) == ERROR_SUCCESS)
+            buttons |= state.Gamepad.wButtons;
+    }
+    return buttons;
+}
+
+// At startup: if the last install never finished, take its partial package
+// away. A package whose files already add up to the full size did finish -
+// the app just ended before it could clear the marker - and is kept.
+static void CleanUpInterruptedInstall()
+{
+    FILE *f = fopen(INSTALL_MARKER_FILE, "r");
+    if (f == NULL)
+        return;
+
+    char root[MAX_TEXT_LENGTH] = "", idLine[32] = "", mediaLine[32] = "", sizeLine[32] = "", name[256] = "";
+    bool ok = fgets(root, sizeof(root), f) && fgets(idLine, sizeof(idLine), f) &&
+              fgets(mediaLine, sizeof(mediaLine), f) && fgets(sizeLine, sizeof(sizeLine), f);
+    if (ok && fgets(name, sizeof(name), f) == NULL)
+        name[0] = '\0';
+    fclose(f);
+
+    root[strcspn(root, "\r\n")] = '\0';
+    name[strcspn(name, "\r\n")] = '\0';
+
+    unsigned long titleId = strtoul(idLine, NULL, 16);
+    unsigned long mediaId = strtoul(mediaLine, NULL, 16);
+    unsigned long long expected = _strtoui64(sizeLine, NULL, 10);
+
+    if (!ok || root[0] == '\0' || titleId == 0)
+    {
+        dprintf("[disc] %s is unreadable; removing it\n", INSTALL_MARKER_FILE);
+        ClearInstallMarker();
+        return;
+    }
+
+    // Its drive isn't here - a USB drive that has been unplugged. Kept for a
+    // launch where it is, rather than forgetting the partial copy on it.
+    if (!FolderExists(root))
+    {
+        dprintf("[disc] an unfinished install of \"%s\" is on %s, which isn't available; will retry next launch\n",
+                name, root);
+        return;
+    }
+
+    unsigned long long onDisk = GodPackageSizeOnDisk(root, titleId, mediaId);
+    if (expected > 0 && onDisk == expected)
+    {
+        dprintf("[disc] \"%s\" had finished installing (%I64u bytes); keeping it\n", name, onDisk);
+        ClearInstallMarker();
+        return;
+    }
+
+    dprintf("[disc] removing the unfinished install of \"%s\" (%08lX, media %08lX) from %s\n",
+            name, titleId, mediaId, root);
+    RenderStatusFrame("Cleaning up", "Removing a game install that didn't finish", name);
+    GodRemovePackage(root, titleId, mediaId);
+    ClearInstallMarker();
+}
+
+// The name the dashboard will show for a disc about to be installed. The
+// bundled list only suggests one - its names are community-edited - so when
+// there's no listed name the keyboard asks, with "Title XXXXXXXX" filled in.
+// False if the keyboard was cancelled.
+static bool AskDiscName(const char *suggested, unsigned int discNumber, unsigned int discCount, std::string &name)
+{
+    WCHAR wideSuggested[128];
+    Utf8ToWideText(suggested, wideSuggested, 128);
+
+    WCHAR description[160];
+    if (discCount > 1)
+        swprintf_s(description, 160, L"The name the dashboard and Aurora show. This is disc %u of %u.",
+                   discNumber, discCount);
+    else
+        swprintf_s(description, 160, L"The name the dashboard and Aurora show.");
+
+    std::string typed;
+    if (OpenKeyboardToString(XUSER_INDEX_ANY, &typed, L"Game Name", description, wideSuggested) != ERROR_SUCCESS)
+        return false;
+    TrimInPlace(typed);
+
+    // Unchanged, the original is kept: the keyboard hands text back one byte
+    // per character, which would turn a name like "Modern WarfareÂ® 3" or a
+    // Japanese title into question marks.
+    if (typed.empty() || typed == Utf8AsKeyboardText(suggested))
+        name = suggested;
+    else
+        name = Latin1ToUtf8(typed);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+static void WaitForExit()
+{
+    dprintf("\nPress B to exit\n");
+
+    XINPUT_STATE state;
+    for (;;)
+    {
+        ZeroMemory(&state, sizeof(state));
+        if (XInputGetState(0, &state) == ERROR_SUCCESS && (state.Gamepad.wButtons & XINPUT_GAMEPAD_B))
+            break;
+        Sleep(50);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The shell: a sidebar of pages, and one loop driving it
+// ---------------------------------------------------------------------------
+
+// Downloads and disc installs, on one Queue page.
+#define MAX_QUEUE_ROWS (MAX_QUEUE_JOBS + MAX_DISC_JOBS + MAX_GAME_JOBS + 1)
+
+// One tile of the Queue page's "Recently installed" row. The name is kept
+// rather than pointed at, because the job it came from is removed the
+// moment the tile is - see Shell::queueRecents.
+struct QueueRecent
+{
+    int id;
+    unsigned long titleId;
+    char name[128];
+};
+
+// The Store's sections with A-Z pages of their own - the arcade's and the
+// indie games' lists (ArcadeSet), and the Original Xbox's discs.
+#define SECTION_XBLA  ARCADE_XBLA
+#define SECTION_XBLIG ARCADE_XBLIG
+#define SECTION_XBOX  2
+#define SECTION_COUNT 3
+
+struct Shell
+{
+    ShellPage page;
+
+    // The sidebar has focus rather than the page. Home draws no sidebar and
+    // uses homeFocus instead, so this is held false while it's the page -
+    // see the Home branch in the input loop, and SidebarShown below.
+    bool sidebarFocused;
+
+    // Home: which of its two rows has focus (HOME_FOCUS_*), and where it is
+    // in each.
+    int homeFocus;
+    int homeNavFocus;
+    int homeSelected;
+    int homeScroll;
+
+    int librarySelected;
+    int libraryScroll; // -1 until placed - see LibraryPageView
+
+    SettingsPage settings;
+    Picker picker; // open over the library while picker.kind != PICKER_NONE
+
+    // The queue as of this frame, copied out of DownloadQueue at the top of
+    // each pass, and the row text built from it. The selection is held as a
+    // job id as well as a row, because the rows reorder as jobs start and
+    // finish - and pressing X should act on the job you were looking at.
+    QueueJobSnapshot queueJobs[MAX_QUEUE_ROWS];
+    int queueCount;
+    int queueSelected;
+    int queueSelectedId;
+    int queueScroll;
+    QueueRowView queueRows[MAX_QUEUE_ROWS];
+    char queueStatus[MAX_QUEUE_ROWS][256];
+    char queueNumbers[MAX_QUEUE_ROWS][128];
+
+    // What installed, as the row across the top of the Queue page. Kept
+    // across frames rather than rebuilt from the snapshot, because nothing
+    // records when a job finished: a job is put at the front the frame it
+    // first reads as installed, so the row is in the order they finished.
+    // The id ties a tile back to its job - removing the tile removes the
+    // job, and a job removed any other way drops out of the row with it.
+    QueueRecent queueRecents[MAX_QUEUE_ROWS];
+    QueueRecentView queueRecentRows[MAX_QUEUE_ROWS];
+    int queueRecentCount;
+    int queueRecentFocus;
+    int queueRecentScroll;
+    bool queueOnRecents; // the row has the focus, not the cards below it
+
+    // The disc in the drive, as the library's first tile - see UpdateDisc.
+    // librarySelected counts it: with a disc, 0 is the disc and game i is
+    // item i + 1.
+    DiscInfo disc;
+    bool hasDisc;
+    bool discInstalled;
+    char discName[128];
+
+    // A disc install finished: read the library again at the top of the
+    // next pass, so the game is in it.
+    bool rescanLibrary;
+    bool rescanShelves; // likewise the Apps, Homebrew and Emulators pages, for a homebrew install
+
+    // The Store's Homebrew page, open over the front page: the ConsoleMods
+    // repo's apps, homebrew and emulators, a row of tiles each.
+    bool storeInHomebrew;
+    int homebrewRow;
+    int homebrewPlace;
+    int homebrewRowScroll[HOMEBREW_KIND_COUNT]; // each row's first tile shown
+    float homebrewScroll;                       // pixels the page has moved up
+
+    // What takes a file read or a drive query to find out, so it's refreshed
+    // only when something may have changed it - on the way back from any
+    // action, or when a download finishes - rather than on every frame.
+    bool stale;
+    bool settingsStale; // only the Settings page needs building again
+    bool keysSaved;
+    StorageStatus storage;
+
+    // The Store's front page: which tile has focus (STORE_FOCUS_*), how far
+    // it has scrolled, and whether its wallpapers have been asked for yet.
+    int storeFocus;
+    float storeScroll;
+    int storeRowScroll[STORE_ROWS_MAX]; // each row of games' first shown
+    int storeCollectionScroll;          // the Collections' first card shown
+    bool storeArtRequested;
+
+    // A section's A-Z page - Xbox Live Arcade's, the Indie Games' or the
+    // Original Xbox's - open over the front page, and which letter has focus
+    // on each. A letter's grid and a game's page open over it in turn.
+    bool storeInSection;
+    int storeSection;      // SECTION_*
+    int sectionFocus[SECTION_COUNT];
+
+    // A letter's games, while one is open over the front page - or over a
+    // section's page, storeLetterSection; an arcade or indie letter's games
+    // are in g_arcadeGames (storeLetterArcade), others in g_storeGames.
+    bool storeInLetter;
+    bool storeLetterArcade;
+    int storeLetterSection; // SECTION_*, or -1 for the front page's
+    char storeLetter;
+    int storeGameCount; // in g_storeGames
+
+    // Or a collection's games, in g_storeGames, oldest first.
+    bool storeInCollection;
+    int storeCollection;
+
+    // Or a search's results, in g_searchHits - any list's games - with what
+    // was typed.
+    bool storeSearch;
+    char storeQuery[64];
+    int storeSelected;
+    int storeLetterScroll;
+
+    // The Filter and sort panel, open over a letter of disc games: its
+    // focused row (FILTER_ROW_*), and whether a filter changed - saved to
+    // settings.txt when it closes.
+    bool storeFilterOpen;
+    int storeFilterFocus;
+    bool storeFilterChanged;
+
+    // A game's page, open over the letter or the front page - or over the
+    // library, with libraryInGame. The page is the same either way.
+    bool storeInGame;
+    bool libraryInGame;
+    int storeGameFocus;     // STORE_GAME_FOCUS_*
+    int storeVersionChosen;
+    int storeVersionScroll;
+    bool storeVersionsOpen; // the Versions panel, over the page - Y
+    int storeVersionFocus;
+    bool storeShotsAsked;   // its screenshots, once its details came
+    int storeSimilarScroll; // More like this's first game shown
+    float storeGameScroll;  // how far the page has moved up, to show it
+};
+
+// One letter's games and their tiles - or the All tile's, every game of a
+// list: as many as the biggest list has.
+#define MAX_OF(a, b) ((a) > (b) ? (a) : (b))
+#define MAX_STORE_GAMES MAX_OF(MAX_OF(STORE_GAME_COUNT, XBOX_GAME_COUNT), MAX_OF(XBLA_GAME_COUNT, XBLIG_GAME_COUNT))
+// A search shows the best this many - as many as the biggest letter has.
+#define MAX_SEARCH_HITS MAX_OF(STORE_MAX_LETTER_GAMES, ARCADE_MAX_LETTER_GAMES)
+static StoreGame g_storeGames[MAX_STORE_GAMES];
+static const XblaGame *g_arcadeGames[MAX_STORE_GAMES];
+static StoreTileView g_storeTiles[MAX_STORE_GAMES];
+static StoreHit g_searchHits[MAX_SEARCH_HITS];
+static int g_searchTotal = 0; // every match, of which the first MAX_SEARCH_HITS are shown
+// How many games each letter of a section has, counted when its page first
+// opens - a letter with none is drawn faded. By SECTION_*.
+static int g_sectionLetterCounts[SECTION_COUNT][STORE_LETTER_COUNT];
+static bool g_sectionCounted[SECTION_COUNT] = { false, false, false };
+
+// The game whose page is open, and its version rows - the labels are the
+// table's, the sizes formatted here.
+static StoreGame g_storeGame;
+static StoreVersionView g_storeVersions[STORE_MAX_VERSIONS];
+static char g_storeVersionSize[STORE_MAX_VERSIONS][24];
+static char g_storeVersionDetail[STORE_MAX_VERSIONS][160]; // a detail with the slow-install note added
+
+// Its More like this row, and the row's tiles.
+static StoreGame g_similarGames[STORE_SIMILAR_MAX];
+static StoreTileView g_similarTiles[STORE_SIMILAR_MAX];
+static int g_similarCount = 0;
+static StoreDetails g_storeDetails;
+static char g_storeMeta[256];
+
+// The arcade or indie game whose page is open, or NULL for a disc's. Its one
+// version row is the RAR - the game, and anything packed with it.
+static const XblaGame *g_storeArcade = NULL;
+
+// Static rather than on main's stack: the picker's match arrays and the
+// queue's snapshot are tens of KB between them.
+static Shell g_shell;
+
+// An empty Queue has nothing to choose - on it, the sidebar keeps focus.
+static bool PageTakesFocus(const Shell &shell, ShellPage page)
+{
+    if (page == SHELL_PAGE_QUEUE)
+        return shell.queueCount > 0;
+    ShelfKind shelf;
+    return page == SHELL_PAGE_HOME || page == SHELL_PAGE_LIBRARY || ShelfForPage(page, &shelf) ||
+           page == SHELL_PAGE_STORE || page == SHELL_PAGE_SETTINGS;
+}
+
+// The sidebar is this group's own navigation, not the app's: Games and the
+// three shelves share it, and it lists only them. Home, the Store, the Queue
+// and Settings draw full width and are reached from Home's nav row instead,
+// so shell.sidebarFocused means nothing on them and is held false.
+static bool SidebarShown(const Shell &shell)
+{
+    ShelfKind shelf;
+    return shell.page == SHELL_PAGE_LIBRARY || ShelfForPage(shell.page, &shelf);
+}
+
+// Left out of a page's first column goes to the sidebar - where the page has
+// one. On the pages that don't, the press does nothing.
+static void FocusSidebar(Shell &shell)
+{
+    if (SidebarShown(shell))
+        shell.sidebarFocused = true;
+}
+
+// Not in the sidebar. It lists its own group and nothing else: Games, and
+// Apps, Homebrew or Emulators while each has folders set. Home, the Store,
+// the Queue and Settings are reached from Home's nav row instead.
+static bool PageHidden(ShellPage page)
+{
+    ShelfKind shelf;
+    if (ShelfForPage(page, &shelf))
+        return g_shelves[shelf].pathCount == 0;
+    return page != SHELL_PAGE_LIBRARY;
+}
+
+// Up or down the sidebar, past the pages it leaves out. Stays put at either end.
+static ShellPage NextShownPage(ShellPage page, int step)
+{
+    for (int p = (int)page + step; p >= 0 && p < SHELL_PAGE_COUNT; p += step)
+    {
+        if (!PageHidden((ShellPage)p))
+            return (ShellPage)p;
+    }
+    return page;
+}
+
+// Moves to a page and puts focus where that page expects it: Home on its
+// recents row, everything else on the sidebar it was reached from.
+static void EnterPage(Shell &shell, ShellPage page, bool fromSidebar)
+{
+    shell.page = page;
+    if (page == SHELL_PAGE_HOME)
+    {
+        shell.sidebarFocused = false;
+        shell.homeFocus = HOME_FOCUS_RECENTS;
+    }
+    else
+    {
+        shell.sidebarFocused = fromSidebar;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The Store's front page
+// ---------------------------------------------------------------------------
+
+#define STORE_MIDDOT "  \xC2\xB7  "
+
+// The featured games, from featured.json in the repository - an event's, or
+// the week's - as Featured.h has them. Picked up each frame; the details
+// under the large tile are the Xbox Live catalog's.
+static FeaturedSet g_featured;
+static unsigned long g_featuredChanges = (unsigned long)-1;
+static StoreFeaturedView g_featuredTiles[STORE_FEATURED_MAX];
+static int g_featuredCount = 0;
+static char g_featuredDetail[192];
+
+static void AppendText(char *out, size_t outSize, const char *separator, const char *text);
+
+// The latest set; true if it changed since the last call.
+static bool RefreshFeatured()
+{
+    unsigned long changes = 0;
+    FeaturedSet set;
+    GetFeatured(&set, &changes);
+    if (changes == g_featuredChanges)
+        return false;
+    g_featuredChanges = changes;
+    g_featured = set;
+    g_featuredCount = set.count < STORE_FEATURED_MAX ? set.count : STORE_FEATURED_MAX;
+    for (int i = 0; i < g_featuredCount; ++i)
+    {
+        StoreGame game;
+        g_featuredTiles[i].titleId = set.titleIds[i];
+        g_featuredTiles[i].name = StoreGameByTitleId(set.titleIds[i], &game) ? game.name : "";
+        g_featuredTiles[i].detail = NULL;
+    }
+    RequestStoreDetails(set.titleIds[0]);
+    return true;
+}
+
+// The other ways in - those still to come marked SOON. DLC and title updates
+// are on each game's page instead.
+// The Store's Homebrew page. ConsoleMods let Omni360 through their bot
+// protection on 2026-11-01, with the user agent Derf asked for - see
+// UserAgentFor in downloadFile.cpp. False draws the button faded, marked
+// SOON, as it was until then.
+#define HOMEBREW_STORE_OPEN true
+
+// Search is Y, anywhere on the front page.
+static const StoreButtonView kStoreButtons[STORE_BUTTON_COUNT] = {
+    { "Homebrew", !HOMEBREW_STORE_OPEN },
+    { "XBLA", false },
+    { "XBLIG", false },
+    { "Original Xbox", false },
+};
+
+// What each will be, for the toast when one's pressed before then.
+#define STORE_BUTTON_HOMEBREW 0
+#define STORE_BUTTON_XBLA  1
+#define STORE_BUTTON_XBLIG 2
+#define STORE_BUTTON_XBOX  3
+static const char *const kStoreButtonsSoon[STORE_BUTTON_COUNT] = {
+    "Homebrew apps, games and emulators",
+    "Xbox Live Arcade games, A to Z",
+    "Xbox Live Indie Games, A to Z",
+    "Original Xbox games, A to Z",
+};
+
+static const char kStoreLetters[] = "*#ABCDEFGHIJKLMNOPQRSTUVWXYZ"; // STORE_LETTER_ALL first
+
+// A to Z tile's hint: "Browse B", or "Browse all".
+static void BrowseHint(WCHAR *out, int outSize, char letter)
+{
+    if (letter == STORE_LETTER_ALL)
+        _snwprintf(out, outSize, L"Browse all");
+    else
+        _snwprintf(out, outSize, L"Browse %c", (WCHAR)letter);
+    out[outSize - 1] = L'\0';
+}
+
+// The rows under the A to Z - Popular, Top rated, a genre each - as
+// StoreRows.h has them, looked up once.
+static StoreGame g_rowGames[STORE_ROWS_MAX][STORE_ROW_TILES_MAX];
+static StoreTileView g_rowTiles[STORE_ROWS_MAX][STORE_ROW_TILES_MAX];
+static int g_rowCounts[STORE_ROWS_MAX];
+static int g_rowCount = 0;
+
+// The Collections, a card each, as StoreCollections.h has them.
+static StoreCollectionView g_collections[STORE_COLLECTIONS_MAX];
+static int g_collectionIds[STORE_COLLECTIONS_MAX]; // each card's, for StoreCollectionGames
+static int g_collectionCount = 0;
+
+static void BuildStoreRows()
+{
+    g_collectionCount = 0;
+    const int collections = StoreCollectionCount() < STORE_COLLECTIONS_MAX ? StoreCollectionCount()
+                                                                          : STORE_COLLECTIONS_MAX;
+    for (int c = 0; c < collections; ++c)
+    {
+        StoreGame games[STORE_ROW_TILES_MAX];
+        StoreCollectionView &card = g_collections[g_collectionCount];
+        card.count = StoreCollectionGames(c, games, STORE_ROW_TILES_MAX);
+        if (card.count == 0)
+            continue;
+        card.name = StoreCollectionName(c);
+        card.art = StoreCollectionArt(c);
+        g_collectionIds[g_collectionCount++] = c;
+    }
+
+    g_rowCount = 0;
+    const int rows = StoreRowCount() < STORE_ROWS_MAX ? StoreRowCount() : STORE_ROWS_MAX;
+    for (int r = 0; r < rows; ++r)
+    {
+        const int n = StoreRowGames(r, g_rowGames[g_rowCount], STORE_ROW_TILES_MAX);
+        if (n == 0)
+            continue;
+        for (int i = 0; i < n; ++i)
+        {
+            StoreTileView &tile = g_rowTiles[g_rowCount][i];
+            tile.titleId = g_rowGames[g_rowCount][i].titleId;
+            tile.name = g_rowGames[g_rowCount][i].name;
+            tile.letter = g_rowGames[g_rowCount][i].letter;
+            tile.indie = false;
+        }
+        g_rowCounts[g_rowCount++] = n;
+    }
+}
+
+// Where focus is on a row: its game at `place`, kept to the row.
+static int StoreRowFocus(int row, int place)
+{
+    if (place >= g_rowCounts[row])
+        place = g_rowCounts[row] - 1;
+    if (place < 0)
+        place = 0;
+    return STORE_FOCUS_ROWS + row * STORE_ROW_TILES_MAX + place;
+}
+
+static StorePageView MakeStoreView(const Shell &shell)
+{
+    StorePageView view;
+    memset(&view, 0, sizeof(view));
+    view.featuredLabel = g_featured.label;
+    view.featuredCount = g_featuredCount;
+    view.collectionCount = g_collectionCount;
+    for (int c = 0; c < g_collectionCount; ++c)
+        view.collections[c] = g_collections[c];
+    view.collectionScroll = shell.storeCollectionScroll;
+    view.rowCount = g_rowCount;
+    for (int r = 0; r < g_rowCount; ++r)
+    {
+        view.rows[r].name = StoreRowName(r);
+        view.rows[r].tiles = g_rowTiles[r];
+        view.rows[r].count = g_rowCounts[r];
+        view.rows[r].scroll = shell.storeRowScroll[r];
+    }
+    for (int i = 0; i < g_featuredCount; ++i)
+        view.featured[i] = g_featuredTiles[i];
+
+    // Who made the large tile's game, and what it is, once the catalog says.
+    static StoreDetails details;
+    if (GetStoreDetails(g_featuredTiles[0].titleId, &details) == STORE_DETAILS_READY)
+    {
+        g_featuredDetail[0] = '\0';
+        AppendText(g_featuredDetail, sizeof(g_featuredDetail), "", details.developer);
+        if (details.genre[0] != '\0')
+            AppendText(g_featuredDetail, sizeof(g_featuredDetail), STORE_MIDDOT, details.genre);
+        view.featured[0].detail = g_featuredDetail[0] != '\0' ? g_featuredDetail : NULL;
+    }
+    for (int i = 0; i < STORE_BUTTON_COUNT; ++i)
+        view.buttons[i] = kStoreButtons[i];
+    view.letters = kStoreLetters;
+    view.focus = shell.storeFocus;
+    view.scroll = shell.storeScroll;
+    view.focused = !shell.sidebarFocused;
+    return view;
+}
+
+// The featured tile next to tile f in the D-pad's direction - the nearest
+// whose side faces it, its middle closest in line - or -1 for none.
+static int NextFeaturedTile(int f, WORD nav)
+{
+    float ax, ay, aw, ah;
+    StoreFeaturedTileRect(g_featuredCount, f, &ax, &ay, &aw, &ah);
+    const float acx = ax + aw * 0.5f, acy = ay + ah * 0.5f, slack = 2.0f;
+    int best = -1;
+    float bestScore = 0.0f;
+    for (int j = 0; j < g_featuredCount; ++j)
+    {
+        if (j == f)
+            continue;
+        float bx, by, bw, bh;
+        StoreFeaturedTileRect(g_featuredCount, j, &bx, &by, &bw, &bh);
+        const float bcx = bx + bw * 0.5f, bcy = by + bh * 0.5f;
+        float along, across;
+        if (nav == XINPUT_GAMEPAD_DPAD_RIGHT && bx >= ax + aw - slack)
+            along = bx - (ax + aw), across = fabsf(bcy - acy);
+        else if (nav == XINPUT_GAMEPAD_DPAD_LEFT && bx + bw <= ax + slack)
+            along = ax - (bx + bw), across = fabsf(bcy - acy);
+        else if (nav == XINPUT_GAMEPAD_DPAD_DOWN && by >= ay + ah - slack)
+            along = by - (ay + ah), across = fabsf(bcx - acx);
+        else if (nav == XINPUT_GAMEPAD_DPAD_UP && by + bh <= ay + slack)
+            along = ay - (by + bh), across = fabsf(bcx - acx);
+        else
+            continue;
+        const float score = along + across * 2.0f;
+        if (best < 0 || score < bestScore)
+        {
+            best = j;
+            bestScore = score;
+        }
+    }
+    return best;
+}
+
+// Where focus is on the Collections: card `place`, kept to the row.
+static int StoreCollectionFocus(int place)
+{
+    if (place >= g_collectionCount)
+        place = g_collectionCount - 1;
+    if (place < 0)
+        place = 0;
+    return STORE_FOCUS_COLLECTIONS + place;
+}
+
+// The letter in the A to Z's last row under about the same place as one of
+// `across` things on screen.
+static int LastLetterRowFocus(int onScreen, int across)
+{
+    const int perRow = StoreLettersPerRow();
+    int l = ((STORE_LETTER_COUNT - 1) / perRow) * perRow + onScreen * perRow / across;
+    if (l > STORE_LETTER_COUNT - 1)
+        l = STORE_LETTER_COUNT - 1;
+    return STORE_FOCUS_LETTERS + l;
+}
+
+// The D-pad on the front page. The featured tiles are a large one and up to
+// four beside it, gone between by where they are; the buttons are one row
+// under them; the letters wrap, perRow to a row; the Collections and the
+// rows of games under them go sideways. Left from the first column goes to
+// the sidebar.
+static void StepStoreFocus(WORD nav, Shell &shell)
+{
+    const int perRow = StoreLettersPerRow();
+    int i = shell.storeFocus;
+
+    if (i < STORE_FOCUS_BUTTONS)
+    {
+        const int f = i - STORE_FOCUS_FEATURED;
+        const int next = NextFeaturedTile(f, nav);
+        if (next >= 0)
+            i = STORE_FOCUS_FEATURED + next;
+        else if (nav == XINPUT_GAMEPAD_DPAD_LEFT)
+            FocusSidebar(shell);
+        else if (nav == XINPUT_GAMEPAD_DPAD_DOWN)
+        {
+            // The button under it: the first for the large tile, else the
+            // one under its middle.
+            float x, y, w, h;
+            StoreFeaturedTileRect(g_featuredCount, f, &x, &y, &w, &h);
+            const float under = (f == 0) ? x + 1.0f : x + w * 0.5f;
+            int b = 0;
+            for (int k = 0; k < STORE_BUTTON_COUNT; ++k)
+            {
+                float bx, by, bw, bh;
+                StoreButtonRect(k, &bx, &by, &bw, &bh);
+                if (under >= bx)
+                    b = k;
+            }
+            i = STORE_FOCUS_BUTTONS + b;
+        }
+    }
+    else if (i < STORE_FOCUS_LETTERS)
+    {
+        const int b = i - STORE_FOCUS_BUTTONS;
+        if (nav == XINPUT_GAMEPAD_DPAD_RIGHT && b + 1 < STORE_BUTTON_COUNT)
+            i++;
+        else if (nav == XINPUT_GAMEPAD_DPAD_LEFT)
+        {
+            if (b == 0)
+                FocusSidebar(shell);
+            else
+                i--;
+        }
+        else if (nav == XINPUT_GAMEPAD_DPAD_UP)
+        {
+            // The lowest featured tile over the button's middle.
+            float bx, by, bw, bh;
+            StoreButtonRect(b, &bx, &by, &bw, &bh);
+            const float mid = bx + bw * 0.5f;
+            int best = 0;
+            float bestBottom = -1.0f;
+            for (int k = 0; k < g_featuredCount; ++k)
+            {
+                float x, y, w, h;
+                StoreFeaturedTileRect(g_featuredCount, k, &x, &y, &w, &h);
+                if (mid >= x && mid <= x + w && y + h > bestBottom)
+                {
+                    best = k;
+                    bestBottom = y + h;
+                }
+            }
+            i = STORE_FOCUS_FEATURED + best;
+        }
+        else if (nav == XINPUT_GAMEPAD_DPAD_DOWN)
+            i = STORE_FOCUS_LETTERS + (b * perRow * 2 + STORE_BUTTON_COUNT) / (STORE_BUTTON_COUNT * 2);
+    }
+    else if (i < STORE_FOCUS_COLLECTIONS)
+    {
+        const int l = i - STORE_FOCUS_LETTERS;
+        const int col = l % perRow;
+        if (nav == XINPUT_GAMEPAD_DPAD_RIGHT && col + 1 < perRow && l + 1 < STORE_LETTER_COUNT)
+            i++;
+        else if (nav == XINPUT_GAMEPAD_DPAD_LEFT)
+        {
+            if (col == 0)
+                FocusSidebar(shell);
+            else
+                i--;
+        }
+        else if (nav == XINPUT_GAMEPAD_DPAD_UP)
+        {
+            if (l >= perRow)
+                i -= perRow;
+            else
+                i = STORE_FOCUS_BUTTONS + col * STORE_BUTTON_COUNT / perRow;
+        }
+        else if (nav == XINPUT_GAMEPAD_DPAD_DOWN && l / perRow < (STORE_LETTER_COUNT - 1) / perRow)
+        {
+            // Down onto a shorter last row lands on its last letter.
+            i = (l + perRow < STORE_LETTER_COUNT) ? i + perRow : STORE_FOCUS_LETTERS + STORE_LETTER_COUNT - 1;
+        }
+        else if (nav == XINPUT_GAMEPAD_DPAD_DOWN && g_collectionCount > 0)
+        {
+            // Onto the Collections, under about the same place.
+            i = StoreCollectionFocus(shell.storeCollectionScroll + col * StoreCollectionsAcross() / perRow);
+        }
+        else if (nav == XINPUT_GAMEPAD_DPAD_DOWN && g_rowCount > 0)
+        {
+            // Into the first row of games, under about the same place.
+            i = StoreRowFocus(0, shell.storeRowScroll[0] + col * StoreRowTilesAcross() / perRow);
+        }
+    }
+    else if (i < STORE_FOCUS_ROWS)
+    {
+        // The Collections: along them, up to the letters, down to the games.
+        const int place = i - STORE_FOCUS_COLLECTIONS;
+        const int onScreen = place - shell.storeCollectionScroll;
+        if (nav == XINPUT_GAMEPAD_DPAD_RIGHT && place + 1 < g_collectionCount)
+            i++;
+        else if (nav == XINPUT_GAMEPAD_DPAD_LEFT)
+        {
+            if (place == 0)
+                FocusSidebar(shell);
+            else
+                i--;
+        }
+        else if (nav == XINPUT_GAMEPAD_DPAD_UP)
+            i = LastLetterRowFocus(onScreen, StoreCollectionsAcross());
+        else if (nav == XINPUT_GAMEPAD_DPAD_DOWN && g_rowCount > 0)
+            i = StoreRowFocus(0, shell.storeRowScroll[0] + onScreen * StoreRowTilesAcross() / StoreCollectionsAcross());
+    }
+    else
+    {
+        // A row of games: along it, or to the same place on screen in the
+        // row above or below.
+        const int r = (i - STORE_FOCUS_ROWS) / STORE_ROW_TILES_MAX;
+        const int place = (i - STORE_FOCUS_ROWS) % STORE_ROW_TILES_MAX;
+        const int onScreen = place - shell.storeRowScroll[r];
+        if (nav == XINPUT_GAMEPAD_DPAD_RIGHT && place + 1 < g_rowCounts[r])
+            i++;
+        else if (nav == XINPUT_GAMEPAD_DPAD_LEFT)
+        {
+            if (place == 0)
+                FocusSidebar(shell);
+            else
+                i--;
+        }
+        else if (nav == XINPUT_GAMEPAD_DPAD_DOWN && r + 1 < g_rowCount)
+            i = StoreRowFocus(r + 1, shell.storeRowScroll[r + 1] + onScreen);
+        else if (nav == XINPUT_GAMEPAD_DPAD_UP && r > 0)
+            i = StoreRowFocus(r - 1, shell.storeRowScroll[r - 1] + onScreen);
+        else if (nav == XINPUT_GAMEPAD_DPAD_UP && g_collectionCount > 0)
+        {
+            // Back up to the Collections, under about the same place.
+            i = StoreCollectionFocus(shell.storeCollectionScroll +
+                                     onScreen * StoreCollectionsAcross() / StoreRowTilesAcross());
+        }
+        else if (nav == XINPUT_GAMEPAD_DPAD_UP)
+        {
+            // Back up to the letters' last row, under about the same place.
+            i = LastLetterRowFocus(onScreen, StoreRowTilesAcross());
+        }
+    }
+
+    shell.storeFocus = i;
+}
+
+// A featured slot the current set doesn't fill - after featured.json brought
+// fewer games - isn't somewhere focus can be.
+static void KeepStoreFocusOnATile(Shell &shell)
+{
+    if (shell.storeFocus >= STORE_FOCUS_FEATURED + g_featuredCount && shell.storeFocus < STORE_FOCUS_BUTTONS)
+        shell.storeFocus = STORE_FOCUS_FEATURED;
+}
+
+// A section's name, for its page and its letters' headers.
+static const char *SectionName(int section)
+{
+    switch (section)
+    {
+    case SECTION_XBLIG: return "Xbox Live Indie Games";
+    case SECTION_XBOX:  return "Original Xbox";
+    default:            return "Xbox Live Arcade";
+    }
+}
+
+// The Store letters' filters and order, chosen on the Filter and sort panel -
+// Y on a letter of disc games. The regions, language and order are someone's
+// preferences, kept in settings.txt; genre, rating and Hide installed are
+// what they're looking for now, and are cleared when they leave the Store.
+// Arcade and indie games have nothing to filter by, so their letters show
+// everything, A to Z - and the Original Xbox's have no genres or ratings.
+enum StoreSort
+{
+    STORE_SORT_AZ,
+    STORE_SORT_POPULAR, // by how many people rated it on Xbox Live
+    STORE_SORT_RATED,   // by its stars
+    STORE_SORT_COUNT
+};
+static const char *const kSortKeys[STORE_SORT_COUNT] = { "a-z", "popular", "rated" };
+static const char *const kSortNames[STORE_SORT_COUNT] = { "A to Z", "Most popular", "Top rated" };
+
+// The region checkboxes; none ticked is every region. A region-free (World)
+// game is under every one.
+static const struct { const char *key; const char *name; unsigned short mask; } kFilterRegions[] =
+{
+    { "usa",  "USA",    STORE_REGIONS_USA },
+    { "eur",  "Europe", STORE_REGIONS_EUR },
+    { "jpn",  "Japan",  STORE_REGIONS_JPN },
+    { "asia", "Asia",   STORE_REGIONS_ASIA },
+};
+#define FILTER_REGION_COUNT (int)(sizeof(kFilterRegions) / sizeof(kFilterRegions[0]))
+
+// Genre's values: Any, the main genres, then the two tags with rows of their
+// own on the front page.
+#define FILTER_GENRE_FAMILY (STORE_GENRE_COUNT + 1)
+#define FILTER_GENRE_KINECT (STORE_GENRE_COUNT + 2)
+#define FILTER_GENRE_VALUES (STORE_GENRE_COUNT + 3)
+
+static const char *const kRatingNames[] = { "Any", "3 stars and up", "4 stars and up" };
+#define FILTER_RATING_VALUES 3
+
+// Top rated puts games fewer people rated than this after the rest - five
+// stars from three people isn't top rated.
+#define TOP_RATED_MIN_RATINGS 100
+
+struct StoreFilter
+{
+    int sort;              // STORE_SORT_*
+    unsigned int regions;  // bits of kFilterRegions; 0 for every region
+    int genre;             // 0 for any; a main genre, 1 to STORE_GENRE_COUNT; or FILTER_GENRE_FAMILY/KINECT
+    int language;          // 0 for any, else 1 + StoreLanguageName's
+    int rating;            // into kRatingNames: at least 2 + rating stars
+    bool hideInstalled;
+};
+static StoreFilter g_filter;
+static bool g_filterRead = false;
+
+// main's library, for Hide installed.
+static const Library *g_storeLib = NULL;
+
+static const char *GenreValueName(int genre)
+{
+    if (genre == FILTER_GENRE_FAMILY)
+        return "For the family";
+    if (genre == FILTER_GENRE_KINECT)
+        return "Kinect";
+    return genre > 0 ? StoreGenreName(genre) : "Any";
+}
+
+// "name=" in settings.txt's line, up to the next ';', into out.
+static void FilterPart(const char *line, const char *name, char *out, size_t outSize)
+{
+    out[0] = '\0';
+    const size_t nameLen = strlen(name);
+    for (const char *at = line; at != NULL && *at != '\0'; at = strchr(at, ';'), at = at ? at + 1 : NULL)
+    {
+        if (strncmp(at, name, nameLen) == 0 && at[nameLen] == '=')
+        {
+            const char *value = at + nameLen + 1;
+            size_t len = strcspn(value, ";");
+            if (len > outSize - 1)
+                len = outSize - 1;
+            memcpy(out, value, len);
+            out[len] = '\0';
+            return;
+        }
+    }
+}
+
+static const StoreFilter &Filter()
+{
+    if (g_filterRead)
+        return g_filter;
+    g_filterRead = true;
+    memset(&g_filter, 0, sizeof(g_filter));
+
+    char line[256], part[64];
+    GetSettingsPath(STORE_FILTER_KEY, "sort=a-z", line, sizeof(line));
+
+    FilterPart(line, "sort", part, sizeof(part));
+    for (int i = 0; i < STORE_SORT_COUNT; ++i)
+    {
+        if (_stricmp(part, kSortKeys[i]) == 0)
+            g_filter.sort = i;
+    }
+    FilterPart(line, "regions", part, sizeof(part));
+    for (int i = 0; i < FILTER_REGION_COUNT; ++i)
+    {
+        if (strstr(part, kFilterRegions[i].key) != NULL)
+            g_filter.regions |= 1u << i;
+    }
+    FilterPart(line, "language", part, sizeof(part));
+    for (int l = 0; l < STORE_LANGUAGE_COUNT && part[0] != '\0'; ++l)
+    {
+        if (_stricmp(part, StoreLanguageName(l)) == 0)
+            g_filter.language = 1 + l;
+    }
+    return g_filter;
+}
+
+static void SaveFilter()
+{
+    const StoreFilter &f = Filter();
+    char regions[32] = "";
+    for (int i = 0; i < FILTER_REGION_COUNT; ++i)
+    {
+        if (f.regions & (1u << i))
+            AppendText(regions, sizeof(regions), regions[0] != '\0' ? "," : "", kFilterRegions[i].key);
+    }
+    char line[256];
+    _snprintf(line, sizeof(line), "sort=%s;regions=%s;language=%s", kSortKeys[f.sort], regions,
+              f.language > 0 ? StoreLanguageName(f.language - 1) : "");
+    line[sizeof(line) - 1] = '\0';
+    if (!SetSettingsValue(STORE_FILTER_KEY, line))
+        ShowMessageUI("Not saved", "settings.txt could not be written.", NULL);
+}
+
+// Whether anything but the order is chosen.
+static bool FilterNarrows(const StoreFilter &f)
+{
+    return f.regions != 0 || f.genre != 0 || f.language != 0 || f.rating != 0 || f.hideInstalled;
+}
+
+// Clears genre, rating and Hide installed. True if any was set.
+static bool ClearSessionFilters()
+{
+    Filter(); // read before it's changed
+    if (g_filter.genre == 0 && g_filter.rating == 0 && !g_filter.hideInstalled)
+        return false;
+    g_filter.genre = 0;
+    g_filter.rating = 0;
+    g_filter.hideInstalled = false;
+    return true;
+}
+
+// Whether a section's letters can be sorted and filtered by genre and
+// rating: not the Original Xbox's, which the catalog has none of.
+static bool SectionHasInfo(int section)
+{
+    return section != SECTION_XBOX;
+}
+
+// The filters as they apply to a section's letters: section as
+// OpenStoreLetter's.
+static StoreFilter FilterFor(int section)
+{
+    StoreFilter f = Filter();
+    if (!SectionHasInfo(section))
+    {
+        f.sort = STORE_SORT_AZ;
+        f.genre = 0;
+        f.rating = 0;
+    }
+    return f;
+}
+
+// The regions ticked, as STORE_REGION_* bits, World included; 0 for every
+// region.
+static unsigned short FilterRegionMask(const StoreFilter &f)
+{
+    unsigned short mask = 0;
+    for (int i = 0; i < FILTER_REGION_COUNT; ++i)
+    {
+        if (f.regions & (1u << i))
+            mask |= kFilterRegions[i].mask;
+    }
+    return mask != 0 ? (unsigned short)(mask | STORE_REGION_WORLD) : 0;
+}
+
+// Installed: in the library by its title ID, or any of its discs installed
+// from the Store.
+static bool StoreGameInstalled(const StoreGame &game)
+{
+    for (int i = 0; g_storeLib != NULL && game.titleId != 0 && i < g_storeLib->count; ++i)
+    {
+        if (g_storeLib->games[i].titleId == game.titleId)
+            return true;
+    }
+    for (int v = 0; v < game.versionCount; ++v)
+    {
+        const StoreRelease *release = StoreReleaseOf(&game, v);
+        for (int d = 0; release != NULL && d < release->discCount; ++d)
+        {
+            const StoreDisc *disc = StoreReleaseDisc(release, d);
+            if (disc != NULL && IsGameZipInstalled(disc->zip))
+                return true;
+        }
+    }
+    return false;
+}
+
+static bool FilterLets(const StoreFilter &f, const StoreGame &game, const StoreGameInfo *info)
+{
+    const unsigned short regions = FilterRegionMask(f);
+    if (regions != 0 && !(game.regions & regions))
+        return false;
+    if (f.genre != 0)
+    {
+        if (info == NULL)
+            return false;
+        if (f.genre == FILTER_GENRE_FAMILY ? !(info->tags & STORE_TAG_FAMILY)
+            : f.genre == FILTER_GENRE_KINECT ? !(info->tags & STORE_TAG_KINECT)
+            : info->genre != f.genre)
+            return false;
+    }
+    if (f.language != 0 && !(StoreGameLanguages(&game) & (1UL << (f.language - 1))))
+        return false;
+    if (f.rating != 0 && (info == NULL || info->stars < (f.rating + 2) * 10))
+        return false;
+    if (f.hideInstalled && StoreGameInstalled(game))
+        return false;
+    return true;
+}
+
+// Whether a goes before b in the sort - both have info or not as given; a
+// game the catalog hasn't got goes last.
+static bool SortsBefore(int sort, const StoreGameInfo &a, bool aKnown, const StoreGameInfo &b, bool bKnown)
+{
+    if (aKnown != bKnown)
+        return aKnown;
+    if (!aKnown)
+        return false;
+    if (sort == STORE_SORT_RATED)
+    {
+        const bool aMany = a.ratings >= TOP_RATED_MIN_RATINGS, bMany = b.ratings >= TOP_RATED_MIN_RATINGS;
+        if (aMany != bMany)
+            return aMany;
+        if (a.stars != b.stars)
+            return a.stars > b.stars;
+    }
+    return a.ratings > b.ratings;
+}
+
+// What CompareForSort sorts by: qsort takes no context of its own.
+static const StoreGameInfo *g_sortInfo;
+static const bool *g_sortKnown;
+static int g_sortBy;
+
+// For qsort, of positions into g_sortInfo: by SortsBefore, then position.
+static int CompareForSort(const void *a, const void *b)
+{
+    const int i = *(const int *)a, j = *(const int *)b;
+    if (SortsBefore(g_sortBy, g_sortInfo[i], g_sortKnown[i], g_sortInfo[j], g_sortKnown[j]))
+        return -1;
+    if (SortsBefore(g_sortBy, g_sortInfo[j], g_sortKnown[j], g_sortInfo[i], g_sortKnown[i]))
+        return 1;
+    return i - j;
+}
+
+// A disc letter's games that the filters let through, in the chosen order,
+// into g_storeGames - the front page's, or the Original Xbox's with section
+// SECTION_XBOX.
+static int FilteredGamesForLetter(char letter, int section)
+{
+    const int all = (section == SECTION_XBOX) ? XboxGamesForLetter(letter, g_storeGames, MAX_STORE_GAMES)
+                                              : StoreGamesForLetter(letter, g_storeGames, MAX_STORE_GAMES);
+    const StoreFilter f = FilterFor(section);
+    if (!FilterNarrows(f) && f.sort == STORE_SORT_AZ)
+        return all;
+
+    static StoreGameInfo info[MAX_STORE_GAMES];
+    static bool known[MAX_STORE_GAMES];
+    static int order[MAX_STORE_GAMES];
+    static StoreGame sorted[MAX_STORE_GAMES];
+    int count = 0;
+    for (int i = 0; i < all; ++i)
+    {
+        StoreGameInfo gi;
+        const bool has = StoreGameInfoOf(g_storeGames[i].titleId, &gi);
+        if (!FilterLets(f, g_storeGames[i], has ? &gi : NULL))
+            continue;
+        g_storeGames[count] = g_storeGames[i];
+        info[count] = gi;
+        known[count] = has;
+        count++;
+    }
+
+    if (f.sort == STORE_SORT_AZ)
+        return count;
+
+    // Sorted by position, then put back in that order: equals keep their
+    // place, A to Z, which qsort alone doesn't promise.
+    for (int i = 0; i < count; ++i)
+        order[i] = i;
+    g_sortInfo = info;
+    g_sortKnown = known;
+    g_sortBy = f.sort;
+    qsort(order, count, sizeof(order[0]), CompareForSort);
+    for (int i = 0; i < count; ++i)
+        sorted[i] = g_storeGames[order[i]];
+    memcpy(g_storeGames, sorted, count * sizeof(sorted[0]));
+    return count;
+}
+
+// What's chosen for a section's letters - "USA, Europe, Shooters, Top
+// rated"; NULL for nothing but A to Z. With full false, for the header: two
+// at most, then how many more.
+static const char *FilterSummary(int section, bool full)
+{
+    const StoreFilter f = FilterFor(section);
+    const char *parts[FILTER_REGION_COUNT + 5];
+    int n = 0;
+    for (int i = 0; i < FILTER_REGION_COUNT; ++i)
+    {
+        if (f.regions & (1u << i))
+            parts[n++] = kFilterRegions[i].name;
+    }
+    if (f.genre != 0)
+        parts[n++] = GenreValueName(f.genre);
+    if (f.language != 0)
+        parts[n++] = StoreLanguageName(f.language - 1);
+    if (f.rating != 0)
+        parts[n++] = kRatingNames[f.rating];
+    if (f.hideInstalled)
+        parts[n++] = "Not installed";
+    if (f.sort != STORE_SORT_AZ)
+        parts[n++] = kSortNames[f.sort];
+    if (n == 0)
+        return NULL;
+
+    static char summaries[2][160];
+    char *summary = summaries[full ? 1 : 0];
+    const size_t summarySize = sizeof(summaries[0]);
+    const int shown = full ? n : 2;
+    summary[0] = '\0';
+    for (int i = 0; i < n && i < shown; ++i)
+        AppendText(summary, summarySize, ", ", parts[i]);
+    if (n > shown)
+    {
+        char more[16];
+        _snprintf(more, sizeof(more), " +%d", n - 2);
+        more[sizeof(more) - 1] = '\0';
+        AppendText(summary, summarySize, "", more);
+    }
+    return summary;
+}
+
+// Of a game's versions, the one that best fits the filters: in a region
+// ticked, and in the language chosen. The first, if none fits better - the
+// versions are USA and World first already.
+static int BestVersionForFilter(const StoreGame &game)
+{
+    const StoreFilter &f = Filter();
+    const unsigned short regions = FilterRegionMask(f);
+    int best = 0, bestScore = 0;
+    for (int v = 0; (regions != 0 || f.language != 0) && v < game.versionCount; ++v)
+    {
+        const StoreRelease *release = StoreReleaseOf(&game, v);
+        int score = 0;
+        if (regions != 0 && (StoreReleaseRegions(release) & regions))
+            score++;
+        if (f.language != 0 && (StoreReleaseLanguages(release) & (1UL << (f.language - 1))))
+            score++;
+        if (score > bestScore)
+        {
+            best = v;
+            bestScore = score;
+        }
+    }
+    return best;
+}
+
+// A section's games under one letter, counted - for its A-Z page's faded
+// letters.
+static int SectionGamesForLetter(int section, char letter)
+{
+    if (section == SECTION_XBOX)
+        return XboxGamesForLetter(letter, g_storeGames, MAX_STORE_GAMES);
+    static const XblaGame *scratch[MAX_STORE_GAMES];
+    return ArcadeGamesForLetter((ArcadeSet)section, letter, scratch, MAX_STORE_GAMES);
+}
+
+// A letter's grid - the front page's discs, or with section >= 0 that
+// section's: the arcade's or indie games' lists, or the Original Xbox's
+// discs, which are disc games like the front page's.
+static void OpenStoreLetter(Shell &shell, char letter, int section)
+{
+    const bool arcade = (section == SECTION_XBLA || section == SECTION_XBLIG);
+    if (arcade)
+    {
+        // Indie games have no covers to ask for: they're drawn with the
+        // indie banner and their names instead (see IndieTile).
+        const bool indie = (section == SECTION_XBLIG);
+        shell.storeGameCount = ArcadeGamesForLetter((ArcadeSet)section, letter, g_arcadeGames, MAX_STORE_GAMES);
+        for (int i = 0; i < shell.storeGameCount; ++i)
+        {
+            g_storeTiles[i].titleId = indie ? 0 : g_arcadeGames[i]->titleId;
+            g_storeTiles[i].name = g_arcadeGames[i]->name;
+            g_storeTiles[i].letter = g_arcadeGames[i]->letter;
+            g_storeTiles[i].indie = indie;
+        }
+    }
+    else
+    {
+        shell.storeGameCount = FilteredGamesForLetter(letter, section);
+        for (int i = 0; i < shell.storeGameCount; ++i)
+        {
+            g_storeTiles[i].titleId = g_storeGames[i].titleId;
+            g_storeTiles[i].name = g_storeGames[i].name;
+            g_storeTiles[i].letter = g_storeGames[i].letter;
+            g_storeTiles[i].indie = false;
+        }
+    }
+    shell.storeLetterArcade = arcade;
+    shell.storeLetterSection = section;
+    shell.storeSearch = false;
+    shell.storeInCollection = false;
+    shell.storeLetter = letter;
+    shell.storeSelected = 0;
+    shell.storeLetterScroll = 0;
+    shell.storeInLetter = true;
+    shell.storeFilterOpen = false;
+}
+
+// A collection's games, oldest first, in a letter's grid - unfiltered, as
+// it's a series to see whole.
+static void OpenStoreCollection(Shell &shell, int collection)
+{
+    shell.storeGameCount = StoreCollectionGames(collection, g_storeGames, MAX_STORE_GAMES);
+    for (int i = 0; i < shell.storeGameCount; ++i)
+    {
+        g_storeTiles[i].titleId = g_storeGames[i].titleId;
+        g_storeTiles[i].name = g_storeGames[i].name;
+        g_storeTiles[i].letter = g_storeGames[i].letter;
+        g_storeTiles[i].indie = false;
+    }
+    shell.storeLetterArcade = false;
+    shell.storeLetterSection = -1;
+    shell.storeSearch = false;
+    shell.storeInCollection = true;
+    shell.storeCollection = collection;
+    shell.storeLetter = '\0';
+    shell.storeSelected = 0;
+    shell.storeLetterScroll = 0;
+    shell.storeInLetter = true;
+    shell.storeFilterOpen = false;
+}
+
+// Whether the open grid is a letter's that the Filter and sort panel
+// applies to: not a search's, an arcade or indie letter's, or a collection's.
+static bool LetterFilterable(const Shell &shell)
+{
+    return !shell.storeSearch && !shell.storeLetterArcade && !shell.storeInCollection;
+}
+
+// The open letter's games again, after the filters changed - on the same
+// game if it's still there.
+static void RefilterLetter(Shell &shell)
+{
+    const char *was = (shell.storeGameCount > 0) ? g_storeTiles[shell.storeSelected].name : NULL;
+    const bool panelOpen = shell.storeFilterOpen;
+    OpenStoreLetter(shell, shell.storeLetter, shell.storeLetterSection);
+    shell.storeFilterOpen = panelOpen;
+    for (int i = 0; was != NULL && i < shell.storeGameCount; ++i)
+    {
+        if (g_storeTiles[i].name == was)
+        {
+            shell.storeSelected = i;
+            break;
+        }
+    }
+}
+
+// Whether the filters left the open letter with nothing - X resets them.
+static bool LetterFiltersEmptied(const Shell &shell)
+{
+    return shell.storeGameCount == 0 && LetterFilterable(shell) && FilterNarrows(FilterFor(shell.storeLetterSection));
+}
+
+// The Filter and sort panel's rows.
+enum
+{
+    FILTER_ROW_SORT,
+    FILTER_ROW_REGIONS, // a checkbox a region, FILTER_REGION_COUNT of them
+    FILTER_ROW_GENRE = FILTER_ROW_REGIONS + FILTER_REGION_COUNT,
+    FILTER_ROW_LANGUAGE,
+    FILTER_ROW_RATING,
+    FILTER_ROW_HIDE_INSTALLED,
+    FILTER_ROW_RESET,
+    FILTER_ROW_COUNT
+};
+
+static void FilterValueRow(StoreFilterRowView &row, const char *label, const char *value, int index, int count)
+{
+    row.kind = STORE_FILTER_VALUE;
+    row.label = label;
+    row.value = value;
+    row.canDown = index > 0;
+    row.canUp = index + 1 < count;
+}
+
+static void FilterCheckRow(StoreFilterRowView &row, const char *label, bool on)
+{
+    row.kind = STORE_FILTER_CHECK;
+    row.label = label;
+    row.on = on;
+}
+
+// Whether a row does nothing on this letter: sorting, genre and rating on
+// the Original Xbox's.
+static bool FilterRowDisabled(const Shell &shell, int row)
+{
+    return !SectionHasInfo(shell.storeLetterSection) &&
+           (row == FILTER_ROW_SORT || row == FILTER_ROW_GENRE || row == FILTER_ROW_RATING);
+}
+
+static const StoreFilterView *MakeFilterPanel(const Shell &shell)
+{
+    static StoreFilterRowView rows[FILTER_ROW_COUNT];
+    static StoreFilterView panel;
+    const StoreFilter f = FilterFor(shell.storeLetterSection);
+    memset(rows, 0, sizeof(rows));
+
+    FilterValueRow(rows[FILTER_ROW_SORT], "Sort by", kSortNames[f.sort], f.sort, STORE_SORT_COUNT);
+    for (int i = 0; i < FILTER_REGION_COUNT; ++i)
+        FilterCheckRow(rows[FILTER_ROW_REGIONS + i], kFilterRegions[i].name, (f.regions & (1u << i)) != 0);
+    rows[FILTER_ROW_REGIONS].heading = "Regions";
+    FilterValueRow(rows[FILTER_ROW_GENRE], "Genre", GenreValueName(f.genre), f.genre, FILTER_GENRE_VALUES);
+    rows[FILTER_ROW_GENRE].heading = "Show only";
+    FilterValueRow(rows[FILTER_ROW_LANGUAGE], "Language", f.language > 0 ? StoreLanguageName(f.language - 1) : "Any",
+                   f.language, 1 + STORE_LANGUAGE_COUNT);
+    FilterValueRow(rows[FILTER_ROW_RATING], "Rating", kRatingNames[f.rating], f.rating, FILTER_RATING_VALUES);
+    FilterCheckRow(rows[FILTER_ROW_HIDE_INSTALLED], "Hide installed games", f.hideInstalled);
+    rows[FILTER_ROW_RESET].kind = STORE_FILTER_BUTTON;
+    rows[FILTER_ROW_RESET].label = "Reset filters";
+    for (int r = 0; r < FILTER_ROW_COUNT; ++r)
+    {
+        if (!FilterRowDisabled(shell, r))
+            continue;
+        rows[r].disabled = true;
+        rows[r].canDown = rows[r].canUp = false;
+        if (r != FILTER_ROW_SORT)
+            rows[r].value = "Not for Original Xbox";
+    }
+
+    panel.rows = rows;
+    panel.count = FILTER_ROW_COUNT;
+    panel.focus = shell.storeFilterFocus;
+    return &panel;
+}
+
+// A value stepped by step: round from one end to the other with wrap (A),
+// else stopping at the ends. False if it didn't move.
+static bool StepFilterValue(int &value, int count, int step, bool wrap)
+{
+    int next = value + step;
+    if (next < 0 || next >= count)
+    {
+        if (!wrap)
+            return false;
+        next = (next + count) % count;
+    }
+    value = next;
+    return true;
+}
+
+// The D-pad and A on the panel. True if a filter changed.
+static bool StepFilterPanel(const UiInput &input, Shell &shell)
+{
+    int &focus = shell.storeFilterFocus;
+    if (input.nav == XINPUT_GAMEPAD_DPAD_UP || input.nav == XINPUT_GAMEPAD_DPAD_DOWN)
+    {
+        // To the next row that does something here.
+        const int step = (input.nav == XINPUT_GAMEPAD_DPAD_UP) ? -1 : 1;
+        for (int r = focus + step; r >= 0 && r < FILTER_ROW_COUNT; r += step)
+        {
+            if (!FilterRowDisabled(shell, r))
+            {
+                focus = r;
+                break;
+            }
+        }
+        return false;
+    }
+    if (FilterRowDisabled(shell, focus))
+        return false;
+
+    int step = 0;
+    const bool a = (input.pressed & XINPUT_GAMEPAD_A) != 0;
+    if (input.nav == XINPUT_GAMEPAD_DPAD_LEFT)
+        step = -1;
+    else if (input.nav == XINPUT_GAMEPAD_DPAD_RIGHT || a)
+        step = 1;
+    if (step == 0)
+        return false;
+
+    Filter(); // read before it's changed
+    StoreFilter &f = g_filter;
+    switch (focus)
+    {
+    case FILTER_ROW_SORT:
+        return StepFilterValue(f.sort, STORE_SORT_COUNT, step, a);
+    case FILTER_ROW_GENRE:
+        return StepFilterValue(f.genre, FILTER_GENRE_VALUES, step, a);
+    case FILTER_ROW_LANGUAGE:
+        return StepFilterValue(f.language, 1 + STORE_LANGUAGE_COUNT, step, a);
+    case FILTER_ROW_RATING:
+        return StepFilterValue(f.rating, FILTER_RATING_VALUES, step, a);
+    case FILTER_ROW_HIDE_INSTALLED:
+        if (!a)
+            return false;
+        f.hideInstalled = !f.hideInstalled;
+        return true;
+    case FILTER_ROW_RESET:
+        if (!a || (!FilterNarrows(f) && f.sort == STORE_SORT_AZ))
+            return false;
+        memset(&f, 0, sizeof(f));
+        return true;
+    default:
+        if (!a)
+            return false;
+        f.regions ^= 1u << (focus - FILTER_ROW_REGIONS);
+        return true;
+    }
+}
+
+// The filters, for FocusSignature: a change is a press that did something.
+static int FilterSignature()
+{
+    const StoreFilter &f = Filter();
+    return f.sort | (f.regions << 2) | (f.genre << 6) | (f.language << 11) | (f.rating << 16) |
+           ((f.hideInstalled ? 1 : 0) << 18);
+}
+
+// Search on the front page: the keyboard, then every list's games that
+// match, in a letter's grid. Nothing changes if it's cancelled or nothing
+// matches. True if the keyboard was shown.
+static bool OpenStoreSearch(Shell &shell)
+{
+    WCHAR typedBefore[64];
+    NarrowToWide(shell.storeQuery, typedBefore, 64);
+    std::string typed;
+    if (OpenKeyboardToString(XUSER_INDEX_ANY, &typed, L"Search the Store",
+                             L"A game's name, or part of it - every list is searched", typedBefore) != ERROR_SUCCESS)
+        return true; // cancelled
+    TrimInPlace(typed);
+    if (typed.empty())
+        return true;
+
+    const int shown = SearchStore(typed.c_str(), g_searchHits, MAX_SEARCH_HITS, &g_searchTotal);
+    dprintf("[store] search \"%s\": %d match(es)\n", typed.c_str(), g_searchTotal);
+    _snprintf(shell.storeQuery, sizeof(shell.storeQuery), "%s", typed.c_str());
+    shell.storeQuery[sizeof(shell.storeQuery) - 1] = '\0';
+    if (shown == 0)
+    {
+        ShowShellToast("No games found", shell.storeQuery, UI_TOAST_INFO);
+        return true;
+    }
+
+    for (int i = 0; i < shown; ++i)
+    {
+        const StoreHit &hit = g_searchHits[i];
+        StoreTileView &tile = g_storeTiles[i];
+        if (hit.game != NULL)
+        {
+            tile.titleId = hit.game->titleId;
+            tile.name = hit.game->name;
+            tile.letter = hit.game->letter;
+            tile.indie = false;
+        }
+        else
+        {
+            tile.indie = (hit.kind == STORE_HIT_XBLIG);
+            tile.titleId = tile.indie ? 0 : hit.arcade->titleId;
+            tile.name = hit.arcade->name;
+            tile.letter = hit.arcade->letter;
+        }
+    }
+    shell.storeGameCount = shown;
+    shell.storeLetterArcade = false;
+    shell.storeLetterSection = -1;
+    shell.storeSearch = true;
+    shell.storeInCollection = false;
+    shell.storeSelected = 0;
+    shell.storeLetterScroll = 0;
+    shell.storeInLetter = true;
+    return true;
+}
+
+// Whether LT and RT jump a letter: on All games, in A to Z order.
+static bool LetterJumps(const Shell &shell)
+{
+    return shell.storeLetter == STORE_LETTER_ALL && !shell.storeSearch && shell.storeGameCount > 0 &&
+           (shell.storeLetterArcade || FilterFor(shell.storeLetterSection).sort == STORE_SORT_AZ);
+}
+
+static StoreLetterView MakeStoreLetterView(const Shell &shell)
+{
+    StoreLetterView view;
+    view.letter = shell.storeLetter;
+    view.title = NULL;
+    view.section = shell.storeLetterSection >= 0 ? SectionName(shell.storeLetterSection) : NULL;
+    if (shell.storeSearch)
+    {
+        static char title[96], section[48];
+        _snprintf(title, sizeof(title), "\xE2\x80\x9C%s\xE2\x80\x9D", shell.storeQuery); // in curly quotes
+        title[sizeof(title) - 1] = '\0';
+        if (g_searchTotal > shell.storeGameCount)
+            _snprintf(section, sizeof(section), "Search" STORE_MIDDOT "the best %d of %d", shell.storeGameCount,
+                      g_searchTotal);
+        else
+            _snprintf(section, sizeof(section), "Search");
+        section[sizeof(section) - 1] = '\0';
+        view.title = title;
+        view.section = section;
+    }
+    else if (shell.storeInCollection)
+    {
+        view.title = StoreCollectionName(shell.storeCollection);
+        view.section = "Collection";
+    }
+    const bool filtered = LetterFilterable(shell);
+    view.filter = filtered ? FilterSummary(shell.storeLetterSection, false) : NULL;
+    view.filterAll = filtered ? FilterSummary(shell.storeLetterSection, true) : NULL;
+    view.panel = shell.storeFilterOpen ? MakeFilterPanel(shell) : NULL;
+    view.letterJumps = LetterJumps(shell);
+    view.tiles = g_storeTiles;
+    view.count = shell.storeGameCount;
+    view.selected = shell.storeSelected;
+    view.scroll = shell.storeLetterScroll;
+    view.focused = !shell.sidebarFocused;
+    return view;
+}
+
+// LT and RT: to the first game of the letter before or after the focused
+// one's, its row at the top. LT on a letter's later games goes to its first.
+static void JumpLetter(Shell &shell, int step)
+{
+    const int count = shell.storeGameCount;
+    int &sel = shell.storeSelected;
+    const char at = g_storeTiles[sel].letter;
+    int i = sel;
+    if (step > 0)
+    {
+        while (i < count && g_storeTiles[i].letter == at)
+            i++;
+        if (i >= count)
+            return;
+    }
+    else
+    {
+        while (i > 0 && g_storeTiles[i - 1].letter == at)
+            i--;
+        if (i == sel && i > 0)
+        {
+            const char before = g_storeTiles[i - 1].letter;
+            while (i > 0 && g_storeTiles[i - 1].letter == before)
+                i--;
+        }
+    }
+    sel = i;
+    shell.storeLetterScroll = sel / StoreGridColumns();
+}
+
+// The D-pad and shoulders on a letter's grid, as on the library's - and on
+// All games, the triggers.
+static void StepStoreLetter(const UiInput &input, Shell &shell)
+{
+    if (LetterJumps(shell) && input.triggers != 0)
+    {
+        JumpLetter(shell, (input.triggers & UI_TRIGGER_RIGHT) ? 1 : -1);
+        return;
+    }
+
+    // The Store's grid, not the library's: a letter's page runs the full
+    // width with no sidebar beside it, so it fits six tiles across where
+    // the library fits five. Counting in fives here sent Up and Down
+    // diagonally and put the sidebar one tile into the row.
+    const int cols = StoreGridColumns();
+    const int count = shell.storeGameCount;
+    int &sel = shell.storeSelected;
+
+    if (input.nav == XINPUT_GAMEPAD_DPAD_LEFT)
+    {
+        if (sel % cols == 0)
+            FocusSidebar(shell);
+        else
+            sel--;
+    }
+    else if (input.nav == XINPUT_GAMEPAD_DPAD_RIGHT)
+    {
+        if (sel % cols < cols - 1 && sel + 1 < count)
+            sel++;
+    }
+    else if (input.nav == XINPUT_GAMEPAD_DPAD_UP)
+    {
+        if (sel >= cols)
+            sel -= cols;
+    }
+    else if (input.nav == XINPUT_GAMEPAD_DPAD_DOWN)
+    {
+        if (sel + cols < count)
+            sel += cols;
+        else if (sel / cols < (count - 1) / cols)
+            sel = count - 1;
+    }
+
+    if (input.pressed & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER))
+    {
+        const int jump = StoreLetterVisibleRows() * cols;
+        if (input.pressed & XINPUT_GAMEPAD_LEFT_SHOULDER)
+            sel -= jump;
+        if (input.pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER)
+            sel += jump;
+        if (sel > count - 1) sel = count - 1;
+        if (sel < 0) sel = 0;
+    }
+}
+
+// A letter's first screenful of covers, asked for as its tile takes focus, so
+// they're arriving before it's opened. The letter's page asks again for what
+// it shows once it is. section is as OpenStoreLetter's. Indie games have
+// none.
+static void PrefetchLetterCovers(char letter, int section)
+{
+    unsigned long ids[24];
+    int idCount = 0;
+    if (section == SECTION_XBLIG)
+        return;
+    if (section == SECTION_XBLA)
+    {
+        const int n = ArcadeGamesForLetter(ARCADE_XBLA, letter, g_arcadeGames, 24);
+        for (int i = 0; i < n; ++i)
+            ids[idCount++] = g_arcadeGames[i]->titleId;
+    }
+    else
+    {
+        const int n = FilteredGamesForLetter(letter, section);
+        for (int i = 0; i < n && idCount < 24; ++i)
+        {
+            if (g_storeGames[i].titleId != 0)
+                ids[idCount++] = g_storeGames[i].titleId;
+        }
+    }
+    RequestStoreCoverArt(ids, idCount);
+}
+
+// A section's A-Z page, over the front page.
+static void OpenSection(Shell &shell, int section)
+{
+    if (!g_sectionCounted[section])
+    {
+        for (int i = 0; i < STORE_LETTER_COUNT; ++i)
+            g_sectionLetterCounts[section][i] = SectionGamesForLetter(section, kStoreLetters[i]);
+        g_sectionCounted[section] = true;
+    }
+    shell.storeSection = section;
+    shell.storeInSection = true;
+    PrefetchLetterCovers(kStoreLetters[shell.sectionFocus[section]], section);
+}
+
+static StoreSectionView MakeSectionView(const Shell &shell)
+{
+    const int set = shell.storeSection;
+    static char subtitle[96];
+    if (set == SECTION_XBOX)
+        _snprintf(subtitle, sizeof(subtitle), "%d games from archive.org that the 360 can run", XBOX_GAME_COUNT);
+    else
+        _snprintf(subtitle, sizeof(subtitle), "%d games from archive.org",
+                  set == SECTION_XBLIG ? XBLIG_GAME_COUNT : XBLA_GAME_COUNT);
+    subtitle[sizeof(subtitle) - 1] = '\0';
+
+    StoreSectionView view;
+    view.title = SectionName(set);
+    view.subtitle = subtitle;
+    view.letters = kStoreLetters;
+    view.counts = g_sectionLetterCounts[set];
+    view.focus = shell.sectionFocus[set];
+    view.focused = !shell.sidebarFocused;
+    return view;
+}
+
+// The D-pad on a section's letters, as on the front page's.
+static void StepSectionFocus(WORD nav, Shell &shell)
+{
+    const int perRow = StoreLettersPerRow();
+    int &l = shell.sectionFocus[shell.storeSection];
+    const int col = l % perRow;
+    if (nav == XINPUT_GAMEPAD_DPAD_RIGHT && col + 1 < perRow && l + 1 < STORE_LETTER_COUNT)
+        l++;
+    else if (nav == XINPUT_GAMEPAD_DPAD_LEFT)
+    {
+        if (col == 0)
+            FocusSidebar(shell);
+        else
+            l--;
+    }
+    else if (nav == XINPUT_GAMEPAD_DPAD_UP && l >= perRow)
+        l -= perRow;
+    else if (nav == XINPUT_GAMEPAD_DPAD_DOWN && l / perRow < (STORE_LETTER_COUNT - 1) / perRow)
+        l = (l + perRow < STORE_LETTER_COUNT) ? l + perRow : STORE_LETTER_COUNT - 1; // a shorter last row
+}
+
+// The wallpapers for the featured tiles - again on the way back to the front
+// page, as a game page may have pushed them out.
+static void RequestFeaturedArt()
+{
+    for (int i = 0; i < g_featuredCount; ++i)
+        RequestStoreArt(g_featuredTiles[i].titleId, STORE_ART_BACKGROUND);
+}
+
+static void AppendText(char *out, size_t outSize, const char *separator, const char *text)
+{
+    size_t used = strlen(out);
+    _snprintf(out + used, outSize - used, "%s%s", used > 0 ? separator : "", text);
+    out[outSize - 1] = '\0';
+}
+
+// Whether the page showing is a game's page, from the Store or the library.
+static bool GamePageOpen(const Shell &shell)
+{
+    return (shell.page == SHELL_PAGE_STORE && shell.storeInGame) ||
+           (shell.page == SHELL_PAGE_LIBRARY && shell.libraryInGame);
+}
+
+// Whether any disc of a version is a compressed RAR (STORE_FLAG_UNPACKS),
+// unpacked on the console as it downloads. That's slow - Deadpool took 64
+// minutes to download and unpack, then 7 to install - so the page says so,
+// and Install asks first. Without a time: past one, people take a slow
+// install for a stuck one.
+static bool ReleaseUnpacks(const StoreRelease *release)
+{
+    if (release == NULL)
+        return false;
+    for (int d = 0; d < release->discCount; ++d)
+    {
+        const StoreDisc *disc = StoreReleaseDisc(release, d);
+        if (disc != NULL && (disc->flags & STORE_FLAG_UNPACKS))
+            return true;
+    }
+    return false;
+}
+
+// Opens a game's page over the current page - the Store's, or the library's.
+static void OpenStoreGame(Shell &shell, const StoreGame &game)
+{
+    g_storeGame = game;
+    g_storeArcade = NULL; // OpenArcadeGame sets it after
+    for (int v = 0; v < g_storeGame.versionCount; ++v)
+    {
+        // The labels are the generator's; only the size is formatted here -
+        // and, for one unpacked on the console, a word that it's slow.
+        const StoreRelease *release = StoreReleaseOf(&g_storeGame, v);
+        g_storeVersionSize[v][0] = '\0';
+        if (release != NULL)
+            FormatBytes(release->size, g_storeVersionSize[v], sizeof(g_storeVersionSize[v]));
+        g_storeVersions[v].label = release != NULL ? release->label : "";
+        g_storeVersions[v].detail = release != NULL ? release->detail : "";
+        g_storeVersions[v].size = g_storeVersionSize[v];
+
+        if (ReleaseUnpacks(release))
+        {
+            const char *detail = g_storeVersions[v].detail;
+            _snprintf(g_storeVersionDetail[v], sizeof(g_storeVersionDetail[v]), "%s%sSlow install: a compressed .rar",
+                      detail, detail[0] != '\0' ? "  \xC2\xB7  " : "");
+            g_storeVersionDetail[v][sizeof(g_storeVersionDetail[v]) - 1] = '\0';
+            g_storeVersions[v].detail = g_storeVersionDetail[v];
+        }
+    }
+
+    if (shell.page == SHELL_PAGE_LIBRARY)
+        shell.libraryInGame = true;
+    else
+        shell.storeInGame = true;
+    shell.storeGameFocus = STORE_GAME_FOCUS_BUTTONS;
+    shell.storeVersionChosen = BestVersionForFilter(g_storeGame);
+    shell.storeVersionScroll = 0;
+    shell.storeVersionsOpen = false;
+    shell.storeShotsAsked = false;
+    shell.storeSimilarScroll = 0;
+    shell.storeGameScroll = 0.0f;
+
+    // More like this. Its covers are asked for as they come into view.
+    g_similarCount = StoreSimilarGames(g_storeGame.titleId, g_similarGames, STORE_SIMILAR_MAX);
+    for (int i = 0; i < g_similarCount; ++i)
+    {
+        g_similarTiles[i].titleId = g_similarGames[i].titleId;
+        g_similarTiles[i].name = g_similarGames[i].name;
+        g_similarTiles[i].letter = g_similarGames[i].letter;
+        g_similarTiles[i].indie = false;
+    }
+
+    // The details first - the screenshots wait on them - then the art.
+    const unsigned long titleId = g_storeGame.titleId;
+    if (titleId != 0)
+    {
+        // Xbox Live's catalog has nothing for an Original Xbox game; its
+        // cover comes from xboxunity.
+        if (game.system != STORE_SYSTEM_XBOX)
+        {
+            RequestStoreDetails(titleId);
+            RequestStoreArt(titleId, STORE_ART_BACKGROUND);
+        }
+        RequestStoreCoverArt(&titleId, 1);
+    }
+}
+
+// Whether the page open is an indie game's.
+// Whether the page open is an Original Xbox game's.
+static bool StoreGameIsXbox()
+{
+    return g_storeArcade == NULL && g_storeGame.system == STORE_SYSTEM_XBOX;
+}
+
+static bool StoreGameIsIndie()
+{
+    return g_storeArcade != NULL && ArcadeSetOf(g_storeArcade) == ARCADE_XBLIG;
+}
+
+// An arcade or indie game's page: a disc game's, with one version - its RAR.
+// An indie game's has no title ID of its own to find art or details by -
+// every indie game shares one - so it's opened without.
+static void OpenArcadeGame(Shell &shell, const XblaGame &game)
+{
+    const bool indie = (ArcadeSetOf(&game) == ARCADE_XBLIG);
+    StoreGame page;
+    memset(&page, 0, sizeof(page));
+    page.name = game.name;
+    page.titleId = indie ? 0 : game.titleId;
+    OpenStoreGame(shell, page);
+
+    static char detail[48];
+    detail[0] = '\0';
+    if (game.packages > 1)
+    {
+        if (indie)
+            _snprintf(detail, sizeof(detail), "%u packages", (unsigned)game.packages);
+        else
+            _snprintf(detail, sizeof(detail), "With %u add-on%s", (unsigned)(game.packages - 1),
+                      game.packages == 2 ? "" : "s");
+        detail[sizeof(detail) - 1] = '\0';
+    }
+    FormatBytes(game.size, g_storeVersionSize[0], sizeof(g_storeVersionSize[0]));
+    g_storeVersions[0].label = indie ? "Indie game" : "Xbox Live Arcade";
+    g_storeVersions[0].detail = detail;
+    g_storeVersions[0].size = g_storeVersionSize[0];
+    g_storeArcade = &game;
+}
+
+// The version rows the page shows: an arcade or indie game's one, or a disc
+// game's.
+static int StoreVersionCount()
+{
+    return g_storeArcade != NULL ? 1 : g_storeGame.versionCount;
+}
+
+// Whether a game from either list is on the drive: its biggest package, in
+// its title's folder under the content folder. Checked at most once a second
+// - the page asks every frame.
+static bool ArcadePackageOnDrive(const XblaGame &game)
+{
+    static const XblaGame *checked = NULL;
+    static DWORD checkedAt = 0;
+    static bool onDrive = false;
+    if (checked == &game && GetTickCount() - checkedAt < 1000)
+        return onDrive;
+
+    char file[64], path[512];
+    const char *space = strchr(game.files, ' ');
+    const size_t n = (space != NULL) ? (size_t)(space - game.files) : strlen(game.files);
+    onDrive = false;
+    if (n > 0 && n < sizeof(file))
+    {
+        memcpy(file, game.files, n);
+        file[n] = '\0';
+        _snprintf(path, sizeof(path), "%s\\%08lX\\%08lX\\%s", g_contentBase, game.titleId, game.contentType, file);
+        path[sizeof(path) - 1] = '\0';
+        onDrive = (GetFileAttributesA(path) != (DWORD)-1); // INVALID_FILE_ATTRIBUTES, which the XDK lacks
+    }
+    checked = &game;
+    checkedAt = GetTickCount();
+    return onDrive;
+}
+
+// The game's install: on its way in the download queue, where it's a pack
+// like DLC, or installed - its package on the drive, or for an arcade game
+// one the library has, installed some other way.
+static StoreInstallState ArcadeInstallState(const Library &lib, float *outFraction)
+{
+    static QueueJobSnapshot jobs[MAX_QUEUE_JOBS];
+    const int jobCount = SnapshotDownloadQueue(jobs, MAX_QUEUE_JOBS);
+    for (int i = 0; i < jobCount; ++i)
+    {
+        const QueueJobSnapshot &job = jobs[i];
+        if (job.kind != QUEUE_JOB_DLC_PACK || job.state == QUEUE_FINISHED || strcmp(job.title, g_storeArcade->rar) != 0)
+            continue;
+        if (job.state == QUEUE_WAITING)
+            return STORE_INSTALL_QUEUED;
+        *outFraction = job.fraction;
+        return STORE_INSTALL_INSTALLING;
+    }
+    if (ArcadePackageOnDrive(*g_storeArcade))
+        return STORE_INSTALL_INSTALLED;
+    for (int i = 0; !StoreGameIsIndie() && i < lib.count; ++i)
+    {
+        if (lib.games[i].titleId == g_storeArcade->titleId)
+            return STORE_INSTALL_INSTALLED;
+    }
+    return STORE_INSTALL_AVAILABLE;
+}
+
+// Removes a game's own packages - those its RAR held for its title and
+// type. How many were removed.
+static int RemoveArcadePackages(const XblaGame &game)
+{
+    int removed = 0;
+    const char *p = game.files;
+    while (*p != '\0')
+    {
+        const char *space = strchr(p, ' ');
+        const size_t n = (space != NULL) ? (size_t)(space - p) : strlen(p);
+        char file[64], path[512];
+        if (n > 0 && n < sizeof(file))
+        {
+            memcpy(file, p, n);
+            file[n] = '\0';
+            _snprintf(path, sizeof(path), "%s\\%08lX\\%08lX\\%s", g_contentBase, game.titleId, game.contentType, file);
+            path[sizeof(path) - 1] = '\0';
+            if (DeleteFileA(path))
+                removed++;
+        }
+        p += n;
+        while (*p == ' ')
+            p++;
+    }
+    return removed;
+}
+
+// Where one disc of a version is: waiting or running in the game installer,
+// installed, or neither.
+enum StoreDiscProgress
+{
+    STORE_DISC_NOT_INSTALLED,
+    STORE_DISC_QUEUED,
+    STORE_DISC_INSTALLING,
+    STORE_DISC_INSTALLED
+};
+
+// A disc counts as installed once the installer has installed it from this
+// zip - or, for a single-disc version, once the library has its game, however
+// it got there. A title ID can't say which disc of several is installed.
+static StoreDiscProgress ProgressOfDisc(const Library &lib, const StoreRelease *release, const StoreDisc *disc,
+                                        const QueueJobSnapshot *jobs, int jobCount, float *outFraction)
+{
+    for (int i = 0; i < jobCount; ++i)
+    {
+        if (jobs[i].state == QUEUE_FINISHED || strcmp(jobs[i].title, disc->zip) != 0)
+            continue;
+        if (jobs[i].state == QUEUE_WAITING)
+            return STORE_DISC_QUEUED;
+        if (outFraction != NULL)
+            *outFraction = jobs[i].fraction;
+        return STORE_DISC_INSTALLING;
+    }
+
+    if (IsGameZipInstalled(disc->zip))
+        return STORE_DISC_INSTALLED;
+    // An extracted game's folder holds every disc of it, so it speaks for a
+    // multi-disc version too.
+    if (disc->titleId != 0)
+    {
+        for (int i = 0; i < lib.count; ++i)
+        {
+            if (lib.games[i].titleId == disc->titleId && (release->discCount == 1 || lib.games[i].folder))
+                return STORE_DISC_INSTALLED;
+        }
+    }
+    return STORE_DISC_NOT_INSTALLED;
+}
+
+// The disc in the drive is this page's game, ready and not already on its
+// way: the page offers to install from the drive, which beats downloading
+// the same game over again.
+static bool DiscInDriveFor(const Shell &shell, unsigned long titleId)
+{
+    return titleId != 0 && shell.disc.state == DISC_READY && !shell.disc.installing &&
+           shell.disc.titleId == titleId;
+}
+
+// A disc install of this title, waiting or running. The disc worker's jobs
+// are the download queue's in everything but where they come from, so a game
+// page can show one exactly as it shows an archive.org install - the install
+// may have been started from the disc's tile, or from the page itself.
+static StoreInstallState DiscJobState(unsigned long titleId, float *outFraction)
+{
+    if (titleId == 0)
+        return STORE_INSTALL_AVAILABLE;
+
+    static QueueJobSnapshot jobs[MAX_DISC_JOBS];
+    const int count = SnapshotDiscJobs(jobs, MAX_DISC_JOBS);
+    for (int i = 0; i < count; ++i)
+    {
+        if (jobs[i].titleId != titleId || jobs[i].state == QUEUE_FINISHED)
+            continue;
+        if (jobs[i].state == QUEUE_WAITING)
+            return STORE_INSTALL_QUEUED;
+        *outFraction = jobs[i].fraction;
+        return STORE_INSTALL_INSTALLING;
+    }
+    return STORE_INSTALL_AVAILABLE;
+}
+
+// The chosen version as a whole: installing while any disc is, queued while
+// any waits, installed once every disc is. outPartial: some discs are
+// installed and the rest aren't on their way.
+static StoreInstallState StoreVersionState(const Library &lib, int version, float *outFraction, bool *outPartial)
+{
+    *outFraction = -1.0f;
+    *outPartial = false;
+
+    // A disc install first, whatever the Store has: it is this game being
+    // installed, and it is the one the Queue page is showing.
+    float discFraction = -1.0f;
+    const StoreInstallState fromDisc = DiscJobState(g_storeGame.titleId, &discFraction);
+    if (fromDisc != STORE_INSTALL_AVAILABLE)
+    {
+        *outFraction = discFraction;
+        return fromDisc;
+    }
+
+    if (g_storeArcade != NULL)
+        return ArcadeInstallState(lib, outFraction);
+    const StoreRelease *release = StoreReleaseOf(&g_storeGame, version);
+    if (release == NULL || release->discCount == 0)
+    {
+        // A game the Store hasn't got, opened from the library: installed,
+        // as that's where it came from.
+        for (int i = 0; g_storeGame.titleId != 0 && i < lib.count; ++i)
+        {
+            if (lib.games[i].titleId == g_storeGame.titleId)
+                return STORE_INSTALL_INSTALLED;
+        }
+        return STORE_INSTALL_AVAILABLE;
+    }
+
+    static QueueJobSnapshot jobs[MAX_GAME_JOBS];
+    const int jobCount = SnapshotGameJobs(jobs, MAX_GAME_JOBS);
+
+    int installed = 0, queued = 0, installing = 0;
+    float activeFraction = 0.0f;
+    for (int d = 0; d < release->discCount; ++d)
+    {
+        const StoreDisc *disc = StoreReleaseDisc(release, d);
+        if (disc == NULL)
+            continue;
+        float fraction = -1.0f;
+        switch (ProgressOfDisc(lib, release, disc, jobs, jobCount, &fraction))
+        {
+        case STORE_DISC_INSTALLED:
+            installed++;
+            break;
+        case STORE_DISC_QUEUED:
+            queued++;
+            break;
+        case STORE_DISC_INSTALLING:
+            installing++;
+            activeFraction = fraction > 0.0f ? fraction : 0.0f;
+            break;
+        default:
+            break;
+        }
+    }
+
+    if (installing > 0)
+    {
+        // The whole version's progress: the discs done, and the one going.
+        *outFraction = ((float)installed + activeFraction) / (float)release->discCount;
+        return STORE_INSTALL_INSTALLING;
+    }
+    if (queued > 0)
+        return STORE_INSTALL_QUEUED;
+    if (installed == release->discCount)
+        return STORE_INSTALL_INSTALLED;
+    *outPartial = (installed > 0);
+    return STORE_INSTALL_AVAILABLE;
+}
+
+// Whether the game page offers Uninstall: something of the chosen version is
+// installed, and none of it is on its way.
+static bool CanUninstallStoreVersion(const Library &lib, const Shell &shell)
+{
+    float fraction = 0.0f;
+    bool partial = false;
+    const StoreInstallState state = StoreVersionState(lib, shell.storeVersionChosen, &fraction, &partial);
+    return state == STORE_INSTALL_INSTALLED || (state == STORE_INSTALL_AVAILABLE && partial);
+}
+
+// "<root>\TITLEID\00007000\MEDIAID" split up: the content root, and the
+// media ID - or an Original Xbox package's, "...\00005000\TITLEID", whose
+// name is its title ID. False for a path that is neither.
+static bool ParseGodPackagePath(const char *path, char *root, size_t rootSize, unsigned long *mediaId)
+{
+    const char *name = strrchr(path, '\\');
+    if (name == NULL || strlen(name + 1) != 8)
+        return false;
+    const char *type = name - 9; // "\00007000"
+    if (type < path || (_strnicmp(type, "\\00007000", 9) != 0 && _strnicmp(type, "\\00005000", 9) != 0))
+        return false;
+    const char *title = type - 9; // "\TITLEID"
+    if (title < path || title[0] != '\\')
+        return false;
+    char *end = NULL;
+    *mediaId = strtoul(name + 1, &end, 16);
+    if (end == NULL || *end != '\0')
+        return false;
+
+    size_t n = (size_t)(title - path);
+    if (n >= rootSize)
+        return false;
+    memcpy(root, path, n);
+    root[n] = '\0';
+    return true;
+}
+
+// Every package in a library game's own content-type folder - all the discs
+// of a Games on Demand game, or an arcade game's one package. Its DLC and
+// title updates are in other folders, and stay.
+static int RemoveLibraryGamePackages(const InstalledGame &game)
+{
+    if (game.folder)
+        return RemoveFolderGame(game) > 0 ? 1 : 0; // the folder, every disc in it
+
+    char root[512];
+    unsigned long mediaId = 0;
+    if (!ParseGodPackagePath(game.packagePath, root, sizeof(root), &mediaId))
+    {
+        // Not Games on Demand: one package file, nothing beside it.
+        return DeleteFileA(game.packagePath) ? 1 : 0;
+    }
+
+    // Each disc's header in its folder, by media ID - 00007000, or an
+    // Original Xbox game's 00005000, as its own path says.
+    const char *typeDir = strstr(game.packagePath, "\\00005000\\") != NULL ? "00005000" : "00007000";
+    char folder[600], pattern[620];
+    _snprintf(folder, sizeof(folder), "%s\\%08lX\\%s", root, game.titleId, typeDir);
+    folder[sizeof(folder) - 1] = '\0';
+    _snprintf(pattern, sizeof(pattern), "%s\\*", folder);
+    pattern[sizeof(pattern) - 1] = '\0';
+
+    unsigned long mediaIds[16];
+    int count = 0;
+    WIN32_FIND_DATAA found;
+    HANDLE h = FindFirstFileA(pattern, &found);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            char *end = NULL;
+            unsigned long id = strtoul(found.cFileName, &end, 16);
+            if (!(found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && strlen(found.cFileName) == 8 &&
+                end != NULL && *end == '\0' && count < 16)
+                mediaIds[count++] = id;
+        } while (FindNextFileA(h, &found));
+        FindClose(h);
+    }
+    for (int i = 0; i < count; ++i)
+        GodRemovePackage(root, game.titleId, mediaIds[i]);
+    return count;
+}
+
+// Uninstall on the game page, once confirmed: the chosen version's discs - by
+// the installer's note of each, or for a single disc the library's package -
+// or, for a game the Store hasn't got, everything of it in the library. True
+// if anything was removed.
+static bool UninstallStoreVersion(Shell &shell, const Library &lib, const char *gamesPath)
+{
+    char message[200];
+    _snprintf(message, sizeof(message), "Remove %s from the hard drive?", g_storeGame.name);
+    message[sizeof(message) - 1] = '\0';
+    if (!ShowConfirmUI("Uninstall", message, StoreGameIsIndie() ? "Only its own packages are removed."
+                                                                : "Its DLC and title updates stay.", "Uninstall"))
+        return false;
+
+    RenderStatusFrame("Uninstalling", g_storeGame.name, NULL);
+
+    int removed = 0;
+    const StoreRelease *release = StoreReleaseOf(&g_storeGame, shell.storeVersionChosen);
+    if (g_storeArcade != NULL)
+    {
+        // Its own packages; for an arcade game installed some other way -
+        // another version - the library's.
+        removed = RemoveArcadePackages(*g_storeArcade);
+        for (int i = 0; removed == 0 && !StoreGameIsIndie() && i < lib.count; ++i)
+        {
+            if (lib.games[i].titleId == g_storeArcade->titleId)
+                removed += RemoveLibraryGamePackages(lib.games[i]);
+        }
+    }
+    else if (release == NULL)
+    {
+        for (int i = 0; i < lib.count; ++i)
+        {
+            if (lib.games[i].titleId == g_storeGame.titleId)
+                removed += RemoveLibraryGamePackages(lib.games[i]);
+        }
+    }
+    else
+    {
+        for (int d = 0; d < release->discCount; ++d)
+        {
+            const StoreDisc *disc = StoreReleaseDisc(release, d);
+            if (disc == NULL)
+                continue;
+
+            unsigned long titleId = 0, mediaId = 0;
+            if (GameZipInstalledAs(disc->zip, &titleId, &mediaId))
+            {
+                GodRemovePackage(gamesPath, titleId, mediaId);
+                ForgetInstalledZip(disc->zip);
+                removed++;
+                continue;
+            }
+            // One the installer didn't note: the library's, for a single disc.
+            for (int i = 0; release->discCount == 1 && disc->titleId != 0 && i < lib.count; ++i)
+            {
+                char root[512];
+                if (lib.games[i].titleId == disc->titleId &&
+                    ParseGodPackagePath(lib.games[i].packagePath, root, sizeof(root), &mediaId))
+                {
+                    GodRemovePackage(root, disc->titleId, mediaId);
+                    removed++;
+                }
+            }
+        }
+
+        // Kept as an extracted folder rather than Games on Demand.
+        for (int i = 0; removed == 0 && i < lib.count; ++i)
+        {
+            if (lib.games[i].folder && lib.games[i].titleId == g_storeGame.titleId)
+                removed += RemoveLibraryGamePackages(lib.games[i]);
+        }
+    }
+
+    dprintf("[store] uninstalled %d package(s) of \"%s\"\n", removed, g_storeGame.name);
+    shell.rescanLibrary = true;
+    shell.stale = true;
+    if (removed > 0)
+        ShowShellToast("Uninstalled", g_storeGame.name, UI_TOAST_SUCCESS);
+    else
+        ShowShellToast("Nothing to uninstall", "Its package wasn't where the library said.", UI_TOAST_ERROR);
+    return removed > 0;
+}
+
+// A game's page over the library, by its title ID: as the Store has it - on
+// the version that's installed, where it can tell - or, for a game the Store
+// hasn't got (an arcade game, homebrew, a disc it lacks), a page of its own
+// under the name given, with no versions to install. Find DLC and Title
+// updates work either way. For a library game, and the disc in the drive.
+static void OpenGameByTitleId(Shell &shell, const Library &lib, unsigned long titleId, const char *name)
+{
+    static char ownName[256];
+    StoreGame game;
+    if (!StoreGameByTitleId(titleId, &game))
+    {
+        // An arcade game the Store has: its page from there.
+        const XblaGame *xbla = XblaGameByTitleId(titleId);
+        if (xbla != NULL)
+        {
+            OpenArcadeGame(shell, *xbla);
+            return;
+        }
+        _snprintf(ownName, sizeof(ownName), "%s", name != NULL ? name : "");
+        ownName[sizeof(ownName) - 1] = '\0';
+        memset(&game, 0, sizeof(game));
+        game.name = ownName;
+        game.titleId = titleId;
+    }
+    OpenStoreGame(shell, game);
+
+    for (int v = 0; v < g_storeGame.versionCount; ++v)
+    {
+        float fraction = 0.0f;
+        bool partial = false;
+        if (StoreVersionState(lib, v, &fraction, &partial) == STORE_INSTALL_INSTALLED)
+        {
+            shell.storeVersionChosen = v;
+            break;
+        }
+    }
+}
+
+// X on a library game.
+static void OpenLibraryGame(Shell &shell, const Library &lib, const InstalledGame &chosen)
+{
+    OpenGameByTitleId(shell, lib, chosen.titleId, chosen.displayName);
+}
+
+// The library's game by its title ID - the one the scan kept, as it keeps
+// one a title. NULL if it isn't installed.
+static const InstalledGame *LibraryGameByTitleId(const Library &lib, unsigned long titleId)
+{
+    for (int i = 0; i < lib.count; ++i)
+        if (lib.games[i].titleId == titleId)
+            return &lib.games[i];
+    return NULL;
+}
+
+// Leaving stops the queue, so it asks first when there's anything in it
+// still to do. True to go ahead.
+static bool ConfirmLeaving()
+{
+    int pending = PendingDownloadCount() + PendingDiscJobCount() + PendingGameJobCount();
+    if (pending == 0)
+        return true;
+
+    char message[96];
+    _snprintf(message, sizeof(message), "%d job%s still in the queue.",
+              pending, pending == 1 ? " is" : "s are");
+    message[sizeof(message) - 1] = '\0';
+
+    return ShowConfirmUI("Leave Omni360?", message,
+                         "Leaving stops them. Files that already finished stay installed; "
+                         "a disc install is removed.",
+                         "Leave");
+}
+
+// A on a library game, or Play on its page. Returns only if it didn't start,
+// having said so.
+static void PlayLibraryGame(const InstalledGame &game)
+{
+    if (!ConfirmLeaving())
+        return;
+    dprintf("Playing: %s (Title ID %08lX)\n", game.displayName, game.titleId);
+    // Before the loader takes over: starting a game ends Omni360, so this is
+    // the only chance to record it for Home's recents.
+    NoteGamePlayed(game.titleId, game.contentType);
+    RenderLaunchFrame("Starting", game.displayName, game.titleId);
+    LaunchInstalledGame(game);
+    ShowMessageUI("Couldn't start this game", game.displayName, "The console's loader refused it - see the log.");
+}
+
+// B on Home: the one way out of the app. Ending Omni360 takes the console
+// wherever DashLaunch says, which is the only exit now that Home is the
+// root - the Xbox Dashboard and settings.txt's "app:" places were a menu
+// here until then. Launch.h still has what either of those would need.
+static bool ExitMenu()
+{
+    const int pending = PendingDownloadCount() + PendingDiscJobCount() + PendingGameJobCount();
+
+    char message[96];
+    if (pending > 0)
+        _snprintf(message, sizeof(message), "%d job%s still in the queue.", pending,
+                  pending == 1 ? " is" : "s are");
+    else
+        _snprintf(message, sizeof(message), "The console goes back to its dashboard.");
+    message[sizeof(message) - 1] = '\0';
+
+    return ShowConfirmUI("Exit Omni360?", message,
+                         pending > 0 ? "Leaving stops them. Files that already finished stay installed; "
+                                       "a disc install is removed."
+                                     : NULL,
+                         "Exit");
+}
+static StoreGameView MakeStoreGameView(Shell &shell, const Library &lib)
+{
+    StoreGameView view;
+    memset(&view, 0, sizeof(view));
+    view.titleId = g_storeGame.titleId;
+    view.indie = StoreGameIsIndie();
+    view.name = g_storeGame.name;
+
+    const StoreDetailsState state = GetStoreDetails(g_storeGame.titleId, &g_storeDetails);
+    view.loading = (state == STORE_DETAILS_LOADING);
+    if (state == STORE_DETAILS_READY)
+    {
+        const StoreDetails &d = g_storeDetails;
+        g_storeMeta[0] = '\0';
+        AppendText(g_storeMeta, sizeof(g_storeMeta), "", d.developer);
+        if (strcmp(d.publisher, d.developer) != 0 && d.publisher[0] != '\0')
+            AppendText(g_storeMeta, sizeof(g_storeMeta), STORE_MIDDOT, d.publisher);
+        if (d.genre[0] != '\0')
+            AppendText(g_storeMeta, sizeof(g_storeMeta), STORE_MIDDOT, d.genre);
+
+        view.meta = g_storeMeta[0] != '\0' ? g_storeMeta : NULL;
+        view.players = d.players;
+        view.rating = d.rating;
+        view.ratings = d.ratings;
+        view.description = d.description;
+        view.screenshots = d.screenshots;
+        view.screenshotCount = d.screenshotCount;
+
+        if (!shell.storeShotsAsked)
+        {
+            for (int i = 0; i < d.screenshotCount; ++i)
+                RequestStoreArt(g_storeGame.titleId, STORE_ART_SCREEN + d.screenshots[i]);
+            shell.storeShotsAsked = true;
+        }
+    }
+
+    // Install speaks for the chosen version, all of its discs.
+    static char installLabel[32];
+    bool partial = false;
+    view.install = StoreVersionState(lib, shell.storeVersionChosen, &view.installFraction, &partial);
+    switch (view.install)
+    {
+    case STORE_INSTALL_QUEUED:
+        view.buttons[0] = "Queued";
+        break;
+    case STORE_INSTALL_INSTALLING:
+        if (view.installFraction >= 0.0f)
+        {
+            _snprintf(installLabel, sizeof(installLabel), "Installing %d%%", (int)(view.installFraction * 100.0f));
+            installLabel[sizeof(installLabel) - 1] = '\0';
+            view.buttons[0] = installLabel;
+        }
+        else
+        {
+            view.buttons[0] = "Installing";
+        }
+        break;
+    case STORE_INSTALL_INSTALLED:
+        // Played from here too, where the library has it to play.
+        view.buttons[0] = LibraryGameByTitleId(lib, g_storeGame.titleId) != NULL ? "Play" : "Installed";
+        break;
+    default:
+        if (DiscInDriveFor(shell, g_storeGame.titleId))
+        {
+            // Even for a game archive.org hasn't got, which has no version
+            // to install and so would leave the button disabled.
+            view.buttons[0] = "Install from disc";
+        }
+        else
+        {
+            view.buttons[0] = partial ? "Install remaining" : "Install";
+            view.buttonDisabled[0] = (StoreVersionCount() == 0);
+        }
+        break;
+    }
+    view.buttons[1] = "Find DLC";
+    view.buttons[2] = "Title updates";
+    if (view.indie)
+    {
+        // Indie games had neither, and Xbox Live's catalog doesn't list them.
+        view.buttonDisabled[1] = view.buttonDisabled[2] = true;
+        view.loading = false;
+        view.description = "An Xbox Live Indie Game. Xbox Live's catalog doesn't list indie games, "
+                           "so there's no description or screenshots for it here.";
+    }
+    else if (StoreGameIsXbox())
+    {
+        // The archive's DLC and title updates are the 360's.
+        view.buttonDisabled[1] = view.buttonDisabled[2] = true;
+        view.loading = false;
+        view.description = "An Original Xbox game, played through the 360's backwards compatibility - it's "
+                           "on Microsoft's list of the games that run. Xbox Live's catalog doesn't list "
+                           "Original Xbox games, so there's no description or screenshots for it here.";
+    }
+    if (view.install == STORE_INSTALL_INSTALLED || (view.install == STORE_INSTALL_AVAILABLE && partial))
+        view.buttons[3] = "Uninstall"; // else not shown
+
+    view.versions = g_storeVersions;
+    view.versionCount = StoreVersionCount();
+    view.versionChosen = shell.storeVersionChosen;
+    view.versionsOpen = shell.storeVersionsOpen;
+    view.versionFocus = shell.storeVersionFocus;
+    view.versionScroll = shell.storeVersionScroll;
+    view.similar = g_similarTiles;
+    view.similarCount = g_similarCount;
+    view.similarScroll = shell.storeSimilarScroll;
+    view.scroll = shell.storeGameScroll;
+    view.focus = shell.storeGameFocus;
+    view.focused = !shell.sidebarFocused;
+    return view;
+}
+
+// Whether a game page's first button is Play: the chosen version is
+// installed, and the library has the game to start.
+static bool GamePagePlays(const Shell &shell, const Library &lib)
+{
+    float fraction = 0.0f;
+    bool partial = false;
+    return StoreVersionState(lib, shell.storeVersionChosen, &fraction, &partial) == STORE_INSTALL_INSTALLED &&
+           LibraryGameByTitleId(lib, g_storeGame.titleId) != NULL;
+}
+
+// The D-pad on a game page: along the buttons, and down to More like this,
+// along it. Left from Install or the row's first game, as from any first
+// column, is the sidebar. The Versions panel has its own.
+static void StepStoreGame(WORD nav, Shell &shell, const Library &lib)
+{
+    int &f = shell.storeGameFocus;
+    const int buttons = CanUninstallStoreVersion(lib, shell) ? STORE_GAME_BUTTONS : STORE_GAME_BUTTONS - 1;
+
+    if (f < STORE_GAME_FOCUS_SIMILAR)
+    {
+        const int b = f - STORE_GAME_FOCUS_BUTTONS;
+        if (nav == XINPUT_GAMEPAD_DPAD_LEFT)
+        {
+            if (b == 0)
+                FocusSidebar(shell);
+            else
+                f--;
+        }
+        else if (nav == XINPUT_GAMEPAD_DPAD_RIGHT && b + 1 < buttons)
+            f++;
+        else if (nav == XINPUT_GAMEPAD_DPAD_DOWN && g_similarCount > 0)
+            f = STORE_GAME_FOCUS_SIMILAR + shell.storeSimilarScroll;
+    }
+    else
+    {
+        const int g = f - STORE_GAME_FOCUS_SIMILAR;
+        if (nav == XINPUT_GAMEPAD_DPAD_LEFT)
+        {
+            if (g == 0)
+                FocusSidebar(shell);
+            else
+                f--;
+        }
+        else if (nav == XINPUT_GAMEPAD_DPAD_RIGHT && g + 1 < g_similarCount)
+            f++;
+        else if (nav == XINPUT_GAMEPAD_DPAD_UP)
+            f = STORE_GAME_FOCUS_BUTTONS;
+    }
+}
+
+static void ReportEnqueue(EnqueueResult result, const char *filename);
+
+// Install on an arcade or indie game's page: its RAR, queued as a pack - the
+// download queue lists the RAR and fetches each package in it, as it does
+// DLC's.
+// The indie games' runtime: the Indie Games title's own update, without
+// which a console offline from Xbox Live won't start one ("you need to
+// download and apply the available update"). The only copy in archive.org's
+// indie items is loose in Castle Miner Z's RAR - so that's where it's fetched
+// from, that one file alone.
+#define INDIE_RUNTIME_RAR  "Castle Miner Z.rar"
+#define INDIE_RUNTIME_FILE "tu32000100_00000000"
+#define INDIE_RUNTIME_NAME "Indie Games update"
+
+// Queues the runtime if it isn't on the drive. True if it was queued.
+static bool QueueIndieRuntime(const char *authHeader)
+{
+    char path[512];
+    _snprintf(path, sizeof(path), "%s\\584E07D2\\000B0000\\" INDIE_RUNTIME_FILE, g_contentBase);
+    path[sizeof(path) - 1] = '\0';
+    if (GetFileAttributesA(path) != (DWORD)-1)
+        return false;
+
+    const XblaGame *carrier = ArcadeGameByRar(INDIE_RUNTIME_RAR);
+    if (carrier == NULL)
+        return false;
+
+    DlcRarMatch pack;
+    memset(&pack, 0, sizeof(pack));
+    _snprintf(pack.item, sizeof(pack.item), "%s", ArcadeItemOf(carrier));
+    pack.item[sizeof(pack.item) - 1] = '\0';
+    _snprintf(pack.filename, sizeof(pack.filename), "%s", carrier->rar);
+    pack.filename[sizeof(pack.filename) - 1] = '\0';
+    _snprintf(pack.only, sizeof(pack.only), "%s", INDIE_RUNTIME_FILE);
+    pack.size = carrier->size;
+    pack.score = 100;
+    return EnqueueDlcPack(pack, INDIE_RUNTIME_NAME, carrier->titleId, authHeader) == ENQUEUE_ADDED;
+}
+
+static void InstallArcadeGame(const char *authHeader)
+{
+    // An indie game's runtime goes first, if it's needed.
+    const bool runtime = StoreGameIsIndie() && QueueIndieRuntime(authHeader);
+
+    DlcRarMatch pack;
+    memset(&pack, 0, sizeof(pack));
+    _snprintf(pack.item, sizeof(pack.item), "%s", ArcadeItemOf(g_storeArcade));
+    pack.item[sizeof(pack.item) - 1] = '\0';
+    _snprintf(pack.filename, sizeof(pack.filename), "%s", g_storeArcade->rar);
+    pack.filename[sizeof(pack.filename) - 1] = '\0';
+    pack.size = g_storeArcade->size;
+    pack.score = 100;
+    const EnqueueResult result = EnqueueDlcPack(pack, g_storeArcade->name, g_storeArcade->titleId, authHeader);
+    if (runtime && result == ENQUEUE_ADDED)
+    {
+        char message[192];
+        _snprintf(message, sizeof(message), "%s, and the " INDIE_RUNTIME_NAME " indie games need to start",
+                  g_storeArcade->name);
+        message[sizeof(message) - 1] = '\0';
+        ShowShellToast("Added to the queue", message, UI_TOAST_INFO);
+    }
+    else
+    {
+        ReportEnqueue(result, g_storeArcade->name);
+    }
+}
+
+// Install on a game page: every disc of the chosen version that isn't
+// installed or on its way, in disc order, queued for GameInstaller. One that's
+// unpacked on the console asks first, as it takes a lot longer. True if that
+// question took over the screen.
+static bool InstallStoreVersion(const Shell &shell, const Library &lib, const char *authHeader)
+{
+    if (g_storeArcade != NULL)
+    {
+        InstallArcadeGame(authHeader);
+        return false;
+    }
+
+    const StoreRelease *release = StoreReleaseOf(&g_storeGame, shell.storeVersionChosen);
+    if (release == NULL)
+        return false;
+
+    const bool unpacks = ReleaseUnpacks(release);
+    if (unpacks)
+    {
+        char message[192];
+        _snprintf(message, sizeof(message), "archive.org only has %s as a compressed .rar file.", g_storeGame.name);
+        message[sizeof(message) - 1] = '\0';
+        if (!ShowConfirmUI("Slow install", message,
+                           "It can still be installed, but it has to be unpacked on your console first, "
+                           "so it takes a lot longer than other games.",
+                           "Install"))
+            return true;
+    }
+
+    static QueueJobSnapshot jobs[MAX_GAME_JOBS];
+    const int jobCount = SnapshotGameJobs(jobs, MAX_GAME_JOBS);
+
+    int added = 0;
+    GameEnqueueResult failure = GAME_QUEUED;
+    for (int d = 0; d < release->discCount && failure == GAME_QUEUED; ++d)
+    {
+        const StoreDisc *disc = StoreReleaseDisc(release, d);
+        if (disc == NULL || ProgressOfDisc(lib, release, disc, jobs, jobCount, NULL) != STORE_DISC_NOT_INSTALLED)
+            continue;
+
+        GameRequest request;
+        memset(&request, 0, sizeof(request));
+        _snprintf(request.item, sizeof(request.item), "%s", StoreItemOf(disc));
+        _snprintf(request.zipName, sizeof(request.zipName), "%s", disc->zip);
+        // The disc's number in its name, so the Queue page and the dashboard
+        // tell the discs apart.
+        if (release->discCount > 1 && disc->disc > 0)
+            _snprintf(request.name, sizeof(request.name), "%s (Disc %u)", g_storeGame.name, (unsigned)disc->disc);
+        else
+            _snprintf(request.name, sizeof(request.name), "%s", g_storeGame.name);
+        request.item[sizeof(request.item) - 1] = '\0';
+        request.zipName[sizeof(request.zipName) - 1] = '\0';
+        request.name[sizeof(request.name) - 1] = '\0';
+        request.zipSize = disc->zipSize;
+        request.titleId = disc->titleId;
+
+        const GameEnqueueResult result = EnqueueGameInstall(request, authHeader);
+        if (result == GAME_QUEUED)
+            added++;
+        else if (result != GAME_ALREADY_QUEUED)
+            failure = result;
+    }
+
+    if (failure == GAME_QUEUE_FULL)
+        ShowShellToast("The queue is full", added > 0 ? "Not every disc fit - try again when one finishes."
+                                                      : "Wait for an install to finish first.", UI_TOAST_ERROR);
+    else if (failure != GAME_QUEUED)
+        ShowShellToast("Couldn't add it", "The game installer isn't running.", UI_TOAST_ERROR);
+    else if (added > 1)
+    {
+        char message[64];
+        _snprintf(message, sizeof(message), "%d discs of %s", added, g_storeGame.name);
+        message[sizeof(message) - 1] = '\0';
+        ShowShellToast("Added to the queue", message, UI_TOAST_INFO);
+    }
+    else if (added == 1)
+        ShowShellToast("Added to the queue", g_storeGame.name, UI_TOAST_INFO);
+    else
+        ShowShellToast("Already in the queue", g_storeGame.name, UI_TOAST_INFO);
+    return unpacks;
+}
+
+// ---------------------------------------------------------------------------
+// The Store's Homebrew page
+// ---------------------------------------------------------------------------
+//
+// The ConsoleMods repo's apps, homebrew games and emulators - the list
+// Aurora's Xbox 360 Homebrew Store script shows, bundled from its .ini files
+// (HomebrewCatalog.h) until the repo can be read live. A row of tiles for
+// each kind, its covers xboxunity's, found by the folder it installs as - the
+// name the Apps, Homebrew and Emulators pages look its cover up by once it's
+// in, so the two share it. A shows an item's details, and Install queues it
+// into the first folder of its kind in Settings - or Hdd1:\Apps, \Homebrew or
+// \Emulators, which then becomes that folder.
+
+static const FolderKind kHomebrewFolderKinds[HOMEBREW_KIND_COUNT] = { FOLDER_APPS, FOLDER_HOMEBREW, FOLDER_EMULATORS };
+static const char *const kHomebrewHeadings[HOMEBREW_KIND_COUNT] = { "Apps", "Homebrew", "Emulators" };
+static const char *const kHomebrewDefaultFolders[HOMEBREW_KIND_COUNT] = { "Hdd1:\\Apps", "Hdd1:\\Homebrew",
+                                                                          "Hdd1:\\Emulators" };
+
+// The tiles, in kHomebrewItems' order - by kind, then title - so each row is
+// a run of them, starting at its kind's first.
+static StoreTileView g_homebrewTiles[HOMEBREW_ITEM_COUNT];
+static bool g_homebrewInstalled[HOMEBREW_ITEM_COUNT];
+static int g_homebrewRowStart[HOMEBREW_KIND_COUNT + 1];
+
+// Where an item of kind installs. *isSet: it's a folder from Settings, not
+// the usual one.
+static const char *HomebrewKindFolder(int kind, bool *isSet)
+{
+    const Shelf &shelf = ShelfFor(kHomebrewFolderKinds[kind]);
+    *isSet = shelf.pathCount > 0;
+    return *isSet ? shelf.paths[0] : kHomebrewDefaultFolders[kind];
+}
+
+// The test mirror from settings.txt, without a trailing '/'; empty for none.
+static void HomebrewMirror(char *out, size_t outSize)
+{
+    GetSettingsPath(HOMEBREW_MIRROR_KEY, "", out, outSize);
+    size_t len = strlen(out);
+    while (len > 0 && (out[len - 1] == '/' || out[len - 1] == ' '))
+        out[--len] = '\0';
+}
+
+// The catalog's tiles and rows. Once: they're its own.
+static void MakeHomebrewTiles()
+{
+    static bool made = false;
+    if (made)
+        return;
+    made = true;
+    for (int k = 0; k <= HOMEBREW_KIND_COUNT; ++k)
+        g_homebrewRowStart[k] = HOMEBREW_ITEM_COUNT;
+    for (int i = HOMEBREW_ITEM_COUNT - 1; i >= 0; --i)
+        g_homebrewRowStart[kHomebrewItems[i].kind] = i;
+    for (int k = HOMEBREW_KIND_COUNT - 1; k >= 0; --k)
+    {
+        if (g_homebrewRowStart[k] > g_homebrewRowStart[k + 1])
+            g_homebrewRowStart[k] = g_homebrewRowStart[k + 1]; // a kind with none
+    }
+    for (int i = 0; i < HOMEBREW_ITEM_COUNT; ++i)
+    {
+        StoreTileView &tile = g_homebrewTiles[i];
+        tile.titleId = HomebrewCoverKey(kHomebrewItems[i].folder);
+        tile.name = kHomebrewItems[i].title;
+        tile.letter = 0;
+        tile.indie = false;
+    }
+}
+
+// The item a row's tile is.
+static int HomebrewItemAt(int row, int place)
+{
+    return g_homebrewRowStart[row] + place;
+}
+
+static int HomebrewRowCount(int row)
+{
+    return g_homebrewRowStart[row + 1] - g_homebrewRowStart[row];
+}
+
+// The names behind every homebrew cover key: the Apps, Homebrew and Emulators
+// pages' items, by their names, and the catalog's, by their folders - for
+// the cover worker to search xboxunity for.
+static void NameHomebrewCovers()
+{
+    static const char *names[SHELF_COUNT * MAX_SHELF_ITEMS + HOMEBREW_ITEM_COUNT];
+    int named = 0;
+    if (g_shelvesRead)
+    {
+        for (int s = 0; s < SHELF_COUNT; ++s)
+            for (int i = 0; i < g_shelves[s].count; ++i)
+                names[named++] = g_shelves[s].items[i].displayName;
+    }
+    for (int i = 0; i < HOMEBREW_ITEM_COUNT; ++i)
+        names[named++] = kHomebrewItems[i].folder;
+    SetHomebrewCoverNames(names, named);
+}
+
+// Which items are installed - their folder is in their kind's. One listing
+// of each kind's folder, not a look-up an item.
+static void RefreshHomebrewPage()
+{
+    std::string present[HOMEBREW_KIND_COUNT];
+    for (int k = 0; k < HOMEBREW_KIND_COUNT; ++k)
+    {
+        bool set;
+        char pattern[MAX_TEXT_LENGTH + 4];
+        _snprintf(pattern, sizeof(pattern), "%s\\*", HomebrewKindFolder(k, &set));
+        pattern[sizeof(pattern) - 1] = '\0';
+        WIN32_FIND_DATAA found;
+        HANDLE h = FindFirstFileA(pattern, &found);
+        if (h == INVALID_HANDLE_VALUE)
+            continue;
+        do
+        {
+            if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+                present[k] += std::string("|") + found.cFileName + "|";
+        } while (FindNextFileA(h, &found));
+        FindClose(h);
+        for (size_t c = 0; c < present[k].size(); ++c)
+            present[k][c] = (char)tolower((unsigned char)present[k][c]);
+    }
+
+    for (int i = 0; i < HOMEBREW_ITEM_COUNT; ++i)
+    {
+        const HomebrewItem &item = kHomebrewItems[i];
+        std::string key = std::string("|") + item.folder + "|";
+        for (size_t c = 0; c < key.size(); ++c)
+            key[c] = (char)tolower((unsigned char)key[c]);
+        g_homebrewInstalled[i] = present[item.kind].find(key) != std::string::npos;
+    }
+}
+
+static void OpenHomebrew(Shell &shell)
+{
+    MakeHomebrewTiles();
+    NameHomebrewCovers();
+    RefreshHomebrewPage();
+    shell.storeInHomebrew = true;
+}
+
+static StoreRowsView MakeHomebrewView(const Shell &shell)
+{
+    StoreRowsView view;
+    memset(&view, 0, sizeof(view));
+    view.title = "Homebrew";
+
+    char mirror[MAX_TEXT_LENGTH];
+    HomebrewMirror(mirror, sizeof(mirror));
+    static char subtitle[MAX_TEXT_LENGTH + 64];
+    if (mirror[0] != '\0')
+        _snprintf(subtitle, sizeof(subtitle), "From the ConsoleMods repo" STORE_MIDDOT "downloads from %s", mirror);
+    else
+        _snprintf(subtitle, sizeof(subtitle), "From the ConsoleMods repo, as Aurora's Homebrew Store lists it");
+    subtitle[sizeof(subtitle) - 1] = '\0';
+    view.subtitle = subtitle;
+
+    for (int k = 0; k < HOMEBREW_KIND_COUNT; ++k)
+    {
+        StoreRowView &row = view.rows[k];
+        row.name = kHomebrewHeadings[k];
+        row.tiles = &g_homebrewTiles[g_homebrewRowStart[k]];
+        row.count = HomebrewRowCount(k);
+        row.scroll = shell.homebrewRowScroll[k];
+        view.installed[k] = &g_homebrewInstalled[g_homebrewRowStart[k]];
+    }
+    view.rowCount = HOMEBREW_KIND_COUNT;
+    view.focusRow = shell.homebrewRow;
+    view.focusPlace = shell.homebrewPlace;
+    view.scroll = shell.homebrewScroll;
+    view.focused = !shell.sidebarFocused;
+    return view;
+}
+
+// A on an item: its details, and Install. Takes over the screen.
+static void ShowHomebrewItem(Shell &shell, int index)
+{
+    const HomebrewItem &item = kHomebrewItems[index];
+    bool set;
+    const char *kindFolder = HomebrewKindFolder(item.kind, &set);
+    char mirror[MAX_TEXT_LENGTH];
+    HomebrewMirror(mirror, sizeof(mirror));
+
+    std::string body = item.description;
+    char facts[160] = "";
+    if (item.version[0] != '\0')
+        _snprintf(facts, sizeof(facts), "Version %s", item.version);
+    facts[sizeof(facts) - 1] = '\0';
+    if (item.author[0] != '\0')
+    {
+        char by[96];
+        _snprintf(by, sizeof(by), "by %s", item.author);
+        by[sizeof(by) - 1] = '\0';
+        AppendText(facts, sizeof(facts), STORE_MIDDOT, by);
+    }
+    if (item.size[0] != '\0')
+        AppendText(facts, sizeof(facts), STORE_MIDDOT, item.size);
+    if (facts[0] != '\0')
+        body = std::string(facts) + "\n\n" + body;
+
+    char foot[MAX_TEXT_LENGTH + 160];
+    _snprintf(foot, sizeof(foot), "%s %s\\%s%s", g_homebrewInstalled[index] ? "Installed in" : "Installs to",
+              kindFolder, item.folder, mirror[0] != '\0' ? "  -  from your test mirror" : "");
+    foot[sizeof(foot) - 1] = '\0';
+
+    if (!ShowNotesUI(kHomebrewHeadings[item.kind], item.title, body.c_str(), foot,
+                     g_homebrewInstalled[index] ? L"Install again" : L"Install"))
+        return;
+    if (g_homebrewInstalled[index] &&
+        !ShowConfirmUI("Install again?", item.title,
+                       "Files it brings are replaced; anything else in its folder, like settings, stays.", "Install"))
+        return;
+
+    // The first of its kind: the usual folder becomes its kind's, so its
+    // page turns up in the sidebar once it's in.
+    if (!set)
+    {
+        if (!WriteFolderKind(kHomebrewFolderKinds[item.kind], "", NULL, kindFolder))
+        {
+            ShowMessageUI("Not saved", "settings.txt could not be written.", kindFolder);
+            return;
+        }
+        shell.rescanShelves = true;
+    }
+
+    HomebrewJobSpec spec;
+    memset(&spec, 0, sizeof(spec));
+    _snprintf(spec.title, sizeof(spec.title), "%s", item.title);
+    for (int u = 0; u < item.urlCount && u < HOMEBREW_MAX_URLS; ++u)
+        _snprintf(spec.urls[u], sizeof(spec.urls[u]), "%s", kHomebrewUrls[item.firstUrl + u]);
+    spec.urlCount = item.urlCount < HOMEBREW_MAX_URLS ? item.urlCount : HOMEBREW_MAX_URLS;
+    _snprintf(spec.kindFolder, sizeof(spec.kindFolder), "%s", kindFolder);
+    _snprintf(spec.folder, sizeof(spec.folder), "%s", item.folder);
+    _snprintf(spec.mirror, sizeof(spec.mirror), "%s", mirror);
+    spec.title[sizeof(spec.title) - 1] = spec.kindFolder[sizeof(spec.kindFolder) - 1] = '\0';
+    spec.folder[sizeof(spec.folder) - 1] = spec.mirror[sizeof(spec.mirror) - 1] = '\0';
+    ReportEnqueue(EnqueueHomebrew(spec), item.title);
+}
+
+// A on the front page. True if something took over the screen.
+static bool ActOnStoreFocus(Shell &shell)
+{
+    const int i = shell.storeFocus;
+    if (i < STORE_FOCUS_BUTTONS)
+    {
+        const StoreFeaturedView &featured = g_featuredTiles[i - STORE_FOCUS_FEATURED];
+        if (StoreGameByTitleId(featured.titleId, &g_storeGame))
+            OpenStoreGame(shell, g_storeGame);
+        else
+            ShowShellToast("Not in the collection", featured.name, UI_TOAST_ERROR);
+    }
+    else if (i < STORE_FOCUS_LETTERS)
+    {
+        if (kStoreButtons[i - STORE_FOCUS_BUTTONS].disabled)
+            ShowShellToast("Coming soon", kStoreButtonsSoon[i - STORE_FOCUS_BUTTONS], UI_TOAST_INFO);
+        else if (i - STORE_FOCUS_BUTTONS == STORE_BUTTON_XBLA)
+            OpenSection(shell, SECTION_XBLA);
+        else if (i - STORE_FOCUS_BUTTONS == STORE_BUTTON_XBLIG)
+            OpenSection(shell, SECTION_XBLIG);
+        else if (i - STORE_FOCUS_BUTTONS == STORE_BUTTON_XBOX)
+            OpenSection(shell, SECTION_XBOX);
+        else if (i - STORE_FOCUS_BUTTONS == STORE_BUTTON_HOMEBREW)
+            OpenHomebrew(shell);
+        else
+            ShowShellToast("Coming soon", kStoreButtonsSoon[i - STORE_FOCUS_BUTTONS], UI_TOAST_INFO);
+    }
+    else if (i < STORE_FOCUS_COLLECTIONS)
+    {
+        OpenStoreLetter(shell, kStoreLetters[i - STORE_FOCUS_LETTERS], -1);
+    }
+    else if (i < STORE_FOCUS_ROWS)
+    {
+        const int place = i - STORE_FOCUS_COLLECTIONS;
+        if (place < g_collectionCount)
+            OpenStoreCollection(shell, g_collectionIds[place]);
+    }
+    else
+    {
+        const int r = (i - STORE_FOCUS_ROWS) / STORE_ROW_TILES_MAX;
+        const int place = (i - STORE_FOCUS_ROWS) % STORE_ROW_TILES_MAX;
+        if (r < g_rowCount && place < g_rowCounts[r])
+            OpenStoreGame(shell, g_rowGames[r][place]);
+    }
+    return false;
+}
+
+// Where focus is, as one number: a press that changes it moved something,
+// and makes a sound; one at the end of a list doesn't.
+static unsigned long FocusSignature(const Shell &shell)
+{
+    const int parts[] = {
+        shell.page, shell.sidebarFocused, shell.librarySelected, shell.libraryInGame,
+        shell.homeFocus, shell.homeNavFocus, shell.homeSelected,
+        shell.settings.focusRow, shell.settings.focusCol, DiscSpeedSetting(),
+        shell.picker.kind, shell.picker.selected, shell.queueSelected,
+        shell.storeFocus, shell.storeInSection, shell.storeSection, shell.sectionFocus[shell.storeSection],
+        shell.storeInLetter, shell.storeSelected, shell.storeInGame, shell.storeGameFocus, shell.storeVersionChosen,
+        shell.storeVersionsOpen, shell.storeVersionFocus,
+        shell.storeFilterOpen, shell.storeFilterFocus, FilterSignature(),
+        shell.storeInHomebrew, shell.homebrewRow, shell.homebrewPlace,
+        g_shelves[SHELF_APPS].selected, g_shelves[SHELF_HOMEBREW].selected, g_shelves[SHELF_EMULATORS].selected,
+    };
+    unsigned long hash = 2166136261UL; // FNV-1a
+    for (size_t i = 0; i < sizeof(parts) / sizeof(parts[0]); ++i)
+    {
+        hash ^= (unsigned long)parts[i];
+        hash *= 16777619UL;
+    }
+    return hash;
+}
+
+static void RefreshShell(Shell &shell, Library &lib, const char *contentBasePath, const char *gamesPath)
+{
+    // Kept for the next start.
+    const double start = ImageTimerMs();
+    if (lib.cacheDirty)
+        SaveLibrary(lib, gamesPath);
+    const double savedDone = ImageTimerMs();
+
+    // The banner goes as soon as keys are added in Settings, and comes back
+    // if they're removed.
+    std::string savedAccess, savedSecret;
+    shell.keysSaved = LoadSavedKeys(savedAccess, savedSecret);
+
+    // Where DLC and title updates install, not where the games are - that's
+    // the drive that fills up.
+    const double keysDone = ImageTimerMs();
+    ReadStorageStatus(contentBasePath, &shell.storage);
+    const double storageDone = ImageTimerMs();
+
+    // An install, or a new games folder, can change whether the disc is in it.
+    if (shell.hasDisc && shell.disc.state == DISC_READY)
+        shell.discInstalled = IsDiscInstalled(gamesPath, shell.disc.titleId, shell.disc.mediaId);
+
+    const double discDone = ImageTimerMs();
+    BuildSettingsPage(shell.settings, lib, gamesPath);
+    dprintf("[timing] refresh: library cache %.1f, keys %.1f, storage %.1f, disc check %.1f, settings page %.1f ms\n",
+            savedDone - start, keysDone - savedDone, storageDone - keysDone, discDone - storageDone, ImageTimerMs() - discDone);
+
+    shell.stale = false;
+    shell.settingsStale = false;
+}
+
+// Every frame, so the blocking screens - a search, a key check - show the
+// sidebar as it was when they started.
+static void PublishSidebar(const Shell &shell, const Library &lib)
+{
+    ShellSidebar sidebar;
+    sidebar.shown = SidebarShown(shell);
+    sidebar.page = shell.page;
+    // Home draws no sidebar; never let a focused one be published for it,
+    // whatever shell.sidebarFocused was left holding.
+    sidebar.focused = SidebarShown(shell) && shell.sidebarFocused;
+    sidebar.libraryCount = lib.count;
+    sidebar.appsCount = g_shelvesRead ? g_shelves[SHELF_APPS].count : 0;
+    sidebar.homebrewCount = g_shelvesRead ? g_shelves[SHELF_HOMEBREW].count : 0;
+    sidebar.emulatorsCount = g_shelvesRead ? g_shelves[SHELF_EMULATORS].count : 0;
+    for (int p = 0; p < SHELL_PAGE_COUNT; ++p)
+        sidebar.hidden[p] = PageHidden((ShellPage)p);
+    sidebar.queueCount = PendingDownloadCount() + PendingDiscJobCount() + PendingGameJobCount();
+    sidebar.storageUsed = shell.storage.used;
+    strncpy(sidebar.storageLabel, shell.storage.label, sizeof(sidebar.storageLabel) - 1);
+    sidebar.storageLabel[sizeof(sidebar.storageLabel) - 1] = '\0';
+    strncpy(sidebar.storageDetail, shell.storage.detail, sizeof(sidebar.storageDetail) - 1);
+    sidebar.storageDetail[sizeof(sidebar.storageDetail) - 1] = '\0';
+    strncpy(sidebar.storageTotal, shell.storage.total, sizeof(sidebar.storageTotal) - 1);
+    sidebar.storageTotal[sizeof(sidebar.storageTotal) - 1] = '\0';
+
+    SetShellSidebar(sidebar);
+}
+
+// ---------------------------------------------------------------------------
+// Home
+// ---------------------------------------------------------------------------
+
+// Recents.txt as last read. Reading it is one small file read, so it's done
+// at startup and again whenever the library is rescanned - never per frame.
+static RecentGame g_recents[MAX_RECENTS];
+static int g_recentCount = 0;
+
+static void ReadRecents()
+{
+    g_recentCount = LoadRecents(g_recents, MAX_RECENTS);
+}
+
+// What the disc's tile shows, wherever it is drawn: the library's grid and
+// Home's recents row both start with it, and its buttons depend on this.
+static LibraryDiscTile DiscTileState(const Shell &shell)
+{
+    if (shell.disc.state == DISC_READING)
+        return DISC_TILE_READING;
+    if (shell.disc.state == DISC_UNREADABLE)
+        return DISC_TILE_UNREADABLE;
+    if (shell.disc.installing)
+        return DISC_TILE_INSTALLING;
+    if (shell.discInstalled)
+        return DISC_TILE_INSTALLED;
+    return DISC_TILE_READY;
+}
+
+// The games played most recently that are still installed, with the disc in
+// the drive in front of them. Names and covers come from the library, so a
+// game uninstalled since isn't found and drops out on its own.
+//
+// The strings the view points at are held in statics: it's built, drawn and
+// thrown away inside one frame, like the other Make*View calls.
+static HomePageView MakeHomeView(const Shell &shell, const Library &lib)
+{
+    static char clock[16];
+    static char storage[40];
+
+    HomePageView view;
+    memset(&view, 0, sizeof(view));
+
+    view.gamertag = NULL; // until there's a profile to show
+    view.focus = shell.homeFocus;
+    view.navFocus = shell.homeNavFocus;
+    view.recentFocus = shell.homeSelected;
+    view.recentScroll = shell.homeScroll;
+
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    int hour = now.wHour % 12;
+    if (hour == 0)
+        hour = 12;
+    _snprintf(clock, sizeof(clock), "%d:%02d %s", hour, (int)now.wMinute, now.wHour < 12 ? "AM" : "PM");
+    clock[sizeof(clock) - 1] = '\0';
+    view.clock = clock;
+
+    if (shell.storage.detail[0] != '\0')
+    {
+        _snprintf(storage, sizeof(storage), "%s", shell.storage.detail);
+        storage[sizeof(storage) - 1] = '\0';
+        view.storage = storage;
+    }
+
+    // The four places Home goes. Apps, Homebrew and Emulators aren't here:
+    // they sit in the Games page's own sidebar, beside the games, which is
+    // why that one reads "Games + Apps".
+    static const ShellPage kHomeNavPages[] = { SHELL_PAGE_LIBRARY, SHELL_PAGE_STORE, SHELL_PAGE_QUEUE,
+                                               SHELL_PAGE_SETTINGS };
+    const int queued = PendingDownloadCount() + PendingDiscJobCount() + PendingGameJobCount();
+    for (int i = 0; i < (int)(sizeof(kHomeNavPages) / sizeof(kHomeNavPages[0])) && view.navCount < HOME_NAV_MAX;
+         ++i)
+    {
+        const ShellPage p = kHomeNavPages[i];
+        HomeNavView &item = view.nav[view.navCount++];
+        item.label = (p == SHELL_PAGE_LIBRARY) ? "Games + Apps" : ShellPageName(p);
+        item.page = p;
+        item.count = (p == SHELL_PAGE_QUEUE) ? queued : 0;
+    }
+
+    // The disc first: it's the thing you've just put in, so it's what you
+    // most likely came here to start.
+    if (shell.hasDisc && view.recentCount < HOME_RECENTS_MAX)
+    {
+        HomeRecentView &tile = view.recents[view.recentCount];
+        // Only a disc that read has a title ID worth asking for art by, as
+        // the library's tile does.
+        tile.titleId = (shell.disc.state == DISC_READY) ? shell.disc.titleId : 0;
+        tile.name = shell.discName;
+        tile.disc = true;
+        view.recentCount++;
+    }
+
+    for (int i = 0; i < g_recentCount && view.recentCount < HOME_RECENTS_MAX; ++i)
+    {
+        const InstalledGame *game = NULL;
+        for (int g = 0; g < lib.count && game == NULL; ++g)
+        {
+            if (lib.games[g].titleId == g_recents[i].titleId)
+                game = &lib.games[g];
+        }
+        if (game == NULL)
+            continue; // played once, not installed now
+
+        HomeRecentView &tile = view.recents[view.recentCount];
+        tile.titleId = game->titleId;
+        tile.name = game->displayName;
+        tile.disc = false;
+        view.recentCount++;
+    }
+
+    if (view.recentCount == 0)
+    {
+        view.emptyTitle = lib.count > 0 ? "Nothing played yet" : "No games installed yet";
+        view.emptyHint = lib.count > 0 ? "Games you start show up here."
+                                       : "Find something in the Store to get going.";
+    }
+
+    return view;
+}
+
+static LibraryPageView MakeLibraryView(const Shell &shell, const Library &lib, const char *gamesPath)
+{
+    LibraryPageView view;
+    view.games = lib.games;
+    view.count = lib.count;
+    view.selected = shell.librarySelected;
+    view.scroll = shell.libraryScroll;
+    view.gamesPath = gamesPath;
+    view.bannerText = shell.keysSaved ? NULL : "Add your archive.org keys in Settings to start downloading.";
+    view.focused = !shell.sidebarFocused;
+    view.heading = NULL;
+    view.emptyTitle = NULL;
+    view.emptyHint = NULL;
+    view.isApps = false;
+    view.coverKeys = NULL;
+
+    view.hasDisc = shell.hasDisc;
+    view.discTitleId = (shell.disc.state == DISC_READY) ? shell.disc.titleId : 0;
+    view.discName = shell.discName;
+    view.discProgress = -1.0f;
+    view.discTile = DiscTileState(shell);
+
+    // The bar across an installing disc's tile, from its job on the Queue.
+    for (int i = 0; i < shell.queueCount; ++i)
+    {
+        const QueueJobSnapshot &job = shell.queueJobs[i];
+        if (job.kind == QUEUE_JOB_DISC_INSTALL && job.state == QUEUE_ACTIVE)
+            view.discProgress = job.fraction;
+    }
+    return view;
+}
+
+// The Apps or Homebrew page, drawn as the library's grid is.
+static LibraryPageView MakeShelfView(const Shell &shell, ShelfKind kind)
+{
+    static const char *const headings[SHELF_COUNT] = { "Apps", "Homebrew", "Emulators" };
+    static const char *const looking[SHELF_COUNT] = { "Looking for apps", "Looking for homebrew",
+                                                      "Looking for emulators" };
+    static const char *const none[SHELF_COUNT] = { "No apps found", "No homebrew found", "No emulators found" };
+    const Shelf &shelf = g_shelves[kind];
+
+    LibraryPageView view;
+    memset(&view, 0, sizeof(view));
+    view.games = shelf.items;
+    view.count = g_shelvesRead ? shelf.count : 0;
+    view.selected = shelf.selected;
+    view.scroll = shelf.scroll;
+    view.focused = !shell.sidebarFocused;
+    view.heading = headings[kind];
+    view.isApps = true;
+    view.coverKeys = shelf.coverKeys;
+    view.gamesPath = shelf.pathCount > 0 ? shelf.pathList : NULL;
+
+    // Without folders the page isn't in the sidebar, so it's never empty for
+    // want of them.
+    if (!g_shelvesRead)
+    {
+        view.emptyTitle = looking[kind];
+        view.emptyHint = "";
+    }
+    else
+    {
+        view.emptyTitle = none[kind];
+        view.emptyHint = "Each one is a folder with default.xex, default.xbe or one other .xex in it.";
+    }
+    return view;
+}
+
+// A on an app. Returns only if it didn't start, having said so.
+static void PlayApp(const InstalledGame &app)
+{
+    if (!ConfirmLeaving())
+        return;
+    dprintf("Starting app: %s (%s)\n", app.displayName, app.packagePath);
+    RenderLaunchFrame("Starting", app.displayName, app.titleId);
+    LaunchApp(app.packagePath);
+    ShowMessageUI("Couldn't start it", app.displayName, "The console's loader refused it - see the log.");
+}
+
+// The D-pad and shoulder buttons on a grid of tiles - the library's, or an
+// app page's. True when left from the first column means the sidebar.
+static bool StepGrid(const UiInput &input, int itemCount, int pageRows, int &sel)
+{
+    if (itemCount == 0)
+        return input.nav == XINPUT_GAMEPAD_DPAD_LEFT;
+
+    const int cols = LibraryGridColumns();
+
+    if (input.nav == XINPUT_GAMEPAD_DPAD_LEFT)
+    {
+        if (sel % cols == 0)
+            return true;
+        sel--;
+    }
+    else if (input.nav == XINPUT_GAMEPAD_DPAD_RIGHT)
+    {
+        if (sel % cols < cols - 1 && sel + 1 < itemCount)
+            sel++;
+    }
+    else if (input.nav == XINPUT_GAMEPAD_DPAD_UP)
+    {
+        if (sel >= cols)
+            sel -= cols;
+    }
+    else if (input.nav == XINPUT_GAMEPAD_DPAD_DOWN)
+    {
+        // Down from a row with nothing under it lands on the last
+        // game, rather than doing nothing.
+        if (sel + cols < itemCount)
+            sel += cols;
+        else if (sel / cols < (itemCount - 1) / cols)
+            sel = itemCount - 1;
+    }
+
+    // Shoulder buttons jump a screenful of rows - the fast way
+    // through a large library even with auto-repeat.
+    if (input.pressed & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER))
+    {
+        int jump = pageRows * cols;
+        if (input.pressed & XINPUT_GAMEPAD_LEFT_SHOULDER)
+            sel -= jump;
+        if (input.pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER)
+            sel += jump;
+        if (sel > itemCount - 1) sel = itemCount - 1;
+        if (sel < 0) sel = 0;
+    }
+    return false;
+}
+
+// The disc in the drive, as of this frame. When it changes - in, out, or a
+// different one - its name is looked up, whether it's installed is checked,
+// and its box art is asked for; the selection moves with the games, so the
+// one you were on stays selected as the disc's tile comes and goes.
+// A disc's name: the bundled title list's, then the Store's - its 360 and
+// Original Xbox lists - then an Original Xbox disc's own, from default.xbe.
+// NULL if none has one.
+static const char *KnownDiscName(const DiscInfo &disc)
+{
+    const char *listed = LookupTitleName(disc.titleId);
+    if (listed != NULL)
+        return listed;
+    static StoreGame game;
+    if (StoreGameByTitleId(disc.titleId, &game) && game.name != NULL && game.name[0] != '\0')
+        return game.name;
+    return disc.name[0] != '\0' ? disc.name : NULL;
+}
+
+static void UpdateDisc(Shell &shell, const Library &lib, const char *gamesPath)
+{
+    DiscInfo now;
+    GetDiscInfo(&now);
+
+    const bool changed = (now.changeCount != shell.disc.changeCount);
+    const bool hadDisc = shell.hasDisc;
+
+    shell.disc = now;
+    shell.hasDisc = (now.state == DISC_READY || now.state == DISC_READING || now.state == DISC_UNREADABLE);
+
+    if (changed)
+    {
+        if (now.state == DISC_READY)
+        {
+            const char *listed = KnownDiscName(now);
+            if (listed != NULL)
+                _snprintf(shell.discName, sizeof(shell.discName), "%s", listed);
+            else
+                _snprintf(shell.discName, sizeof(shell.discName), "Title %08lX", now.titleId);
+            shell.discInstalled = IsDiscInstalled(gamesPath, now.titleId, now.mediaId);
+        }
+        else if (now.state == DISC_READING)
+        {
+            _snprintf(shell.discName, sizeof(shell.discName), "Reading the disc");
+            shell.discInstalled = false;
+        }
+        else if (now.state == DISC_UNREADABLE)
+        {
+            _snprintf(shell.discName, sizeof(shell.discName), "%s", now.reason);
+            shell.discInstalled = false;
+        }
+        shell.discName[sizeof(shell.discName) - 1] = '\0';
+
+        unsigned long coverTitle = (now.state == DISC_READY) ? now.titleId : 0;
+        if (coverTitle != g_coverDiscTitleId)
+        {
+            g_coverDiscTitleId = coverTitle;
+            RequestLibraryCovers(lib);
+        }
+    }
+
+    if (hadDisc != shell.hasDisc)
+    {
+        if (shell.hasDisc)
+            shell.librarySelected++;
+        else if (shell.librarySelected > 0)
+            shell.librarySelected--;
+    }
+}
+
+// Installs the disc that's in the drive now, asking first for what it needs:
+// whether to replace a copy that's already on the drive, whether there's
+// room for it, and the name the dashboard will show. Returns true if one of
+// those took over the screen, so input is resynced after.
+//
+// START on the disc's tile starts this, and so does Install from disc on the
+// game's own page - the two are the same install.
+static bool StartDiscInstall(Shell &shell, const char *gamesPath)
+{
+    const DiscInfo &disc = shell.disc;
+    if (disc.state != DISC_READY || disc.installing)
+        return false;
+
+    if (shell.discInstalled &&
+        !ShowConfirmUI("Install again?", shell.discName,
+                       "Installing it again replaces the copy on the drive.", "Reinstall"))
+        return true;
+
+    unsigned long long freeSpace = 0;
+    if (DriveFreeSpace(gamesPath, &freeSpace) && freeSpace < disc.outputSize + 4ULL * 1024 * 1024)
+    {
+        ShowNotEnoughSpace(gamesPath, disc.outputSize, freeSpace);
+        return true;
+    }
+
+    // A name from a list or the disc is used as it is; without one, the
+    // keyboard asks rather than installing it as "Title XXXXXXXX".
+    std::string name = shell.discName;
+    bool tookScreen = shell.discInstalled; // the confirm above
+    if (KnownDiscName(disc) == NULL)
+    {
+        tookScreen = true;
+        if (!AskDiscName(shell.discName, disc.discNumber, disc.discCount, name))
+            return true;
+    }
+
+    char sizeText[64] = "";
+    FormatBytes(disc.outputSize, sizeText, sizeof(sizeText));
+
+    char detail[160];
+    switch (QueueDiscInstall(disc.titleId, disc.mediaId, name.c_str()))
+    {
+    case DISC_INSTALL_QUEUED:
+        _snprintf(detail, sizeof(detail), "%s" "  \xC2\xB7  " "%s, on the Queue page", name.c_str(), sizeText);
+        detail[sizeof(detail) - 1] = '\0';
+        ShowShellToast("Installing", detail, UI_TOAST_INFO);
+        break;
+    case DISC_INSTALL_BUSY:
+        ShowShellToast("Already installing", "One disc installs at a time.", UI_TOAST_INFO);
+        break;
+    case DISC_INSTALL_NO_DISC:
+        ShowShellToast("Couldn't install", "The disc in the drive changed. Try again in a moment.", UI_TOAST_ERROR);
+        break;
+    default:
+        ShowShellToast("Couldn't install", "The disc worker didn't start - the log says why.", UI_TOAST_ERROR);
+        break;
+    }
+    return tookScreen;
+}
+
+// What A, X and START do on the disc's tile. Returns true if it took over
+// the screen (the keyboard, a message), so input is resynced after.
+static bool DiscTileAction(Shell &shell, const Library &lib, const char *gamesPath, WORD pressed)
+{
+    const DiscInfo &disc = shell.disc;
+
+    if (disc.state == DISC_UNREADABLE)
+    {
+        if (pressed & XINPUT_GAMEPAD_A)
+        {
+            ShowMessageUI("Can't install this disc", disc.reason, "Only Xbox 360 game discs can be installed.");
+            return true;
+        }
+        return false;
+    }
+
+    if (disc.state != DISC_READY)
+        return false;
+
+    if (disc.installing)
+    {
+        // It's on the Queue page; A goes there.
+        if (pressed & XINPUT_GAMEPAD_A)
+        {
+            shell.page = SHELL_PAGE_QUEUE;
+            shell.sidebarFocused = false;
+        }
+        return false;
+    }
+
+    // A plays it, as A does any library game. X is the game's page,
+    // installed or not - its details, versions, DLC and updates - and START
+    // installs it, or installs it again.
+    if (pressed & XINPUT_GAMEPAD_A)
+    {
+        if (ConfirmLeaving())
+        {
+            dprintf("Playing the disc: %s (Title ID %08lX)\n", shell.discName, disc.titleId);
+            // Recorded like any other game: it shows on Home if the same
+            // title is also installed, and drops out if it isn't.
+            NoteGamePlayed(disc.titleId, 0);
+            RenderLaunchFrame("Starting", shell.discName, disc.titleId);
+            // Nothing may be reading the drive as the game starts from it.
+            StopDiscWorker(3000);
+            LaunchDisc(disc.original);
+            ShowMessageUI("Couldn't start this disc", shell.discName, "The console's loader refused it - see the log.");
+        }
+        return true;
+    }
+
+    if (pressed & XINPUT_GAMEPAD_X)
+    {
+        OpenGameByTitleId(shell, lib, disc.titleId, shell.discName);
+        return false;
+    }
+
+    if (!(pressed & XINPUT_GAMEPAD_START))
+        return false;
+
+    return StartDiscInstall(shell, gamesPath);
+}
+
+// One row up or down for an up/down nav, clamped to the list.
+static void StepSelection(WORD nav, int count, int &selected)
+{
+    if (nav == XINPUT_GAMEPAD_DPAD_UP && selected > 0)
+        selected--;
+    else if (nav == XINPUT_GAMEPAD_DPAD_DOWN && selected < count - 1)
+        selected++;
+}
+
+// ---------------------------------------------------------------------------
+// The queue, from the UI's side
+// ---------------------------------------------------------------------------
+
+// Whose cover a job shows. By title ID rather than a row number, so it still
+// finds the game after the library is rescanned.
+static int LibraryIndexForTitle(const Library &lib, unsigned long titleId)
+{
+    for (int i = 0; i < lib.count; ++i)
+    {
+        if (lib.games[i].titleId == titleId)
+            return i;
+    }
+    return -1;
+}
+
+// A or X on a Home tile. The disc's tile is the library's, so it goes
+// through the same place; a game plays, or opens its page in Your Library.
+// True if something took over the screen.
+static bool HomeTileAction(Shell &shell, const Library &lib, const char *gamesPath, WORD pressed,
+                           const HomeRecentView &tile)
+{
+    if (tile.disc)
+    {
+        // The game's page is drawn by Games and by the Store, not by Home -
+        // OpenGameByTitleId goes by whichever page is showing, so opened
+        // from here it set a flag nothing on Home reads, and X appeared to
+        // do nothing at all. Move to Games first, as X on a library game
+        // does, but only in the two states DiscTileAction opens a page from:
+        // in the others X does nothing, and moving for it would be a jump
+        // to nowhere.
+        const LibraryDiscTile state = DiscTileState(shell);
+        if ((pressed & XINPUT_GAMEPAD_X) && (state == DISC_TILE_READY || state == DISC_TILE_INSTALLED))
+        {
+            shell.page = SHELL_PAGE_LIBRARY;
+            shell.sidebarFocused = false;
+            shell.librarySelected = 0; // the disc is the library's first tile
+        }
+        return DiscTileAction(shell, lib, gamesPath, pressed);
+    }
+
+    const int index = LibraryIndexForTitle(lib, tile.titleId);
+    if (index < 0)
+        return false; // uninstalled since the page was built
+
+    if (pressed & XINPUT_GAMEPAD_A)
+    {
+        PlayLibraryGame(lib.games[index]);
+        return true; // it said why if it's still here
+    }
+
+    if (pressed & XINPUT_GAMEPAD_X)
+    {
+        // On the library's page, so B comes back to the grid rather than to
+        // the Store - OpenGameByTitleId goes by whichever page is showing.
+        shell.page = SHELL_PAGE_LIBRARY;
+        shell.sidebarFocused = false;
+        shell.librarySelected = index + (shell.hasDisc ? 1 : 0);
+        OpenGameByTitleId(shell, lib, tile.titleId, lib.games[index].displayName);
+    }
+
+    return false;
+}
+
+static QueueRowTone ToneForOutcome(QueueOutcome outcome)
+{
+    switch (outcome)
+    {
+    case QUEUE_OUTCOME_INSTALLED:
+    case QUEUE_OUTCOME_ALREADY_INSTALLED:
+        return QUEUE_ROW_DONE;
+    case QUEUE_OUTCOME_CANCELLED:
+        return QUEUE_ROW_WAITING; // dim - it simply isn't happening
+    default:
+        return QUEUE_ROW_FAILED;
+    }
+}
+
+// "12.4 MB of 48.0 MB   1.2 MB/s   3:21 left", or as much of it as is known.
+// Fixed format specifiers and explicit termination throughout: this
+// toolchain's _snprintf doesn't terminate on truncation, and its
+// dynamic-precision specifier has crashed this project before.
+static void FormatTransferNumbers(const QueueJobSnapshot &job, char *out, size_t outSize)
+{
+    out[0] = '\0';
+    if (job.bytesDone == 0 && job.bytesTotal == 0)
+        return;
+
+    char done[64] = "", speed[64] = "";
+    FormatBytes(job.bytesDone, done, sizeof(done));
+    FormatBytes(job.bytesPerSec, speed, sizeof(speed));
+
+    if (job.bytesTotal > 0)
+    {
+        char total[64] = "";
+        FormatBytes(job.bytesTotal, total, sizeof(total));
+
+        // Minutes/seconds cast down to int before formatting - small by
+        // definition, and it avoids relying on %llu width handling here.
+        int minutesLeft = (int)(job.secondsLeft / 60);
+        int secsLeft = (int)(job.secondsLeft % 60);
+
+        _snprintf(out, outSize, "%s of %s   %s/s   %d:%02d left", done, total, speed, minutesLeft, secsLeft);
+    }
+    else
+    {
+        // No size to go on - say what's known rather than implying a
+        // percentage there isn't.
+        _snprintf(out, outSize, "%s   %s/s", done, speed);
+    }
+    out[outSize - 1] = '\0';
+}
+
+// A job that finished by putting the game on the console. These go to the
+// row across the top of the page; everything else that finished - a
+// failure, a stopped install - keeps its card, because what it has to say
+// is the reason it's still listed at all.
+static bool JobInstalled(const QueueJobSnapshot &job)
+{
+    return job.state == QUEUE_FINISHED &&
+           (job.outcome == QUEUE_OUTCOME_INSTALLED || job.outcome == QUEUE_OUTCOME_ALREADY_INSTALLED);
+}
+
+// Puts a job at the front of the row, if it isn't already in it. Already
+// there means it was noted on an earlier frame, and where it sits then is
+// where it belongs - the row is in the order jobs finished.
+static void NoteQueueRecent(Shell &shell, const QueueJobSnapshot &job)
+{
+    for (int i = 0; i < shell.queueRecentCount; ++i)
+    {
+        if (shell.queueRecents[i].id == job.id)
+            return;
+    }
+
+    if (shell.queueRecentCount >= MAX_QUEUE_ROWS)
+        shell.queueRecentCount = MAX_QUEUE_ROWS - 1; // the oldest falls off the end
+    for (int i = shell.queueRecentCount; i > 0; --i)
+        shell.queueRecents[i] = shell.queueRecents[i - 1];
+
+    QueueRecent &r = shell.queueRecents[0];
+    r.id = job.id;
+    r.titleId = job.titleId;
+    _snprintf(r.name, sizeof(r.name), "%s", job.gameName[0] != '\0' ? job.gameName : job.title);
+    r.name[sizeof(r.name) - 1] = '\0';
+    shell.queueRecentCount++;
+
+    // The row grew under the focus; keep it on the same tile.
+    if (shell.queueRecentCount > 1)
+        shell.queueRecentFocus++;
+}
+
+// Brings the row in line with the queue: anything newly installed joins it,
+// and anything no longer in the queue - removed by X, here or on a card -
+// leaves it.
+static void UpdateQueueRecents(Shell &shell, const QueueJobSnapshot *disc, int discCount,
+                               const QueueJobSnapshot *game, int gameCount, const QueueJobSnapshot *dl,
+                               int dlCount)
+{
+    const QueueJobSnapshot *lists[3] = { disc, game, dl };
+    const int counts[3] = { discCount, gameCount, dlCount };
+
+    int live[MAX_QUEUE_ROWS];
+    int liveCount = 0;
+    for (int l = 0; l < 3; ++l)
+    {
+        for (int i = 0; i < counts[l] && liveCount < MAX_QUEUE_ROWS; ++i)
+        {
+            if (JobInstalled(lists[l][i]))
+                live[liveCount++] = lists[l][i].id;
+        }
+    }
+
+    int kept = 0;
+    for (int i = 0; i < shell.queueRecentCount; ++i)
+    {
+        bool stillThere = false;
+        for (int j = 0; j < liveCount && !stillThere; ++j)
+            stillThere = (live[j] == shell.queueRecents[i].id);
+        if (stillThere)
+            shell.queueRecents[kept++] = shell.queueRecents[i];
+        else if (i < shell.queueRecentFocus)
+            shell.queueRecentFocus--; // a tile before the focus went; it didn't move
+    }
+    shell.queueRecentCount = kept;
+
+    for (int l = 0; l < 3; ++l)
+    {
+        for (int i = 0; i < counts[l]; ++i)
+        {
+            if (JobInstalled(lists[l][i]))
+                NoteQueueRecent(shell, lists[l][i]);
+        }
+    }
+
+    if (shell.queueRecentFocus > shell.queueRecentCount - 1)
+        shell.queueRecentFocus = shell.queueRecentCount - 1;
+    if (shell.queueRecentFocus < 0)
+        shell.queueRecentFocus = 0;
+}
+
+// Copies the queue out and turns it into rows for the Queue page: a disc
+// install and game installs still to do first, then the downloads as the
+// download queue orders them, then whatever finished without installing.
+// What installed goes to the row above them instead - see queueRecents.
+static void SnapshotQueue(Shell &shell, const Library &lib)
+{
+    QueueJobSnapshot foundryJob;
+    static QueueJobSnapshot discJobs[MAX_DISC_JOBS];
+    static QueueJobSnapshot gameJobs[MAX_GAME_JOBS];
+    static QueueJobSnapshot dlJobs[MAX_QUEUE_JOBS];
+    const int discCount = SnapshotDiscJobs(discJobs, MAX_DISC_JOBS);
+    const int gameCount = SnapshotGameJobs(gameJobs, MAX_GAME_JOBS);
+    const int dlCount = SnapshotDownloadQueue(dlJobs, MAX_QUEUE_JOBS);
+
+    int n = 0;
+    for (int i = 0; i < discCount; ++i)
+    {
+        if (discJobs[i].state != QUEUE_FINISHED)
+            shell.queueJobs[n++] = discJobs[i];
+    }
+    for (int i = 0; i < gameCount; ++i)
+    {
+        if (gameJobs[i].state != QUEUE_FINISHED)
+            shell.queueJobs[n++] = gameJobs[i];
+    }
+    for (int i = 0; i < dlCount && n < MAX_QUEUE_ROWS; ++i)
+    {
+        if (!JobInstalled(dlJobs[i]))
+            shell.queueJobs[n++] = dlJobs[i];
+    }
+    for (int i = 0; i < gameCount && n < MAX_QUEUE_ROWS; ++i)
+    {
+        if (gameJobs[i].state == QUEUE_FINISHED && !JobInstalled(gameJobs[i]))
+            shell.queueJobs[n++] = gameJobs[i];
+    }
+    for (int i = 0; i < discCount && n < MAX_QUEUE_ROWS; ++i)
+    {
+        if (discJobs[i].state == QUEUE_FINISHED && !JobInstalled(discJobs[i]))
+            shell.queueJobs[n++] = discJobs[i];
+    }
+    if (n < MAX_QUEUE_ROWS && SnapshotFoundryJobs(&foundryJob, 1))
+        shell.queueJobs[n++] = foundryJob;
+    shell.queueCount = n;
+
+    UpdateQueueRecents(shell, discJobs, discCount, gameJobs, gameCount, dlJobs, dlCount);
+    for (int i = 0; i < shell.queueRecentCount; ++i)
+    {
+        shell.queueRecentRows[i].name = shell.queueRecents[i].name;
+        shell.queueRecentRows[i].titleId = shell.queueRecents[i].titleId;
+        shell.queueRecentRows[i].libraryIndex = LibraryIndexForTitle(lib, shell.queueRecents[i].titleId);
+    }
+
+    // Focus can't stay where there's nothing: on an empty row it goes back
+    // to the cards, and with no cards left it has nowhere else to be.
+    if (shell.queueRecentCount == 0)
+        shell.queueOnRecents = false;
+    else if (shell.queueCount == 0)
+        shell.queueOnRecents = true;
+
+    // Follow the selected job to wherever it now sits.
+    for (int i = 0; i < shell.queueCount; ++i)
+    {
+        if (shell.queueJobs[i].id == shell.queueSelectedId)
+        {
+            shell.queueSelected = i;
+            break;
+        }
+    }
+    if (shell.queueSelected > shell.queueCount - 1) shell.queueSelected = shell.queueCount - 1;
+    if (shell.queueSelected < 0) shell.queueSelected = 0;
+    shell.queueSelectedId = (shell.queueCount > 0) ? shell.queueJobs[shell.queueSelected].id : 0;
+
+    for (int i = 0; i < shell.queueCount; ++i)
+    {
+        const QueueJobSnapshot &job = shell.queueJobs[i];
+        QueueRowView &row = shell.queueRows[i];
+        char *status = shell.queueStatus[i];
+        char *numbers = shell.queueNumbers[i];
+        const size_t statusSize = sizeof(shell.queueStatus[i]);
+
+        row.title = job.title;
+        row.gameName = job.gameName;
+        row.status = status;
+        row.numbers = NULL;
+        row.libraryIndex = LibraryIndexForTitle(lib, job.titleId);
+        row.titleId = job.titleId;
+        row.step = 0;
+        row.stepCount = 0;
+        row.stepFraction = -1.0f;
+        numbers[0] = '\0';
+
+        if (job.state == QUEUE_WAITING)
+        {
+            _snprintf(status, statusSize, "Waiting");
+            row.tone = QUEUE_ROW_WAITING;
+            row.showBar = true;
+            row.fraction = -1.0f;
+        }
+        else if (job.state == QUEUE_ACTIVE)
+        {
+            const char *phase = job.phase[0] != '\0' ? job.phase : "Starting";
+            if (job.stepCount > 1 && job.stepFraction >= 0.0f)
+                _snprintf(status, statusSize, "Step %d of %d: %s (%d%%)", job.step + 1, job.stepCount, phase,
+                          (int)((job.stepFraction > 1.0f ? 1.0f : job.stepFraction) * 100.0f));
+            else if (job.stepCount > 1)
+                _snprintf(status, statusSize, "Step %d of %d: %s", job.step + 1, job.stepCount, phase);
+            else
+                _snprintf(status, statusSize, "%s", phase);
+            FormatTransferNumbers(job, numbers, sizeof(shell.queueNumbers[i]));
+            row.numbers = numbers;
+            row.tone = QUEUE_ROW_ACTIVE;
+            row.showBar = true;
+            row.fraction = job.fraction;
+            row.step = job.step;
+            row.stepCount = job.stepCount > 4 ? 4 : job.stepCount;
+            row.stepFraction = job.stepFraction;
+
+            // The segments' widths: the download is the long wait, so its
+            // segment is most of the bar. The same as each step's share of
+            // the percentage (kGameStepShares, kPackStepShares), so the two
+            // agree.
+            static const float kGameWidths[3] = { 0.05f, 0.90f, 0.05f };
+            static const float kPackWidths[2] = { 0.10f, 0.90f };
+            const float *widths = (job.kind == QUEUE_JOB_GAME_INSTALL && row.stepCount == 3) ? kGameWidths
+                                  : (row.stepCount == 2)                                  ? kPackWidths
+                                                                                          : NULL;
+            for (int s = 0; s < row.stepCount; ++s)
+                row.stepWidths[s] = widths != NULL ? widths[s] : 1.0f / row.stepCount;
+        }
+        else
+        {
+            if (job.resultDetail[0] != '\0')
+                _snprintf(status, statusSize, "%s   -   %s", job.resultText, job.resultDetail);
+            else
+                _snprintf(status, statusSize, "%s", job.resultText);
+            row.tone = ToneForOutcome(job.outcome);
+            row.showBar = false;
+            row.fraction = -1.0f;
+        }
+        status[statusSize - 1] = '\0';
+    }
+}
+
+// Notices the update check finishing: the Settings row says so, and a newer
+// version gets one popup a session.
+static void PollUpdateCheck(Shell &shell)
+{
+    static unsigned long seen = 0;
+    static bool announced = false;
+    unsigned long changes = 0;
+    UpdateInfo info;
+    const UpdateState state = GetUpdateState(&info, &changes);
+    if (changes == seen)
+        return;
+    seen = changes;
+    // Just the Settings row - a whole refresh walks every game's folders
+    // again, which froze the library for most of a second.
+    shell.settingsStale = true;
+
+    if (state == UPDATE_AVAILABLE && !announced)
+    {
+        announced = true;
+        char title[64];
+        _snprintf(title, sizeof(title), "Omni360 %s is available", info.version);
+        title[sizeof(title) - 1] = '\0';
+        ShowShellToast(title, "See Settings for what's new", UI_TOAST_INFO);
+    }
+}
+
+// Drains the jobs that finished since the last frame. Each one may have
+// changed what's on disk - the installed markers, the free space - so they're
+// refreshed; the ones worth hearing about get a popup.
+static void HandleFinishedDownloads(Shell &shell, bool &haveAuth)
+{
+    QueueJobSnapshot job;
+
+    // A disc or game install: the game is new in the library, or it isn't.
+    while (TakeFinishedDiscJob(&job) || TakeFinishedGameJob(&job) || TakeFinishedFoundryJob(&job))
+    {
+        shell.stale = true;
+        if (job.outcome == QUEUE_OUTCOME_INSTALLED)
+            shell.rescanLibrary = true;
+
+        if (!job.notify)
+            continue;
+
+        char message[192];
+        if (job.outcome == QUEUE_OUTCOME_INSTALLED)
+            _snprintf(message, sizeof(message), "%s", job.gameName);
+        else
+            _snprintf(message, sizeof(message), "%s   -   %s", job.gameName, job.resultDetail);
+        message[sizeof(message) - 1] = '\0';
+
+        ShowShellToast(job.resultText, message,
+                       job.outcome == QUEUE_OUTCOME_INSTALLED ? UI_TOAST_SUCCESS : UI_TOAST_ERROR);
+    }
+
+    while (TakeFinishedQueueJob(&job))
+    {
+        shell.stale = true;
+
+        // Refused keys: rebuild the header from the file next time, so keys
+        // fixed outside Settings - by replacing ArchiveOrgKeys.txt over FTP -
+        // are picked up without restarting the app.
+        if (job.outcome == QUEUE_OUTCOME_KEYS_REJECTED)
+            haveAuth = false;
+
+        // An arcade or indie game, by its RAR. An arcade game is new in the
+        // library; an indie game isn't one the library lists.
+        const XblaGame *arcade = (job.kind == QUEUE_JOB_DLC_PACK) ? ArcadeGameByRar(job.title) : NULL;
+        const bool arcadeGame = (arcade != NULL);
+        if (arcadeGame && ArcadeSetOf(arcade) == ARCADE_XBLA && job.outcome == QUEUE_OUTCOME_INSTALLED)
+            shell.rescanLibrary = true;
+
+        // Homebrew: new on its Apps, Homebrew or Emulators page.
+        if (job.kind == QUEUE_JOB_HOMEBREW && job.outcome == QUEUE_OUTCOME_INSTALLED)
+            shell.rescanShelves = true;
+
+        if (!job.notify)
+            continue;
+
+        char heading[64];
+        _snprintf(heading, sizeof(heading), "%s", job.resultText);
+        heading[sizeof(heading) - 1] = '\0';
+
+        // The pack's filename says which download this was - an arcade
+        // game's name, for one of those; the detail is in the Queue page for
+        // anyone who wants it.
+        const char *what = arcadeGame ? job.gameName : job.title;
+        char message[192];
+        if (job.outcome == QUEUE_OUTCOME_INSTALLED || job.outcome == QUEUE_OUTCOME_ALREADY_INSTALLED)
+            _snprintf(message, sizeof(message), "%s", what);
+        else
+            _snprintf(message, sizeof(message), "%s   -   %s", what, job.resultDetail);
+        message[sizeof(message) - 1] = '\0';
+
+        ShowShellToast(heading, message,
+                       ToneForOutcome(job.outcome) == QUEUE_ROW_DONE ? UI_TOAST_SUCCESS : UI_TOAST_ERROR);
+    }
+}
+
+// What adding a row from a picker says. Never a blocking message - the point
+// of the queue is that choosing a download doesn't stop you.
+static void ReportEnqueue(EnqueueResult result, const char *filename)
+{
+    switch (result)
+    {
+    case ENQUEUE_ADDED:
+        ShowShellToast("Added to the queue", filename, UI_TOAST_INFO);
+        break;
+    case ENQUEUE_ALREADY_QUEUED:
+        ShowShellToast("Already in the queue", filename, UI_TOAST_INFO);
+        break;
+    case ENQUEUE_FULL:
+        ShowShellToast("The queue is full", "Wait for a download to finish, or remove finished ones from the Queue.",
+                       UI_TOAST_ERROR);
+        break;
+    default:
+        ShowShellToast("Downloads aren't available", "The download worker didn't start - see the log.",
+                       UI_TOAST_ERROR);
+        break;
+    }
+}
+
+static int AddHint(UiHint *hints, int count, UiButton button, const WCHAR *label, const WCHAR *shortLabel = NULL)
+{
+    hints[count].button = button;
+    hints[count].label = label;
+    hints[count].shortLabel = shortLabel;
+    return count + 1;
+}
+
+// The DLC pack or title update picker, over whichever page opened it: a
+// search in progress or what it found.
+// A game's page, over the Store or the library, with the buttons that apply
+// to what has focus.
+static void RenderGamePageFrame(Shell &shell, const Library &lib, UiHint *hints, int hintCount)
+{
+    if (!shell.sidebarFocused)
+    {
+        const int f = shell.storeGameFocus;
+        if (shell.storeVersionsOpen)
+        {
+            hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Choose");
+            hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Done");
+        }
+        else if (f >= STORE_GAME_FOCUS_SIMILAR)
+            hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"View game", L"View");
+        else if (f == STORE_GAME_FOCUS_BUTTONS && StoreVersionCount() > 0)
+            hintCount = AddHint(hints, hintCount, UI_BUTTON_A, GamePagePlays(shell, lib) ? L"Play" : L"Install");
+        else if (f == STORE_GAME_FOCUS_BUTTONS + 1 && !StoreGameIsIndie() && !StoreGameIsXbox())
+            hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Find DLC", L"DLC");
+        else if (f == STORE_GAME_FOCUS_BUTTONS + 2 && !StoreGameIsIndie() && !StoreGameIsXbox())
+            hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Find title updates", L"Updates");
+        else if (f == STORE_GAME_FOCUS_BUTTONS + 3)
+            hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Uninstall");
+        if (!shell.storeVersionsOpen)
+        {
+            hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Back");
+            if (StoreVersionCount() > 1)
+                hintCount = AddHint(hints, hintCount, UI_BUTTON_Y, L"Versions");
+        }
+    }
+
+    StoreGameView view = MakeStoreGameView(shell, lib);
+    RenderStoreGameFrame(view, hints, hintCount);
+    shell.storeGameFocus = view.focus;
+    shell.storeVersionScroll = view.versionScroll;
+    shell.storeVersionFocus = view.versionFocus;
+    shell.storeSimilarScroll = view.similarScroll;
+    shell.storeGameScroll = view.scroll;
+}
+
+static void RenderPickerFrame(Shell &shell, UiHint *hints, int hintCount)
+{
+    if (shell.picker.kind != PICKER_NONE && shell.picker.status != PICKER_READY)
+    {
+        const Picker &picker = shell.picker;
+        const char *heading = (picker.kind == PICKER_DLC) ? "Choose a DLC pack" : "Choose a title update";
+        const char *gameName = picker.gameName;
+
+        if (picker.status == PICKER_UNREACHABLE)
+            hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Try again");
+        hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Back");
+
+        if (picker.status == PICKER_SEARCHING)
+        {
+            // The dots step about three times a second - something
+            // has to move, or a slow answer reads as a hang.
+            static const char *const kSearching[] = {
+                "Searching archive.org", "Searching archive.org.",
+                "Searching archive.org..", "Searching archive.org..."};
+            const char *message = kSearching[(GetTickCount() / 333) % 4];
+            RenderPlaceholderFrame(heading, message, gameName, hints, hintCount);
+        }
+        else if (picker.status == PICKER_NOTHING)
+        {
+            RenderPlaceholderFrame(heading,
+                                   picker.kind == PICKER_DLC ? "No DLC in the collection matched this game."
+                                                             : "No title update matched this game.",
+                                   gameName, hints, hintCount);
+        }
+        else
+        {
+            RenderPlaceholderFrame(heading, "Could not reach archive.org.",
+                                   "Check the console's network connection and try again.",
+                                   hints, hintCount);
+        }
+    }
+    else
+    {
+        hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Add to queue", L"Queue");
+        hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Back");
+
+        ListPageView view;
+        view.heading = (shell.picker.kind == PICKER_DLC) ? "Choose a DLC pack" : "Choose a title update";
+        view.subheading = shell.picker.gameName;
+        view.labels = shell.picker.labels;
+        view.sublabels = shell.picker.sublabels;
+        view.sections = NULL;
+        view.count = shell.picker.count;
+        view.selected = shell.picker.selected;
+        view.scroll = shell.picker.scroll;
+        view.focused = true;
+        view.showCounter = true;
+
+        RenderListFrame(view, hints, hintCount);
+
+        shell.picker.selected = view.selected;
+        shell.picker.scroll = view.scroll;
+    }
+}
+
+// The auth header is built once and kept, and only rebuilt after the keys
+// change or archive.org refuses them.
+static bool EnsureAuthHeader(bool &haveAuth, char *authHeader, unsigned long long authHeaderSize)
+{
+    if (haveAuth)
+        return true;
+
+    // Nothing is drawn for saved keys - reading them is instant, and a frame
+    // here only flashed up between A and the toast. GetArchiveOrgAuthHeader
+    // draws its own screens when there's something to ask.
+    //
+    // GetArchiveOrgAuthHeader explains its own failures on screen, so nothing
+    // more is shown here - a second message would only repeat it.
+    if (!GetArchiveOrgAuthHeader(authHeader, authHeaderSize))
+        return false;
+
+    haveAuth = true;
+    return true;
+}
+
+// Startup timing: each step's time and the total since main() began, so a
+// launch log shows where the wait before the library goes.
+static double g_startupStart = 0.0;
+static double g_startupLast = 0.0;
+
+static void StartupStep(const char *step)
+{
+    const double now = ImageTimerMs();
+    dprintf("[timing] startup: %s %.1f ms (%.1f ms since launch)\n", step, now - g_startupLast, now - g_startupStart);
+    g_startupLast = now;
+}
+
+// What startup reads off the UI thread: the library, which games have DLC or
+// an update installed, and the Store's rows. Seconds on a hard drive, nearly
+// all of it waiting on the disk.
+//
+// With no Library.cache, all of it is behind the loading screen, read into
+// lib. With one, lib is already the cached list, so the loading screen waits
+// only for the Store's rows; the library is then read into fresh while the
+// app runs, and the shell loop swaps it in if anything changed.
+struct StartupLoad
+{
+    Library *lib;
+    Library *fresh;   // NULL with no cache
+    const char *gamesPath;
+    char morePaths[MAX_MORE_GAMES_PATHS][MAX_TEXT_LENGTH];
+    int moreCount;
+    volatile LONG ready;     // the loading screen can end
+    volatile LONG freshRead; // fresh is read, and lib can be compared with it
+};
+
+static DWORD WINAPI StartupLoadEntry(LPVOID param)
+{
+    StartupLoad &load = *(StartupLoad *)param;
+    Library &lib = load.fresh != NULL ? *load.fresh : *load.lib;
+
+    const double start = ImageTimerMs();
+    if (load.fresh != NULL)
+    {
+        BuildStoreRows();
+        InterlockedExchange(&load.ready, 1);
+    }
+    const double rows = ImageTimerMs();
+    ReadLibrary(lib, load.gamesPath, load.morePaths, load.moreCount);
+    const double read = ImageTimerMs();
+    if (load.fresh == NULL)
+    {
+        BuildStoreRows();
+        InterlockedExchange(&load.ready, 1);
+    }
+    else
+    {
+        InterlockedExchange(&load.freshRead, 1);
+    }
+    dprintf("[timing] startup thread%s: library %.1f, Store rows %.1f ms\n",
+            load.fresh != NULL ? " (behind the cached library)" : "", read - rows,
+            load.fresh != NULL ? rows - start : ImageTimerMs() - read);
+
+    // The Apps and Homebrew pages last, with the app already up.
+    const double shelvesStart = ImageTimerMs();
+    for (int s = 0; s < SHELF_COUNT; ++s)
+        ScanShelf(g_shelves[s]);
+    InterlockedExchange(&g_shelvesRead, 1);
+    dprintf("[timing] startup thread: apps, homebrew and emulators %.1f ms (%d + %d + %d)\n",
+            ImageTimerMs() - shelvesStart, g_shelves[SHELF_APPS].count, g_shelves[SHELF_HOMEBREW].count,
+            g_shelves[SHELF_EMULATORS].count);
+    return 0;
+}
+
+// Whether two reads of the library found the same: the same games, at the same
+// paths.
+static bool SameLibrary(const Library &a, const Library &b, int folderCount)
+{
+    if (a.count != b.count || memcmp(a.folderFound, b.folderFound, folderCount * sizeof(int)) != 0)
+        return false;
+    for (int i = 0; i < a.count; ++i)
+    {
+        const InstalledGame &x = a.games[i], &y = b.games[i];
+        if (x.titleId != y.titleId || x.contentType != y.contentType || x.folder != y.folder ||
+            strcmp(x.packagePath, y.packagePath) != 0 || strcmp(x.displayName, y.displayName) != 0)
+            return false;
+    }
+    return true;
+}
+
+// The library read behind the cached one, once it's done: swapped in if it
+// differs, keeping the selected game selected - unless the library was
+// scanned again meanwhile, which is newer.
+// A freshly read library becomes the live one: the selection stays on the
+// same game, the covers are asked for again, and `fresh` is left empty with
+// its buffer kept for the next read. Nothing happens if the drive turned out
+// to agree with what's already on screen.
+static void AdoptLibrary(Shell &shell, Library &lib, Library &fresh, const char *gamesPath)
+{
+    if (SameLibrary(lib, fresh, 1 + g_moreGamesPathCount))
+    {
+        dprintf("[library cache] the drive agrees with it\n");
+        FreeInstalledGames(fresh.games, fresh.count);
+        fresh.count = 0;
+        return;
+    }
+
+    dprintf("[library cache] the drive has changed: %d games, were %d\n", fresh.count, lib.count);
+    const int discItems = shell.hasDisc ? 1 : 0;
+    const int was = shell.librarySelected - discItems;
+    const unsigned long selectedTitle = (was >= 0 && was < lib.count) ? lib.games[was].titleId : 0;
+
+    ReleaseGameListIcons();
+    FreeInstalledGames(lib.games, lib.count);
+    InstalledGame *spare = lib.games;
+    lib.games = fresh.games;
+    lib.count = fresh.count;
+    memcpy(lib.folderFound, fresh.folderFound, sizeof(lib.folderFound));
+    fresh.games = spare;
+    fresh.count = 0;
+
+    if (selectedTitle != 0)
+    {
+        for (int i = 0; i < lib.count; ++i)
+            if (lib.games[i].titleId == selectedTitle)
+                shell.librarySelected = discItems + i;
+    }
+    if (shell.librarySelected > discItems + lib.count - 1)
+        shell.librarySelected = discItems + lib.count - 1;
+    if (shell.librarySelected < 0)
+        shell.librarySelected = 0;
+
+    RequestLibraryCovers(lib);
+    SaveLibrary(lib, gamesPath);
+    shell.stale = true;
+}
+
+static void TakeFreshLibrary(Shell &shell, Library &lib, Library &fresh, const char *gamesPath)
+{
+    if (g_libraryGeneration != 0)
+    {
+        dprintf("[library cache] the library was read again meanwhile; the startup read is dropped\n");
+        FreeInstalledGames(fresh.games, fresh.count);
+        fresh.count = 0;
+        return;
+    }
+    AdoptLibrary(shell, lib, fresh, gamesPath);
+}
+
+// ---------------------------------------------------------------------------
+// Reading the library again without stopping the app
+// ---------------------------------------------------------------------------
+//
+// An install finishing leaves the drive out of step with what's on screen.
+// Reading it again takes a couple of seconds on a large library, and used to
+// take the whole screen while it did. It runs on a worker thread instead,
+// into a library of its own - the shape the startup read already uses - so
+// the page carries on, with "Refreshing library" in the footer until the new
+// one can be swapped in. Nothing is shared with the worker: it writes only
+// to its own library, and the swap happens here.
+
+struct LibraryRescan
+{
+    Library fresh;
+    char gamesPath[MAX_TEXT_LENGTH];
+    char morePaths[MAX_MORE_GAMES_PATHS][MAX_TEXT_LENGTH];
+    int moreCount;
+    volatile LONG done;
+    HANDLE thread;
+    bool running;
+    bool again;     // asked for again while one was going
+    int generation; // what g_libraryGeneration was when it started
+};
+
+static LibraryRescan g_rescan = { 0 };
+
+static DWORD WINAPI LibraryRescanEntry(LPVOID param)
+{
+    LibraryRescan &r = *(LibraryRescan *)param;
+    ReadLibrary(r.fresh, r.gamesPath, r.morePaths, r.moreCount);
+    InterlockedExchange(&r.done, 1);
+    return 0;
+}
+
+// False if it couldn't start one, and the caller should read the drive the
+// slow way instead.
+static bool StartLibraryRescan(const char *gamesPath)
+{
+    if (g_rescan.running)
+    {
+        g_rescan.again = true;
+        return true;
+    }
+
+    // settings.txt is read here, on the UI thread, and the paths handed over:
+    // the worker must not touch anything this thread may be reading.
+    ReadMoreGamesPaths();
+
+    if (g_rescan.fresh.games == NULL)
+        g_rescan.fresh.games = (InstalledGame *)malloc(sizeof(InstalledGame) * MAX_INSTALLED_GAMES);
+    if (g_rescan.fresh.games == NULL)
+        return false;
+    g_rescan.fresh.count = 0;
+
+    _snprintf(g_rescan.gamesPath, sizeof(g_rescan.gamesPath), "%s", gamesPath);
+    g_rescan.gamesPath[sizeof(g_rescan.gamesPath) - 1] = '\0';
+    memcpy(g_rescan.morePaths, g_moreGamesPaths, sizeof(g_rescan.morePaths));
+    g_rescan.moreCount = g_moreGamesPathCount;
+
+    g_rescan.generation = g_libraryGeneration;
+    InterlockedExchange(&g_rescan.done, 0);
+    g_rescan.thread = CreateThread(NULL, 0, LibraryRescanEntry, &g_rescan, 0, NULL);
+    if (g_rescan.thread == NULL)
+    {
+        dprintf("[library] no thread to read the drive on; reading it here instead\n");
+        return false;
+    }
+
+    g_rescan.running = true;
+    SetShellBusy("Refreshing library");
+    return true;
+}
+
+// Swaps a finished read in. Call once a frame.
+static void PollLibraryRescan(Shell &shell, Library &lib, const char *gamesPath)
+{
+    if (!g_rescan.running || InterlockedCompareExchange(&g_rescan.done, 0, 0) == 0)
+        return;
+
+    CloseHandle(g_rescan.thread);
+    g_rescan.thread = NULL;
+    g_rescan.running = false;
+
+    if (g_libraryGeneration != g_rescan.generation)
+    {
+        // Settings changed the folders and read the drive itself while this
+        // was going: what came back is for the folders as they were.
+        dprintf("[library] the folders changed while the drive was being read; that read is dropped\n");
+        FreeInstalledGames(g_rescan.fresh.games, g_rescan.fresh.count);
+        g_rescan.fresh.count = 0;
+    }
+    else
+    {
+        g_libraryGeneration++;
+        AdoptLibrary(shell, lib, g_rescan.fresh, gamesPath);
+        shell.stale = true;
+    }
+
+    // Another install finished while that one was going.
+    if (g_rescan.again)
+    {
+        g_rescan.again = false;
+        if (StartLibraryRescan(gamesPath))
+            return;
+    }
+    SetShellBusy(NULL);
+}
+
+int main()
+{
+    g_startupStart = g_startupLast = ImageTimerMs();
+
+    remove(LOG_FILE_PATH);
+
+    MakeConsole("embed:\\font", CONSOLE_COLOR_BLACK, CONSOLE_COLOR_WHITE);
+    StartupStep("console");
+
+    // The log goes to the file but not the screen: a flash of white log text
+    // before the loading screen is just noise. The console is only shown if
+    // the UI fails to start, below.
+    SetConsoleQuiet(true);
+
+    if (!CheckGameMounted())
+        dprintf("Warning: Some paths may not be mounted\n");
+
+    // X-Store, which this began as a fork of, is credited in the README's
+    // Credits section - the modified-version notice AGPL-3.0 asks for.
+    dprintf("Omni360 " CURRENT_VERSION "\n");
+
+    // Whether opening the disc tray should leave the app running (see
+    // xex.xml), and whether DashLaunch is loaded - the first thing to check
+    // if the app is ever closed by an eject again.
+    {
+        HANDLE dashLaunch = NULL;
+        bool haveDashLaunch = XexGetModuleHandle("launch.xex", &dashLaunch) >= 0 && dashLaunch != NULL;
+        dprintf("Stays open when the disc tray opens (no-force-reboot privilege): %s; DashLaunch %s\n",
+                XexCheckExecutablePrivilege(0) ? "yes" : "NO", haveDashLaunch ? "loaded" : "not loaded");
+    }
+    StartupStep("mount check + log header");
+
+    // The network stack, kept up for the session, and the network as the app
+    // sees it - the first thing to read when a download won't connect.
+    StartNetwork();
+    LogNetworkStatus();
+    StartupStep("network");
+    SetDiscReadSpeed(DiscSpeedSetting());
+    if (StartUiSounds())
+        SetUiSoundsOn(UiSoundsSetting());
+    StartupStep("disc speed + sounds");
+
+    if (!InitGameListUI())
+    {
+        SetConsoleQuiet(false);
+        dprintf("ERROR: failed to initialize the icon-list UI (D3D device not ready?)\n");
+        dprintf("The full log is in " LOG_FILE_PATH "\n");
+        WaitForExit();
+        return EXIT_FAILURE;
+    }
+
+    StartupStep("UI init");
+
+    char gamesPath[MAX_TEXT_LENGTH];
+    GetGamesPath(gamesPath, sizeof(gamesPath));
+    dprintf("Games path (scanned for your library): %s\n", gamesPath);
+
+    // After the games path, which it follows the drive of.
+    GetContentBasePath(gamesPath, g_contentBase, sizeof(g_contentBase));
+    dprintf("Content path (DLC, updates and arcade games install here): %s\n", g_contentBase);
+
+    // First thing, so the space a half-installed game from last time took is
+    // back before anything else checks for room. (It was never listed: the
+    // header is written last, and without one the library doesn't see it.)
+    CleanUpInterruptedInstall();
+    StartupStep("paths + interrupted-install cleanup");
+
+    // From here on the screen belongs to the UI rather than the debug console.
+    // The dprintf calls stay - they're the log, and the log is still how
+    // anything that goes wrong gets diagnosed - but every phase the user
+    // actually waits on now draws a real frame instead of leaving whatever
+    // was last on screen.
+    Library lib;
+    g_storeLib = &lib;
+    lib.count = 0;
+    memset(lib.folderFound, 0, sizeof(lib.folderFound));
+    lib.cacheDirty = false;
+    lib.games = (InstalledGame *)malloc(sizeof(InstalledGame) * MAX_INSTALLED_GAMES);
+
+    if (lib.games == NULL)
+    {
+        dprintf("ERROR: out of memory for the game list\n");
+        ShutdownGameListUI();
+        return EXIT_FAILURE;
+    }
+
+    // An empty library is NOT a reason to quit any more. It used to end the
+    // app with a message, which left someone whose games folder was simply
+    // wrong no way to fix it from the console - the game list now says it is
+    // empty, names the folder it searched, and offers Settings.
+    // Before the first scan, which asks it for the library's box art.
+    if (!StartCoverArt())
+        dprintf("ERROR: the cover worker didn't start - tiles keep their icons\n");
+
+    // Waits until the Store is first opened to fetch anything.
+    if (!StartStoreArt())
+        dprintf("ERROR: the Store's art worker didn't start - its tiles stay plain\n");
+
+    // Reads what's in the drive straight away, for the library's first tile.
+    if (!StartDiscWorker(gamesPath))
+        dprintf("ERROR: the disc worker didn't start - discs can't be installed\n");
+
+    // Also clears out what an install interrupted last time left staged.
+    if (!StartGameInstaller(gamesPath))
+        dprintf("ERROR: the game installer didn't start - games can't be installed\n");
+    if (!StartFoundry(gamesPath, g_contentBase))
+        dprintf("ERROR: Foundry worker did not start\n");
+    StartupStep("art, disc and installer workers");
+
+    // The startup screen: the library, its DLC/update flags and the Store's
+    // rows are read on a thread of their own while this one keeps the dot
+    // bouncing - and starts everything else, one step a frame, in between.
+    // The bouncing lasts exactly as long as that takes; then the mark forms
+    // and rests (about 2.5 s, see GameListUI.cpp) and fades into the app.
+    //
+    // With the library kept from last time, the bouncing waits only for the
+    // Store's rows, and the drive is read behind the library instead.
+    ReadMoreGamesPaths();
+    for (int s = 0; s < SHELF_COUNT; ++s)
+        ReadShelfPaths(g_shelves[s], kShelfKeys[s]);
+    Library fresh;
+    fresh.count = 0;
+    fresh.games = NULL;
+    {
+        char folders[2048];
+        LibraryFoldersKey(gamesPath, folders, sizeof(folders));
+        const double start = ImageTimerMs();
+        const int cached =
+            LoadLibraryCache(folders, lib.games, MAX_INSTALLED_GAMES, lib.folderFound, 1 + g_moreGamesPathCount);
+        if (cached >= 0)
+        {
+            fresh.games = (InstalledGame *)malloc(sizeof(InstalledGame) * MAX_INSTALLED_GAMES);
+            if (fresh.games == NULL)
+            {
+                // Read the drive behind the loading screen, as with no cache.
+                FreeInstalledGames(lib.games, cached);
+            }
+            else
+            {
+                lib.count = cached;
+                dprintf("[library cache] %d games, read in %.1f ms\n", cached, ImageTimerMs() - start);
+            }
+        }
+    }
+
+    StartupLoad load;
+    load.lib = &lib;
+    load.fresh = fresh.games != NULL ? &fresh : NULL;
+    load.gamesPath = gamesPath;
+    memcpy(load.morePaths, g_moreGamesPaths, sizeof(load.morePaths));
+    load.moreCount = g_moreGamesPathCount;
+    load.ready = 0;
+    load.freshRead = 0;
+    HANDLE loader = CreateThread(NULL, 256 * 1024, StartupLoadEntry, &load, CREATE_SUSPENDED, NULL);
+    if (loader == NULL)
+    {
+        dprintf("[startup] CreateThread failed (%lu) - reading the library on this thread\n", GetLastError());
+        RenderStartupFrame(false);
+        StartupLoadEntry(&load);
+    }
+    else
+    {
+#ifdef _XBOX
+        // Hardware thread 2, core 1's first - the read-ahead's, which only
+        // runs during an install. This is nearly all waiting on the disk.
+        XSetThreadProcessor(loader, 2);
+#endif
+        ResumeThread(loader);
+    }
+
+    bool downloadsStarted = false, searchStarted = false;
+    bool loaded = false;
+    for (int step = 0;; ++step)
+    {
+        if (RenderStartupFrame(loaded))
+            break;
+
+        if (loaded)
+        {
+            // The mark is forming and resting; nothing left to do.
+        }
+        else if (step == 0)
+        {
+            // One request to GitHub, on its own thread; the Settings page
+            // says how it went, and a newer version gets a popup.
+            if (UpdateChecksOn())
+                StartUpdateCheck();
+        }
+        else if (step == 1)
+        {
+            // The Store's featured games: the kept featured.json now,
+            // GitHub's shortly - see Featured.h.
+            StartFeatured();
+        }
+        else if (step == 2)
+            RefreshFeatured();
+        else if (step == 3)
+        {
+            // Not fatal if it fails: everything but downloading still works,
+            // and choosing a download then says why it can't.
+            downloadsStarted = StartDownloadQueue(g_contentBase);
+        }
+        else if (step == 4)
+        {
+            // Likewise: without it, a search says archive.org can't be
+            // reached.
+            searchStarted = StartSearchWorker();
+        }
+        else if (load.ready)
+        {
+            // Then the icons, a few a frame, so the library's first frame
+            // has nothing left to build.
+            if (PrepareGameListIcons(lib.games, lib.count, 4))
+            {
+                loaded = true;
+                StartupStep("loading (the dot bouncing)");
+
+                // Box art, in the library's order so the first screenful
+                // comes first - fetching while the mark forms.
+                RequestLibraryCovers(lib);
+            }
+        }
+
+        Sleep(16);
+    }
+    if (loader != NULL)
+        CloseHandle(loader); // it may still be reading the drive; load and fresh outlive it
+
+    // Read from the drive, so kept for next time at the first refresh.
+    if (load.fresh == NULL)
+        lib.cacheDirty = true;
+    if (!downloadsStarted)
+        dprintf("ERROR: the download worker didn't start - downloads are unavailable\n");
+    if (!searchStarted)
+        dprintf("ERROR: the search worker didn't start - searches are unavailable\n");
+    StartupStep("the mark forming and resting");
+
+    // The shell loop: read the controller, act on it, draw a frame.
+    //
+    // It starts on the library, with focus in the list, since that's where
+    // almost every visit is headed. B steps back a level everywhere - out of a
+    // picker to the library, out of a page to the sidebar - and only B on the
+    // sidebar leaves the app.
+    //
+    // Downloads run on the queue's worker thread, so the loop carries on
+    // while they do - it only reads their progress each frame. What still
+    // takes over the screen - a search, the keyboard, a message, a disc
+    // install - blocks inside this loop and draws its own frames. When it
+    // returns, the input is resynced so the button that ended it can't also
+    // act here, and everything it may have changed is refreshed before the
+    // next frame.
+    //
+    // The library is scanned once (and again only if Settings changes the
+    // folder) and the auth header is built once; both are held across the
+    // loop, so coming back from anything costs nothing.
+    // One small file read. The list is filtered against the library every
+    // frame, so an uninstall drops out without this being read again.
+    ReadRecents();
+
+    Shell &shell = g_shell;
+    shell.page = SHELL_PAGE_HOME;
+    shell.sidebarFocused = false;
+    shell.homeFocus = HOME_FOCUS_RECENTS;
+    shell.homeNavFocus = 0;
+    shell.homeSelected = 0;
+    shell.homeScroll = 0;
+    shell.librarySelected = 0;
+    shell.libraryScroll = -1;
+    shell.settings.focusRow = 0;
+    shell.settings.focusCol = 0;
+    shell.settings.scroll = 0.0f;
+    shell.picker.kind = PICKER_NONE;
+    shell.queueCount = 0;
+    shell.queueSelected = 0;
+    shell.queueSelectedId = 0;
+    shell.queueScroll = -1;
+    shell.queueRecentCount = 0;
+    shell.queueRecentFocus = 0;
+    shell.queueRecentScroll = 0;
+    shell.queueOnRecents = false;
+    shell.homebrewScroll = 0.0f;
+    shell.stale = true;
+
+    char authHeader[IAS3_AUTH_HEADER_MAX];
+    bool haveAuth = false;
+
+    FadeOutStartupScreen();
+
+    ResyncUiInput();
+
+    // For spotting stutter: a frame taking more than this is logged. Screens
+    // that wait on the user - a confirmation, the keyboard - show up here too,
+    // as one long frame; those can be ignored.
+    const DWORD slowFrameMs = 50;
+    DWORD lastFrame = 0;
+
+    for (;;)
+    {
+        const DWORD frameStart = GetTickCount();
+        if (lastFrame != 0 && frameStart - lastFrame > slowFrameMs)
+            dprintf("[timing] slow frame: %lu ms (page %d)\n", (unsigned long)(frameStart - lastFrame), (int)shell.page);
+        lastFrame = frameStart;
+        const double partStart = ImageTimerMs();
+
+        // Finished downloads first, since they can make the rest stale.
+        HandleFinishedDownloads(shell, haveAuth);
+        PollUpdateCheck(shell);
+
+        if (shell.rescanLibrary)
+        {
+            shell.rescanLibrary = false;
+            if (!StartLibraryRescan(gamesPath))
+            {
+                ScanLibrary(lib, gamesPath); // no thread for it: the old way
+                shell.stale = true;
+            }
+        }
+        PollLibraryRescan(shell, lib, gamesPath);
+        if (shell.rescanShelves)
+        {
+            shell.rescanShelves = false;
+            RescanShelves(lib);
+            if (shell.storeInHomebrew)
+                RefreshHomebrewPage(); // what's installed now
+            shell.stale = true;
+        }
+
+        // The drive, read behind the library kept from last time.
+        if (load.fresh != NULL && load.freshRead)
+        {
+            TakeFreshLibrary(shell, lib, fresh, gamesPath);
+            load.fresh = NULL;
+        }
+
+        // The apps, read after it: their covers too.
+        static bool shelfCoversAsked = false;
+        if (g_shelvesRead && !shelfCoversAsked)
+        {
+            shelfCoversAsked = true;
+            RequestLibraryCovers(lib);
+            shell.settingsStale = true; // their folders' counts
+
+        }
+
+        const double partDisc = ImageTimerMs();
+        UpdateDisc(shell, lib, gamesPath);
+
+        const double partRefresh = ImageTimerMs();
+        if (shell.stale)
+            RefreshShell(shell, lib, g_contentBase, gamesPath);
+        else if (shell.settingsStale)
+        {
+            BuildSettingsPage(shell.settings, lib, gamesPath);
+            shell.settingsStale = false;
+        }
+        const double partPumps = ImageTimerMs();
+
+        SnapshotQueue(shell, lib);
+        PollPickerSearch(shell.picker);
+        PumpCoverArt();
+        PumpStoreArt();
+        const double partRest = ImageTimerMs();
+
+        // The featured games - new ones once featured.json has come - and
+        // their wallpapers, the first time the Store is shown and again when
+        // they change.
+        const bool featuredChanged = RefreshFeatured();
+        if (featuredChanged)
+            KeepStoreFocusOnATile(shell);
+        if (shell.page == SHELL_PAGE_STORE && (!shell.storeArtRequested || featuredChanged))
+        {
+            RequestFeaturedArt();
+            shell.storeArtRequested = true;
+        }
+
+        // An empty Queue has nothing to focus, and no sidebar to hand focus
+        // to any more: it says so, and B goes Home like every other page.
+
+        // Nor is there anything on a page whose last folder Settings took
+        // away - it's gone from the sidebar.
+        // A shelf whose folders have just been cleared in Settings: back to
+        // Games, which is the one page of the group that is always there.
+        ShelfKind clearedShelf;
+        if (ShelfForPage(shell.page, &clearedShelf) && g_shelves[clearedShelf].pathCount == 0)
+            EnterPage(shell, SHELL_PAGE_LIBRARY, false);
+
+        PublishSidebar(shell, lib);
+
+        UiInput input = PollUiInput();
+        const WORD pressed = input.pressed;
+
+        bool acted = false; // something ran that took over the screen
+        bool exitRequested = false;
+        const unsigned long focusBefore = (pressed != 0 || input.nav != 0) ? FocusSignature(shell) : 0;
+
+        if (shell.page == SHELL_PAGE_HOME)
+        {
+            // Home's chrome is the nav row across the top rather than the
+            // sidebar, so the same back-stack every other page has - content,
+            // then chrome, then the Exit menu - runs up and down here instead
+            // of left and right.
+            const HomePageView home = MakeHomeView(shell, lib);
+            if (home.recentCount == 0)
+                shell.homeFocus = HOME_FOCUS_NAV; // nothing below to go to
+
+            if (shell.homeNavFocus > home.navCount - 1)
+                shell.homeNavFocus = home.navCount - 1;
+            if (shell.homeNavFocus < 0)
+                shell.homeNavFocus = 0;
+            if (shell.homeSelected > home.recentCount - 1)
+                shell.homeSelected = home.recentCount - 1;
+            if (shell.homeSelected < 0)
+                shell.homeSelected = 0;
+
+            if (shell.homeFocus == HOME_FOCUS_NAV)
+            {
+                if (input.nav == XINPUT_GAMEPAD_DPAD_LEFT && shell.homeNavFocus > 0)
+                    shell.homeNavFocus--;
+                else if (input.nav == XINPUT_GAMEPAD_DPAD_RIGHT && shell.homeNavFocus + 1 < home.navCount)
+                    shell.homeNavFocus++;
+                else if (input.nav == XINPUT_GAMEPAD_DPAD_DOWN && home.recentCount > 0)
+                    shell.homeFocus = HOME_FOCUS_RECENTS;
+                else if ((pressed & XINPUT_GAMEPAD_A) && home.navCount > 0)
+                {
+                    // Straight into the page's content. Only Games has a
+                    // sidebar now, and landing in it rather than on the
+                    // games would be a stop on the way to nowhere.
+                    EnterPage(shell, (ShellPage)home.nav[shell.homeNavFocus].page, false);
+                }
+                else if (pressed & XINPUT_GAMEPAD_B)
+                {
+                    // Home is the root, so B here is what B on the sidebar is
+                    // everywhere else.
+                    exitRequested = ExitMenu();
+                    acted = !exitRequested;
+                }
+            }
+            else
+            {
+                const int across = HomeRecentsAcross();
+
+                if (input.nav == XINPUT_GAMEPAD_DPAD_LEFT && shell.homeSelected > 0)
+                    shell.homeSelected--;
+                else if (input.nav == XINPUT_GAMEPAD_DPAD_RIGHT && shell.homeSelected + 1 < home.recentCount)
+                    shell.homeSelected++;
+                else if (input.nav == XINPUT_GAMEPAD_DPAD_UP)
+                    shell.homeFocus = HOME_FOCUS_NAV;
+                else if (pressed & XINPUT_GAMEPAD_B)
+                {
+                    // Home is the root, so B here leaves the app wherever
+                    // focus is on it - the dialog is what catches a slip.
+                    exitRequested = ExitMenu();
+                    acted = !exitRequested;
+                }
+                else if (pressed & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER))
+                {
+                    shell.homeSelected += (pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? across : -across;
+                    if (shell.homeSelected > home.recentCount - 1) shell.homeSelected = home.recentCount - 1;
+                    if (shell.homeSelected < 0) shell.homeSelected = 0;
+                }
+                else if (pressed & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_START))
+                {
+                    // START is the disc's install, as it is in the grid.
+                    acted = HomeTileAction(shell, lib, gamesPath, pressed, home.recents[shell.homeSelected]);
+                }
+            }
+        }
+        else if (shell.sidebarFocused)
+        {
+            if (input.nav == XINPUT_GAMEPAD_DPAD_UP)
+                shell.page = NextShownPage(shell.page, -1);
+            else if (input.nav == XINPUT_GAMEPAD_DPAD_DOWN)
+                shell.page = NextShownPage(shell.page, 1);
+            else if ((input.nav == XINPUT_GAMEPAD_DPAD_RIGHT || (pressed & XINPUT_GAMEPAD_A)) &&
+                     PageTakesFocus(shell, shell.page))
+                shell.sidebarFocused = false;
+            else if (pressed & XINPUT_GAMEPAD_B)
+                EnterPage(shell, SHELL_PAGE_HOME, false); // the root, as B is everywhere but Home
+        }
+        else if (shell.picker.kind != PICKER_NONE && shell.page == shell.picker.page)
+        {
+            Picker &picker = shell.picker;
+
+            if (picker.status == PICKER_READY)
+                StepSelection(input.nav, picker.count, picker.selected);
+
+            if (pressed & XINPUT_GAMEPAD_B)
+            {
+                // Backing out of a search that's still running just leaves its
+                // result uncollected.
+                picker.kind = PICKER_NONE;
+            }
+            else if ((pressed & XINPUT_GAMEPAD_A) && picker.status == PICKER_UNREACHABLE)
+            {
+                OpenPicker(picker, picker.kind, picker.gameName, picker.titleId, picker.page); // try again
+            }
+            else if ((pressed & XINPUT_GAMEPAD_A) && picker.status == PICKER_READY)
+            {
+                // The keys, the first time something is queued. Usually
+                // they're saved and this costs nothing; if they're not, it's
+                // the keyboard, which takes over the screen.
+                // If that took over the screen, resync once it's done.
+                const bool hadAuth = haveAuth;
+                const bool signedIn = EnsureAuthHeader(haveAuth, authHeader, sizeof(authHeader));
+                if (!hadAuth)
+                    acted = true;
+
+                // Queued, not downloaded: this returns at once and the picker
+                // stays open, so the next pack can be queued straight after.
+                // How it goes turns up on the Queue page and as a popup.
+                if (signedIn && picker.kind == PICKER_DLC)
+                {
+                    const DlcRarMatch &pack = picker.packs[picker.selected];
+                    ReportEnqueue(EnqueueDlcPack(pack, picker.gameName, picker.titleId, authHeader),
+                                  pack.filename);
+                }
+                else if (signedIn)
+                {
+                    const TitleUpdateMatch &update = picker.updates[picker.selected];
+                    ReportEnqueue(EnqueueTitleUpdate(update, picker.gameName, picker.titleId, authHeader),
+                                  update.filename);
+                }
+            }
+        }
+        else if (shell.page == SHELL_PAGE_LIBRARY && !shell.libraryInGame)
+        {
+            // Left from the first column goes to the sidebar, as B does.
+            // B leaves the page for Home, the root. Left from the first
+            // column goes to the sidebar, which is this page's own chrome.
+            const bool toHome = (pressed & XINPUT_GAMEPAD_B) != 0;
+            bool toSidebar = false;
+
+            // The disc's tile, when there is one, is item 0 and the games
+            // follow it.
+            const int discItems = shell.hasDisc ? 1 : 0;
+            const int itemCount = lib.count + discItems;
+            const bool onDisc = shell.hasDisc && shell.librarySelected == 0;
+
+            if (StepGrid(input, itemCount, LibraryPageVisibleRows(MakeLibraryView(shell, lib, gamesPath)),
+                         shell.librarySelected))
+                toSidebar = true;
+
+            if (toHome)
+            {
+                EnterPage(shell, SHELL_PAGE_HOME, false);
+            }
+            else if (toSidebar)
+            {
+                FocusSidebar(shell);
+            }
+            else if (onDisc && (pressed & (XINPUT_GAMEPAD_A | XINPUT_GAMEPAD_X | XINPUT_GAMEPAD_START)))
+            {
+                acted = DiscTileAction(shell, lib, gamesPath, pressed);
+            }
+            else if ((pressed & XINPUT_GAMEPAD_A) && lib.count > 0 && !onDisc)
+            {
+                // The library is what you have, so A plays it - as the
+                // dashboard and Aurora do.
+                PlayLibraryGame(lib.games[shell.librarySelected - discItems]);
+                acted = true;
+            }
+            else if ((pressed & XINPUT_GAMEPAD_X) && lib.count > 0 && !onDisc)
+            {
+                // Its page, with its DLC and title updates a button away - X,
+                // as on the disc's tile.
+                const InstalledGame &chosen = lib.games[shell.librarySelected - discItems];
+                dprintf("Selected: %s (Title ID %08lX)\n", chosen.displayName, chosen.titleId);
+                OpenLibraryGame(shell, lib, chosen);
+            }
+            else if (pressed & XINPUT_GAMEPAD_Y)
+            {
+                // A shortcut, for the keys banner and the empty library, which
+                // both send you to Settings with a Y badge.
+                shell.page = SHELL_PAGE_SETTINGS;
+            }
+        }
+        else if (shell.page == SHELL_PAGE_APPS || shell.page == SHELL_PAGE_HOMEBREW ||
+                 shell.page == SHELL_PAGE_EMULATORS)
+        {
+            ShelfKind kind = SHELF_APPS;
+            ShelfForPage(shell.page, &kind);
+            Shelf &shelf = g_shelves[kind];
+            const int count = g_shelvesRead ? shelf.count : 0;
+
+            if (pressed & XINPUT_GAMEPAD_B)
+            {
+                EnterPage(shell, SHELL_PAGE_HOME, false);
+            }
+            else if (StepGrid(input, count, LibraryPageVisibleRows(MakeShelfView(shell, kind)), shelf.selected))
+            {
+                FocusSidebar(shell);
+            }
+            else if ((pressed & XINPUT_GAMEPAD_A) && count > 0)
+            {
+                PlayApp(shelf.items[shelf.selected]);
+                acted = true;
+            }
+        }
+        else if (GamePageOpen(shell) && shell.storeVersionsOpen)
+        {
+            // The Versions panel: A chooses one, for Install; B or Y closes it.
+            if (pressed & (XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_Y))
+            {
+                shell.storeVersionsOpen = false;
+            }
+            else if (pressed & XINPUT_GAMEPAD_A)
+            {
+                shell.storeVersionChosen = shell.storeVersionFocus;
+                shell.storeVersionsOpen = false;
+            }
+            else if (input.nav == XINPUT_GAMEPAD_DPAD_UP && shell.storeVersionFocus > 0)
+            {
+                shell.storeVersionFocus--;
+            }
+            else if (input.nav == XINPUT_GAMEPAD_DPAD_DOWN && shell.storeVersionFocus + 1 < StoreVersionCount())
+            {
+                shell.storeVersionFocus++;
+            }
+        }
+        else if (GamePageOpen(shell))
+        {
+            const int f = shell.storeGameFocus;
+            if ((pressed & XINPUT_GAMEPAD_Y) && StoreVersionCount() > 1)
+            {
+                // The Versions panel, on the one Install installs.
+                shell.storeVersionsOpen = true;
+                shell.storeVersionFocus = shell.storeVersionChosen;
+            }
+            else if ((pressed & XINPUT_GAMEPAD_B) && shell.page == SHELL_PAGE_LIBRARY)
+            {
+                shell.libraryInGame = false; // back to the library's grid
+            }
+            else if (pressed & XINPUT_GAMEPAD_B)
+            {
+                // Back to the letter it was opened from, or the front page.
+                shell.storeInGame = false;
+                if (!shell.storeInLetter && !shell.storeInSection)
+                    RequestFeaturedArt();
+            }
+            else if (pressed & XINPUT_GAMEPAD_A)
+            {
+                float installFraction = 0.0f;
+                bool partial = false;
+                const StoreInstallState installState =
+                    StoreVersionState(lib, shell.storeVersionChosen, &installFraction, &partial);
+                if (f >= STORE_GAME_FOCUS_SIMILAR)
+                {
+                    // Copied out first: opening it fills the row afresh.
+                    if (f - STORE_GAME_FOCUS_SIMILAR < g_similarCount)
+                    {
+                        const StoreGame next = g_similarGames[f - STORE_GAME_FOCUS_SIMILAR];
+                        OpenStoreGame(shell, next);
+                    }
+                }
+                else if (f == STORE_GAME_FOCUS_BUTTONS && installState == STORE_INSTALL_AVAILABLE &&
+                         DiscInDriveFor(shell, g_storeGame.titleId))
+                {
+                    // Install from disc: the same install the disc's tile
+                    // starts, without going back to it.
+                    if (StartDiscInstall(shell, gamesPath))
+                        acted = true;
+                }
+                else if (f == STORE_GAME_FOCUS_BUTTONS && StoreVersionCount() > 0 && GamePagePlays(shell, lib))
+                {
+                    PlayLibraryGame(*LibraryGameByTitleId(lib, g_storeGame.titleId));
+                    acted = true;
+                }
+                else if (f == STORE_GAME_FOCUS_BUTTONS && StoreVersionCount() > 0 &&
+                         installState != STORE_INSTALL_AVAILABLE)
+                {
+                    // On its way or already there.
+                    ShowShellToast(installState == STORE_INSTALL_INSTALLED ? "Already installed" : "Already in the queue",
+                                   g_storeGame.name, UI_TOAST_INFO);
+                }
+                else if (f == STORE_GAME_FOCUS_BUTTONS && StoreVersionCount() > 0)
+                {
+                    // The keys, the first time - the keyboard, if they aren't saved.
+                    // A slow install's question takes over the screen, so
+                    // resync after it too.
+                    const bool hadAuth = haveAuth;
+                    if (EnsureAuthHeader(haveAuth, authHeader, sizeof(authHeader)) &&
+                        InstallStoreVersion(shell, lib, authHeader))
+                        acted = true;
+                    if (!hadAuth)
+                        acted = true;
+                }
+                else if ((f == STORE_GAME_FOCUS_BUTTONS + 1 || f == STORE_GAME_FOCUS_BUTTONS + 2) && !StoreGameIsIndie() &&
+                         !StoreGameIsXbox())
+                {
+                    // The library's pickers, open over this page.
+                    OpenPicker(shell.picker, f == STORE_GAME_FOCUS_BUTTONS + 1 ? PICKER_DLC : PICKER_TITLE_UPDATE,
+                               g_storeGame.name, g_storeGame.titleId, shell.page);
+                }
+                else if (f == STORE_GAME_FOCUS_BUTTONS + 3 && CanUninstallStoreVersion(lib, shell))
+                {
+                    // The confirmation takes over the screen, so resync after.
+                    const bool removed = UninstallStoreVersion(shell, lib, gamesPath);
+                    acted = true;
+                    shell.storeGameFocus = STORE_GAME_FOCUS_BUTTONS;
+
+                    // A game the Store hasn't got has no page once it's gone.
+                    if (removed && shell.page == SHELL_PAGE_LIBRARY && StoreVersionCount() == 0)
+                        shell.libraryInGame = false;
+                }
+            }
+            else if (input.nav != 0)
+            {
+                StepStoreGame(input.nav, shell, lib);
+            }
+        }
+        else if (shell.page == SHELL_PAGE_STORE && shell.storeInHomebrew)
+        {
+            int &row = shell.homebrewRow;
+            int &place = shell.homebrewPlace;
+            const int across = StoreRowTilesAcross();
+            if (pressed & XINPUT_GAMEPAD_B)
+            {
+                shell.storeInHomebrew = false; // back to the front page, on its button
+            }
+            else if (input.nav == XINPUT_GAMEPAD_DPAD_LEFT && place == 0)
+            {
+                FocusSidebar(shell);
+            }
+            else if ((pressed & XINPUT_GAMEPAD_A) && HomebrewRowCount(row) > 0)
+            {
+                ShowHomebrewItem(shell, HomebrewItemAt(row, place));
+                RefreshHomebrewPage(); // its folder may be new
+                acted = true;
+            }
+            else if (input.nav == XINPUT_GAMEPAD_DPAD_LEFT)
+            {
+                place--;
+            }
+            else if (input.nav == XINPUT_GAMEPAD_DPAD_RIGHT && place + 1 < HomebrewRowCount(row))
+            {
+                place++;
+            }
+            else if (input.nav == XINPUT_GAMEPAD_DPAD_UP || input.nav == XINPUT_GAMEPAD_DPAD_DOWN)
+            {
+                // The next row with something in it, on the tile in the same
+                // place on screen - or its last, if it's shorter.
+                const int step = (input.nav == XINPUT_GAMEPAD_DPAD_UP) ? -1 : 1;
+                for (int next = row + step; next >= 0 && next < HOMEBREW_KIND_COUNT; next += step)
+                {
+                    if (HomebrewRowCount(next) == 0)
+                        continue;
+                    const int column = place - shell.homebrewRowScroll[row];
+                    place = shell.homebrewRowScroll[next] + column;
+                    if (place > HomebrewRowCount(next) - 1)
+                        place = HomebrewRowCount(next) - 1;
+                    row = next;
+                    break;
+                }
+            }
+            else if (pressed & (XINPUT_GAMEPAD_LEFT_SHOULDER | XINPUT_GAMEPAD_RIGHT_SHOULDER))
+            {
+                // A screenful along the row.
+                place += (pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) ? across : -across;
+                if (place > HomebrewRowCount(row) - 1)
+                    place = HomebrewRowCount(row) - 1;
+                if (place < 0)
+                    place = 0;
+            }
+        }
+        else if (shell.page == SHELL_PAGE_STORE && shell.storeInLetter && shell.storeFilterOpen)
+        {
+            if (pressed & (XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_Y))
+            {
+                shell.storeFilterOpen = false;
+                if (shell.storeFilterChanged)
+                    SaveFilter();
+                shell.storeFilterChanged = false;
+            }
+            else if (StepFilterPanel(input, shell))
+            {
+                shell.storeFilterChanged = true;
+                RefilterLetter(shell);
+            }
+        }
+        else if (shell.page == SHELL_PAGE_STORE && shell.storeInLetter)
+        {
+            if (pressed & XINPUT_GAMEPAD_B)
+            {
+                // Back to the page it was opened from, on the same letter.
+                shell.storeInLetter = false;
+                if (!shell.storeInSection)
+                    RequestFeaturedArt();
+            }
+            else if ((pressed & XINPUT_GAMEPAD_Y) && shell.storeSearch)
+            {
+                acted = OpenStoreSearch(shell);
+            }
+            else if ((pressed & XINPUT_GAMEPAD_Y) && LetterFilterable(shell))
+            {
+                shell.storeFilterOpen = true;
+                if (FilterRowDisabled(shell, shell.storeFilterFocus))
+                    shell.storeFilterFocus = FILTER_ROW_REGIONS;
+            }
+            else if ((pressed & XINPUT_GAMEPAD_X) && LetterFiltersEmptied(shell))
+            {
+                // Reset, as the panel's button.
+                memset(&g_filter, 0, sizeof(g_filter));
+                SaveFilter();
+                RefilterLetter(shell);
+            }
+            else if ((pressed & XINPUT_GAMEPAD_A) && shell.storeGameCount > 0)
+            {
+                if (shell.storeSearch)
+                {
+                    // Only a search's results are in g_searchHits - All games has more.
+                    const StoreHit &hit = g_searchHits[shell.storeSelected];
+                    if (hit.game != NULL)
+                        OpenStoreGame(shell, *hit.game);
+                    else
+                        OpenArcadeGame(shell, *hit.arcade);
+                }
+                else if (shell.storeLetterArcade)
+                    OpenArcadeGame(shell, *g_arcadeGames[shell.storeSelected]);
+                else
+                    OpenStoreGame(shell, g_storeGames[shell.storeSelected]);
+            }
+            else
+                StepStoreLetter(input, shell);
+        }
+        else if (shell.page == SHELL_PAGE_STORE && shell.storeInSection)
+        {
+            const int set = shell.storeSection;
+            const int focusBefore = shell.sectionFocus[set];
+            if (pressed & XINPUT_GAMEPAD_B)
+            {
+                shell.storeInSection = false; // back to the front page, on its button
+                RequestFeaturedArt();
+            }
+            else if (pressed & XINPUT_GAMEPAD_A)
+            {
+                const int l = shell.sectionFocus[set];
+                if (g_sectionLetterCounts[set][l] > 0)
+                    OpenStoreLetter(shell, kStoreLetters[l], set);
+                else
+                    ShowShellToast("No games here", "Nothing in the collection starts with that.", UI_TOAST_INFO);
+            }
+            else if (input.nav != 0)
+                StepSectionFocus(input.nav, shell);
+
+            if (shell.storeInSection && !shell.storeInLetter && shell.sectionFocus[set] != focusBefore)
+                PrefetchLetterCovers(kStoreLetters[shell.sectionFocus[set]], set);
+        }
+        else if (shell.page == SHELL_PAGE_STORE)
+        {
+            const int focusBefore = shell.storeFocus;
+            if (pressed & XINPUT_GAMEPAD_B)
+                EnterPage(shell, SHELL_PAGE_HOME, false);
+            else if (pressed & XINPUT_GAMEPAD_Y)
+                acted = OpenStoreSearch(shell); // from anywhere on the page
+            else if (pressed & XINPUT_GAMEPAD_X)
+            {
+                OpenFoundryUI(gamesPath, g_contentBase);
+                acted = true;
+            }
+            else if (pressed & XINPUT_GAMEPAD_A)
+                acted = ActOnStoreFocus(shell);
+            else if (input.nav != 0)
+                StepStoreFocus(input.nav, shell);
+
+            if (!shell.storeInLetter && shell.storeFocus != focusBefore && shell.storeFocus >= STORE_FOCUS_LETTERS &&
+                shell.storeFocus < STORE_FOCUS_COLLECTIONS)
+                PrefetchLetterCovers(kStoreLetters[shell.storeFocus - STORE_FOCUS_LETTERS], -1);
+        }
+        else if (shell.page == SHELL_PAGE_QUEUE)
+        {
+            // Up off the first card steps into the row of installs above it;
+            // down out of the row comes back to it. Left there walks the row
+            // before it reaches the sidebar, the way a row of tiles should.
+            if (shell.queueOnRecents)
+            {
+                if (input.nav == XINPUT_GAMEPAD_DPAD_DOWN && shell.queueCount > 0)
+                {
+                    shell.queueOnRecents = false;
+                    shell.queueSelected = 0;
+                    shell.queueSelectedId = shell.queueJobs[shell.queueSelected].id;
+                }
+                else if (input.nav == XINPUT_GAMEPAD_DPAD_LEFT)
+                {
+                    if (shell.queueRecentFocus > 0)
+                        shell.queueRecentFocus--;
+                    else
+                        FocusSidebar(shell); // the row's start, so out to the chrome
+                }
+                else if (input.nav == XINPUT_GAMEPAD_DPAD_RIGHT &&
+                         shell.queueRecentFocus < shell.queueRecentCount - 1)
+                    shell.queueRecentFocus++;
+            }
+            else
+            {
+                const int was = shell.queueSelected;
+                StepSelection(input.nav, shell.queueCount, shell.queueSelected);
+                if (input.nav == XINPUT_GAMEPAD_DPAD_UP && shell.queueSelected == was &&
+                    shell.queueRecentCount > 0)
+                    shell.queueOnRecents = true;
+                if (shell.queueCount > 0)
+                    shell.queueSelectedId = shell.queueJobs[shell.queueSelected].id;
+            }
+
+            if (pressed & XINPUT_GAMEPAD_B)
+            {
+                EnterPage(shell, SHELL_PAGE_HOME, false);
+            }
+            else if (input.nav == XINPUT_GAMEPAD_DPAD_LEFT && !shell.queueOnRecents)
+            {
+                FocusSidebar(shell);
+            }
+            else if ((pressed & XINPUT_GAMEPAD_X) && shell.queueOnRecents && shell.queueRecentCount > 0)
+            {
+                // The same removal a finished card's X did: the tile is the
+                // job, so clearing one clears the other.
+                const int id = shell.queueRecents[shell.queueRecentFocus].id;
+                if (IsFoundryJobId(id))
+                    RemoveFoundryJob(id);
+                else if (IsGameJobId(id))
+                    RemoveGameJob(id);
+                else if (IsDiscJobId(id))
+                    RemoveDiscJob(id);
+                else
+                    RemoveQueueJob(id);
+            }
+            else if ((pressed & XINPUT_GAMEPAD_X) && !shell.queueOnRecents && shell.queueCount > 0)
+            {
+                const QueueJobSnapshot &job = shell.queueJobs[shell.queueSelected];
+
+                if (job.state == QUEUE_FINISHED)
+                {
+                    if (IsFoundryJobId(job.id))
+                        RemoveFoundryJob(job.id);
+                    else if (IsGameJobId(job.id))
+                        RemoveGameJob(job.id);
+                    else if (IsDiscJobId(job.id))
+                        RemoveDiscJob(job.id);
+                    else
+                        RemoveQueueJob(job.id);
+                }
+                else if (IsFoundryJobId(job.id))
+                {
+                    CancelFoundryJob(job.id);
+                    acted = true;
+                }
+                else if (IsGameJobId(job.id))
+                {
+                    if (ShowConfirmUI("Stop installing?", job.gameName,
+                                      "The game won't be installed. What has been downloaded is removed.",
+                                      "Stop"))
+                        CancelGameJob(job.id);
+                    acted = true;
+                }
+                else if (IsDiscJobId(job.id))
+                {
+                    if (ShowConfirmUI("Stop installing?", job.gameName,
+                                      "The game won't be installed. What has been copied so far is removed.",
+                                      "Stop"))
+                        CancelDiscJob(job.id);
+                    acted = true;
+                }
+                else
+                {
+                    // Asked, like stopping a disc install: a big pack can be
+                    // most of the way there. The download carries on while the
+                    // question is up - it's on its own thread now.
+                    if (ShowConfirmUI("Stop downloading?", job.title,
+                                      job.kind == QUEUE_JOB_DLC_PACK ? "Files that already finished stay installed."
+                                                                     : "The update won't be installed.",
+                                      "Stop"))
+                        CancelQueueJob(job.id);
+                    acted = true;
+                }
+            }
+        }
+        else if (shell.page == SHELL_PAGE_SETTINGS)
+        {
+            SettingsPage &settings = shell.settings;
+            const SettingsRowView *row = settings.count > 0 ? &settings.rows[settings.focusRow] : NULL;
+            const SettingsControlView *control =
+                (row != NULL && settings.focusCol < row->controlCount) ? &row->controls[settings.focusCol] : NULL;
+            const bool onValue = (control != NULL && control->kind == SETTINGS_CONTROL_VALUE);
+
+            if (pressed & XINPUT_GAMEPAD_B)
+            {
+                EnterPage(shell, SHELL_PAGE_HOME, false);
+            }
+            else if (row == NULL)
+            {
+                FocusSidebar(shell);
+            }
+            else if (input.nav == XINPUT_GAMEPAD_DPAD_UP || input.nav == XINPUT_GAMEPAD_DPAD_DOWN)
+            {
+                StepSettingsRow(settings, input.nav == XINPUT_GAMEPAD_DPAD_UP ? -1 : 1);
+            }
+            else if (input.nav == XINPUT_GAMEPAD_DPAD_LEFT || input.nav == XINPUT_GAMEPAD_DPAD_RIGHT)
+            {
+                // A value changes in place; otherwise along the row, and off
+                // its left end to the sidebar.
+                const bool right = (input.nav == XINPUT_GAMEPAD_DPAD_RIGHT);
+                if (onValue && row->kind == SETTINGS_VIEW_FOLDER)
+                {
+                    // What the folder holds. Moving a scanned one rescans,
+                    // which takes over the screen.
+                    const LibraryFolderRow folder = g_folderRows[settings.args[settings.focusRow]];
+                    const int next = (int)folder.kind + (right ? 1 : -1);
+                    if (next >= 0 && next < FOLDER_KIND_COUNT)
+                    {
+                        PlayUiSound(UI_SOUND_MOVE);
+                        SettingsOutcome changed = {false, false};
+                        StepFolderKind(settings.args[settings.focusRow], right ? 1 : -1, lib, gamesPath, changed);
+                        if (changed.libraryChanged)
+                        {
+                            shell.librarySelected = 0;
+                            shell.libraryScroll = -1;
+                        }
+                        if (folder.scanned)
+                            acted = true;
+                        else
+                            shell.settingsStale = true;
+                    }
+                }
+                else if (onValue)
+                {
+                    StepDiscSpeed(right ? 1 : -1);
+                    shell.stale = true;
+                }
+                else if (right && row->kind != SETTINGS_VIEW_FOLDER && settings.focusCol + 1 < row->controlCount)
+                    settings.focusCol++;
+                else if (!right && settings.focusCol > 0 && row->kind != SETTINGS_VIEW_FOLDER)
+                    settings.focusCol--;
+                else if (!right)
+                    FocusSidebar(shell);
+            }
+            else if ((pressed & XINPUT_GAMEPAD_A) &&
+                     settings.actions[settings.focusRow][row->kind == SETTINGS_VIEW_FOLDER ? 0 : settings.focusCol] !=
+                         SETTINGS_ROW_NONE)
+            {
+                const int col = (row->kind == SETTINGS_VIEW_FOLDER) ? 0 : settings.focusCol;
+                // A tick in place takes over the screen only to rescan, so it
+                // sounds here; anything that opens something has its own.
+                if (row->kind == SETTINGS_VIEW_FOLDER || (control != NULL && control->kind == SETTINGS_CONTROL_CHECK))
+                    PlayUiSound(UI_SOUND_SELECT);
+                SettingsOutcome changed = RunSettingsRow(settings.actions[settings.focusRow][col],
+                                                         settings.args[settings.focusRow], lib, gamesPath,
+                                                         sizeof(gamesPath));
+
+                // A different library makes the old row number meaningless.
+                if (changed.libraryChanged)
+                {
+                    shell.librarySelected = 0;
+                    shell.libraryScroll = -1;
+                }
+
+                // The cached header was built from the old keys - or from
+                // keys that no longer exist.
+                if (changed.keysChanged)
+                    haveAuth = false;
+
+                acted = true;
+            }
+        }
+        else
+        {
+            // Nothing should land here. Leave for Home rather than leave the
+            // pad doing nothing.
+            if (pressed & XINPUT_GAMEPAD_B)
+                EnterPage(shell, SHELL_PAGE_HOME, false);
+        }
+
+        if (exitRequested)
+        {
+            dprintf("Exiting\n");
+            break;
+        }
+
+        // Genre, rating and Hide installed last only while the Store's open.
+        // A letter left open behind is shown again without them.
+        if (shell.page != SHELL_PAGE_STORE)
+        {
+            if (shell.storeFilterOpen)
+            {
+                shell.storeFilterOpen = false;
+                if (shell.storeFilterChanged)
+                    SaveFilter();
+                shell.storeFilterChanged = false;
+            }
+            if (ClearSessionFilters() && shell.storeInLetter && LetterFilterable(shell))
+                RefilterLetter(shell);
+        }
+
+        // A sound for a press that changed something - none when a dialog
+        // or the keyboard took over, as those have their own.
+        if (!acted && (pressed != 0 || input.nav != 0) && FocusSignature(shell) != focusBefore)
+        {
+            if (pressed & XINPUT_GAMEPAD_A)
+                PlayUiSound(UI_SOUND_SELECT);
+            else if (pressed & XINPUT_GAMEPAD_B)
+                PlayUiSound(UI_SOUND_BACK);
+            else
+                PlayUiSound(UI_SOUND_MOVE);
+        }
+
+        if (acted)
+        {
+            ResyncUiInput();
+            shell.stale = true;
+            continue; // refresh first, then draw
+        }
+
+        // --- Draw ---
+        UiHint hints[8];
+        int hintCount = 0;
+
+        if (shell.sidebarFocused)
+        {
+            if (PageTakesFocus(shell, shell.page))
+                hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Select");
+            hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Home");
+        }
+
+        switch (shell.page)
+        {
+        case SHELL_PAGE_HOME:
+        {
+            HomePageView view = MakeHomeView(shell, lib);
+
+            if (shell.homeFocus == HOME_FOCUS_NAV)
+            {
+                if (view.navCount > 0)
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Open");
+                hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Exit");
+            }
+            else
+            {
+                // On the disc's tile the buttons say what its state allows,
+                // the same as they do on the grid.
+                const bool onDisc = view.recentCount > 0 && view.recents[view.recentFocus].disc;
+                if (onDisc)
+                {
+                    switch (DiscTileState(shell))
+                    {
+                    case DISC_TILE_READY:
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Play");
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_X, L"View game", L"View");
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_START, L"Install to hard drive", L"Install");
+                        break;
+                    case DISC_TILE_INSTALLED:
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Play");
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_X, L"View game", L"View");
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_START, L"Install again", L"Reinstall");
+                        break;
+                    case DISC_TILE_INSTALLING:
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"View in the Queue", L"Queue");
+                        break;
+                    case DISC_TILE_UNREADABLE:
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Why?");
+                        break;
+                    default:
+                        break;
+                    }
+                }
+                else if (view.recentCount > 0)
+                {
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Play");
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_X, L"View game", L"View");
+                }
+                hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Exit");
+                if (view.recentCount > HomeRecentsAcross())
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_LBRB, L"Page");
+            }
+
+            RenderHomeFrame(view, hints, hintCount);
+            shell.homeScroll = view.recentScroll;
+            break;
+        }
+
+        case SHELL_PAGE_LIBRARY:
+            if (shell.picker.kind != PICKER_NONE && shell.picker.page == SHELL_PAGE_LIBRARY)
+            {
+                RenderPickerFrame(shell, hints, hintCount);
+            }
+            else if (shell.libraryInGame)
+            {
+                RenderGamePageFrame(shell, lib, hints, hintCount);
+            }
+            else
+            {
+                LibraryPageView view = MakeLibraryView(shell, lib, gamesPath);
+
+                if (!shell.sidebarFocused)
+                {
+                    // The console's own A, X, B order. On the disc's tile they
+                    // say what the disc's state allows.
+                    const int itemCount = lib.count + (shell.hasDisc ? 1 : 0);
+                    const bool onDisc = shell.hasDisc && shell.librarySelected == 0;
+
+                    if (onDisc)
+                    {
+                        switch (view.discTile)
+                        {
+                        case DISC_TILE_READY:
+                            hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Play");
+                            hintCount = AddHint(hints, hintCount, UI_BUTTON_X, L"View game", L"View");
+                            hintCount = AddHint(hints, hintCount, UI_BUTTON_START, L"Install to hard drive", L"Install");
+                            break;
+                        case DISC_TILE_INSTALLED:
+                            hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Play");
+                            hintCount = AddHint(hints, hintCount, UI_BUTTON_X, L"View game", L"View");
+                            hintCount = AddHint(hints, hintCount, UI_BUTTON_START, L"Install again", L"Reinstall");
+                            break;
+                        case DISC_TILE_INSTALLING:
+                            hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"View in the Queue", L"Queue");
+                            break;
+                        case DISC_TILE_UNREADABLE:
+                            hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Why?");
+                            break;
+                        default:
+                            break;
+                        }
+                    }
+                    else if (lib.count > 0)
+                    {
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Play");
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_X, L"View game", L"View");
+                    }
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Home");
+                    if (itemCount > LibraryPageVisibleRows(view) * LibraryGridColumns())
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_LBRB, L"Page");
+                }
+
+                RenderLibraryFrame(view, hints, hintCount);
+
+                shell.librarySelected = view.selected;
+                shell.libraryScroll = view.scroll;
+            }
+            break;
+
+        case SHELL_PAGE_APPS:
+        case SHELL_PAGE_HOMEBREW:
+        case SHELL_PAGE_EMULATORS:
+        {
+            ShelfKind kind = SHELF_APPS;
+            ShelfForPage(shell.page, &kind);
+            Shelf &shelf = g_shelves[kind];
+            LibraryPageView view = MakeShelfView(shell, kind);
+
+            if (!shell.sidebarFocused)
+            {
+                if (view.count > 0)
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Start");
+                hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Home");
+                if (view.count > LibraryPageVisibleRows(view) * LibraryGridColumns())
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_LBRB, L"Page");
+            }
+
+            RenderLibraryFrame(view, hints, hintCount);
+
+            shelf.selected = view.selected;
+            shelf.scroll = view.scroll;
+            break;
+        }
+
+        case SHELL_PAGE_STORE:
+            if (shell.picker.kind != PICKER_NONE && shell.picker.page == SHELL_PAGE_STORE)
+            {
+                RenderPickerFrame(shell, hints, hintCount);
+            }
+            else if (shell.storeInGame)
+            {
+                RenderGamePageFrame(shell, lib, hints, hintCount);
+            }
+            else if (shell.storeInHomebrew)
+            {
+                if (!shell.sidebarFocused)
+                {
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"View");
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Store");
+                    if (HomebrewRowCount(shell.homebrewRow) > StoreRowTilesAcross())
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_LBRB, L"Page");
+                }
+
+                StoreRowsView view = MakeHomebrewView(shell);
+                RenderStoreRowsFrame(view, hints, hintCount);
+                shell.homebrewRow = view.focusRow;
+                shell.homebrewPlace = view.focusPlace;
+                shell.homebrewScroll = view.scroll;
+                for (int k = 0; k < HOMEBREW_KIND_COUNT; ++k)
+                    shell.homebrewRowScroll[k] = view.rows[k].scroll;
+            }
+            else if (shell.storeInLetter)
+            {
+                if (shell.storeFilterOpen)
+                {
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Select");
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Done");
+                }
+                else if (!shell.sidebarFocused)
+                {
+                    if (shell.storeGameCount > 0)
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"View game", L"View");
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Store");
+                    if (shell.storeSearch)
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_Y, L"Search again", L"Search");
+                    else if (LetterFilterable(shell))
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_Y, L"Filter and sort", L"Filter");
+                    if (LetterFiltersEmptied(shell))
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_X, L"Reset filters", L"Reset");
+                    if (shell.storeGameCount > StoreLetterVisibleRows() * StoreGridColumns())
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_LBRB, L"Page");
+                    if (LetterJumps(shell))
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_LTRT, L"Letter");
+                }
+
+                StoreLetterView view = MakeStoreLetterView(shell);
+                RenderStoreLetterFrame(view, hints, hintCount);
+                shell.storeSelected = view.selected;
+                shell.storeLetterScroll = view.scroll;
+            }
+            else if (shell.storeInSection)
+            {
+                const int l = shell.sectionFocus[shell.storeSection];
+                if (!shell.sidebarFocused)
+                {
+                    static WCHAR browse[32];
+                    if (g_sectionLetterCounts[shell.storeSection][l] > 0)
+                    {
+                        BrowseHint(browse, 32, kStoreLetters[l]);
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_A, browse, L"Browse");
+                    }
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Store");
+                }
+
+                StoreSectionView view = MakeSectionView(shell);
+                RenderStoreSectionFrame(view, hints, hintCount);
+                shell.sectionFocus[shell.storeSection] = view.focus;
+            }
+            else
+            {
+                if (!shell.sidebarFocused)
+                {
+                    // What A does where the focus is - nothing, on a button
+                    // that isn't ready.
+                    static WCHAR browse[32];
+                    const int i = shell.storeFocus;
+                    if (i < STORE_FOCUS_BUTTONS)
+                    {
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"View game", L"View");
+                    }
+                    else if (i < STORE_FOCUS_LETTERS)
+                    {
+                        if (!kStoreButtons[i - STORE_FOCUS_BUTTONS].disabled)
+                            hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Browse", L"Browse");
+                    }
+                    else if (i < STORE_FOCUS_COLLECTIONS)
+                    {
+                        BrowseHint(browse, 32, kStoreLetters[i - STORE_FOCUS_LETTERS]);
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_A, browse, L"Browse");
+                    }
+                    else if (i < STORE_FOCUS_ROWS)
+                    {
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"View collection", L"View");
+                    }
+                    else
+                    {
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"View game", L"View");
+                    }
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Home");
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_Y, L"Search");
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_X, L"Foundry");
+                }
+
+                StorePageView view = MakeStoreView(shell);
+                RenderStoreFrame(view, hints, hintCount);
+                shell.storeFocus = view.focus;
+                shell.storeScroll = view.scroll;
+                for (int r = 0; r < view.rowCount; ++r)
+                    shell.storeRowScroll[r] = view.rows[r].scroll;
+                shell.storeCollectionScroll = view.collectionScroll;
+            }
+            break;
+
+        case SHELL_PAGE_QUEUE:
+            if (shell.queueCount == 0 && shell.queueRecentCount == 0)
+            {
+                RenderPlaceholderFrame("Queue", "Nothing is downloading",
+                                       "DLC and title updates you choose will wait here while they download.",
+                                       hints, hintCount);
+            }
+            else
+            {
+                if (!shell.sidebarFocused)
+                {
+                    if (shell.queueOnRecents)
+                    {
+                        hintCount = AddHint(hints, hintCount, UI_BUTTON_X, L"Remove");
+                    }
+                    else
+                    {
+                        bool finished = (shell.queueJobs[shell.queueSelected].state == QUEUE_FINISHED);
+                        hintCount = finished ? AddHint(hints, hintCount, UI_BUTTON_X, L"Remove")
+                                             : AddHint(hints, hintCount, UI_BUTTON_X, L"Stop download", L"Stop");
+                    }
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Home");
+                }
+
+                QueuePageView view;
+                view.games = lib.games;
+                view.gameCount = lib.count;
+                view.rows = shell.queueRows;
+                view.count = shell.queueCount;
+                view.selected = shell.queueSelected;
+                view.scroll = shell.queueScroll;
+                view.focused = !shell.sidebarFocused;
+                view.recents = shell.queueRecentRows;
+                view.recentCount = shell.queueRecentCount;
+                view.recentFocus = shell.queueRecentFocus;
+                view.recentScroll = shell.queueRecentScroll;
+                view.recentFocused = shell.queueOnRecents && !shell.sidebarFocused;
+
+                RenderQueueFrame(view, hints, hintCount);
+
+                shell.queueSelected = view.selected;
+                shell.queueScroll = view.scroll;
+                shell.queueRecentFocus = view.recentFocus;
+                shell.queueRecentScroll = view.recentScroll;
+            }
+            break;
+
+        case SHELL_PAGE_SETTINGS:
+        {
+            SettingsPage &settings = shell.settings;
+            if (!shell.sidebarFocused && settings.count > 0)
+            {
+                const SettingsRowView &row = settings.rows[settings.focusRow];
+                const int col = (row.kind == SETTINGS_VIEW_FOLDER) ? 0 : settings.focusCol;
+                const SettingsRow action = settings.actions[settings.focusRow][col];
+                const SettingsControlView *control = col < row.controlCount ? &row.controls[col] : NULL;
+                if (action == SETTINGS_ROW_LIBRARY_FOLDER)
+                {
+                    const LibraryFolderRow &folder = g_folderRows[settings.args[settings.focusRow]];
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_A,
+                                        !folder.scanned ? L"Scan" : (folder.suggested && folder.exists) ? L"Stop scanning"
+                                                                                                       : L"Remove");
+                }
+                else if (control != NULL && control->kind == SETTINGS_CONTROL_CHECK)
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_A, control->on ? L"Turn off" : L"Turn on");
+                else if (action != SETTINGS_ROW_NONE)
+                    hintCount = AddHint(hints, hintCount, UI_BUTTON_A, L"Select");
+                hintCount = AddHint(hints, hintCount, UI_BUTTON_B, L"Home");
+            }
+
+            SettingsPageView view;
+            view.rows = settings.rows;
+            view.count = settings.count;
+            view.focusRow = settings.focusRow;
+            view.focusCol = settings.focusCol;
+            view.scroll = settings.scroll;
+            view.focused = !shell.sidebarFocused;
+
+            RenderSettingsFrame(view, hints, hintCount);
+            settings.scroll = view.scroll;
+            break;
+        }
+
+        default:
+            break;
+        }
+
+        static bool firstFrameLogged = false;
+        if (!firstFrameLogged)
+        {
+            StartupStep("first library frame");
+            firstFrameLogged = true;
+        }
+
+        // Which part of a slow frame took the time. Screens that wait on the
+        // user land in "input + draw".
+        const double partEnd = ImageTimerMs();
+        if (partEnd - partStart > slowFrameMs)
+            dprintf("[timing] frame parts: downloads/update/rescan %.1f, disc %.1f, refresh %.1f, art pumps %.1f, input + draw %.1f ms\n",
+                    partDisc - partStart, partRefresh - partDisc, partPumps - partRefresh, partRest - partPumps, partEnd - partRest);
+
+        // Device is created with D3DPRESENT_INTERVAL_IMMEDIATE (no vsync), so
+        // pace the loop by hand instead of hammering Present() as fast as the
+        // CPU can spin. Not a real vsync wait - just ~60fps.
+        Sleep(16);
+    }
+
+    // Stop the worker before anything it uses goes away. A transfer stops at
+    // its next progress report; a request already waiting on archive.org
+    // can't be interrupted, so this is bounded rather than waited out.
+    if (PendingDownloadCount() + PendingDiscJobCount() + PendingGameJobCount() > 0)
+        RenderStatusFrame("Stopping", "Stopping downloads and installs", "Files that already finished stay installed.");
+    StopDownloadQueue(15000);
+
+    // An install stops at its next 816KB and removes what it copied.
+    StopDiscWorker(15000);
+
+    // A game install's connections stop at their next progress report, and
+    // the converter at its next 816KB; the staging folder goes next launch
+    // if it can't be removed now.
+    StopFoundry(20000);
+    StopGameInstaller(20000);
+
+    // A search still out would only be thrown away - a short wait is plenty.
+    StopSearchWorker(3000);
+
+    // Likewise a cover download: it's fetched again next time.
+    StopCoverArt(3000);
+    StopStoreArt(3000);
+
+    free(lib.games);
+
+    dprintf("Done.\n");
+
+    ShutdownGameListUI();
+
+    return EXIT_SUCCESS;
+}

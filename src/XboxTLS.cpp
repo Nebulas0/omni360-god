@@ -1,0 +1,840 @@
+﻿/*
+ ============================================================================
+  XboxTLS - Lightweight TLS 1.2 Client for Xbox 360 using BearSSL
+ ============================================================================
+ 
+  Overview:
+  ---------
+  XboxTLS is a self-contained TLS 1.2 client implementation designed to work
+  on retail or dev Xbox 360 consoles. It is built on top of BearSSL's minimal
+  X.509 and SSL/TLS stack, providing secure HTTPS communication with support 
+  for both RSA and EC (Elliptic Curve) trust anchors.
+
+  The core features include:
+    - Secure TLS 1.2 client using BearSSL
+    - Minimal memory footprint, tuned for Xbox 360 constraints
+    - Support for SHA-256, SHA-384, SHA-512, SHA-1, and SHA-224 hashes
+    - X.509 certificate verification (minimal mode)
+    - RSA and EC (P-256, P-384, etc.) trust anchor support
+    - Works with real-world CA roots like ISRG Root X1, GTS Root R4, etc.
+
+  Design Notes:
+  -------------
+  - This library is tailored for use in Xbox 360 homebrew apps and mod tools.
+  - All entropy comes from XeCryptRandom (HMAC-DRBG from BearSSL).
+  - Socket I/O is handled via Winsock 1.1 and raw `SOCKET` APIs.
+  - Uses br_x509_minimal_context for certificate validation, not full path building.
+
+  How to Use:
+  -----------
+    1. Call XboxTLS_CreateContext to initialize a TLS context.
+    2. Add one or more trust anchors using XboxTLS_AddTrustAnchor_RSA or EC.
+    3. Resolve the hostname and connect with XboxTLS_Connect.
+    4. Use XboxTLS_Write / XboxTLS_Read to send/receive data.
+    5. Call XboxTLS_Free to release memory and close the connection.
+	Bonus: See ExampleClient.cpp for demonstration.
+  License:
+  --------
+  MIT License (see LICENSE file)
+
+  Dependencies:
+  -------------
+  - BearSSL (https://bearssl.org/)
+  - XDK headers/libraries (e.g., xtl.h, winsockx.h)
+  - Xbox 360-compatible compiler (Visual Studio 2010, Xenon SDK)
+*/
+#include "inc\bearssl.h"
+#include <string.h>
+#include <xtl.h>
+#include <xboxmath.h>
+#include <stdio.h>
+#include <winsockx.h>
+#include <winnt.h>
+#include <xbox.h>
+#include "Debug.h"
+#include <xtl.h>
+#include <stdint.h>
+#include <limits.h>
+#include "Debug.h"
+#include "XboxTLS.h"
+#define MAX_ANCHORS 255
+// #define XBOXTLS_RECV_BUFFER_SIZE (128 * 1024)
+#define XBOXTLS_RECV_BUFFER_SIZE (4 * 1024 * 1024)
+
+// How long a connection may go without sending or receiving anything before
+// it's given up on. Without it, a server that stops answering leaves recv()
+// waiting forever - found when four parallel connections to archive.org all
+// stalled after sending their requests and the app never got control back.
+// Two minutes is far longer than any healthy pause, even archive.org
+// extracting a zip member before its first byte. A thread can set a shorter
+// one of its own - see XboxTLS_SetThreadIoTimeout.
+#define XBOXTLS_IO_TIMEOUT_MS (2 * 60 * 1000)
+// Xbox 360-specific socket option required for direct outbound sockets that do
+// not tunnel through Microsoft's service stack.
+#define XBOX_SO_BYPASS_SECURITY 0x5801
+
+extern "C" void XeCryptRandom(BYTE* pb, DWORD cb);
+
+
+/*
+ * Custom entropy seeder for XboxTLS.
+ *
+ * ctx is the TLS engine's OWN HMAC-DRBG, which BearSSL has already created
+ * with an empty seed (rng_init in ssl_engine.c). The seeder's job is to feed
+ * entropy into that instance through its update() method, the same way the
+ * stock seeders in SSL/rand/sysrng.c do.
+ *
+ * This used to seed a separate global DRBG and only copy its vtable pointer
+ * into *ctx - which is the same vtable the engine's DRBG already had, so it
+ * changed nothing. The engine's DRBG was never seeded, yet this returned 1,
+ * so BearSSL treated it as properly seeded: every connection's client random
+ * and ECDHE private key came out of an unseeded DRBG. It also meant two
+ * handshakes on different threads raced on that global.
+ *
+ * Returns:
+ *   1 on success (as required by BearSSL API).
+ */
+static int XboxTLS_CustomSeeder(const br_prng_class **ctx) {
+    unsigned char seed[32];
+    XeCryptRandom(seed, sizeof(seed));
+    (*ctx)->update(ctx, seed, sizeof(seed));
+    return 1;
+}
+br_prng_seeder
+br_prng_seeder_system(const char **name) {
+    if (name) *name = "XboxTLS/XeCryptRandom";
+    return &XboxTLS_CustomSeeder;
+}
+
+
+
+
+/*
+ * Internal structure representing the state of an XboxTLS connection.
+ * 
+ * This struct encapsulates all the necessary BearSSL components and runtime
+ * information for a client-side TLS session on Xbox 360, including:
+ *   - TLS client context (sc)
+ *   - Minimal X.509 certificate validation context (xc)
+ *   - I/O wrapper context for socket reads/writes (ioc)
+ *   - Underlying socket descriptor (sock)
+ *   - Array of trust anchors (certificates) for X.509 validation (anchors)
+ *   - Number of valid anchors loaded (anchor_count)
+ *   - Bi-directional I/O buffer (iobuf)
+ */
+struct XboxTLSInternal {
+    br_ssl_client_context sc;                    // BearSSL TLS client context
+    br_x509_minimal_context xc;                  // X.509 cert validation context (minimal)
+    br_sslio_context ioc;                        // I/O context for read/write abstraction
+    SOCKET sock;                                 // Underlying socket handle
+    br_x509_trust_anchor anchors[MAX_ANCHORS];   // Trust anchor certificates
+    int anchor_count;                            // Count of loaded anchors
+    unsigned char iobuf[BR_SSL_BUFSIZE_BIDI];    // TLS I/O buffer
+    bool chachaOnly;                             // offered ChaCha20 alone - see XboxTLS_SetThreadSuites
+    char host[64];                               // for remembering a host that refused that
+};
+
+
+/*
+ * Returns the BearSSL hash function vtable for a given XboxTLS hash enum.
+ * 
+ * This function is used to select the appropriate hash algorithm for HMAC-DRBG
+ * or signature verification. It maps internal XboxTLSHash enum values to the
+ * corresponding BearSSL `br_hash_class` implementations.
+ *
+ * Parameters:
+ *   - hash: An XboxTLSHash enum value representing the desired hash algorithm.
+ *
+ * Returns:
+ *   A pointer to the BearSSL hash vtable (br_hash_class), or NULL if unsupported.
+ */
+const br_hash_class* XboxTLS_GetHashVTable(XboxTLSHash hash) {
+    switch (hash) {
+        case XboxTLS_Hash_SHA256: return &br_sha256_vtable;
+        case XboxTLS_Hash_SHA384: return &br_sha384_vtable;
+        case XboxTLS_Hash_SHA512: return &br_sha512_vtable;
+        case XboxTLS_Hash_SHA1:   return &br_sha1_vtable;
+        case XboxTLS_Hash_SHA224: return &br_sha224_vtable;
+        default: return NULL;
+    }
+}
+
+/*
+ * Low-level read function for BearSSL's I/O abstraction layer.
+ *
+ * This function is passed to BearSSL to perform socket reads.
+ * It reads up to `len` bytes into `buf` from the underlying socket.
+ *
+ * Parameters:
+ *   - ctx: Pointer to the socket (cast to void* by BearSSL)
+ *   - buf: Buffer to fill with received data
+ *   - len: Maximum number of bytes to read
+ *
+ * Returns:
+ *   Number of bytes read, or a negative value on error.
+ */
+static int tls_socket_read(void* ctx, unsigned char* buf, size_t len) {
+    SOCKET s = *(SOCKET*)ctx;
+    int want = (len > (size_t)INT_MAX) ? INT_MAX : (int)len;
+    int r = recv(s, (char*)buf, want, 0);
+
+    if (r <= 0) {
+        return -1;
+    }
+
+    return r;
+}
+
+/*
+ * Low-level write function for BearSSL's I/O abstraction layer.
+ *
+ * This function is passed to BearSSL to perform socket writes.
+ * It sends `len` bytes from `buf` through the underlying socket.
+ *
+ * Parameters:
+ *   - ctx: Pointer to the socket (cast to void* by BearSSL)
+ *   - buf: Buffer containing data to send
+ *   - len: Number of bytes to send
+ *
+ * Returns:
+ *   Number of bytes written, or a negative value on error.
+ */
+static int tls_socket_write(void* ctx, const unsigned char* buf, size_t len) {
+    SOCKET s = *(SOCKET*)ctx;
+    return send(s, (const char*)buf, (int)len, 0);
+}
+
+// A thread's own timeout, from XboxTLS_SetThreadIoTimeout: a thread-local
+// slot, allocated the first time any thread sets one.
+static volatile LONG g_timeoutSlot = (LONG)TLS_OUT_OF_INDEXES;
+
+void XboxTLS_SetThreadIoTimeout(unsigned long timeoutMs) {
+    if (g_timeoutSlot == (LONG)TLS_OUT_OF_INDEXES) {
+        DWORD slot = TlsAlloc();
+        if (slot == TLS_OUT_OF_INDEXES)
+            return;
+        // Another thread may have got there first; keep whichever won.
+        if (InterlockedCompareExchange(&g_timeoutSlot, (LONG)slot, (LONG)TLS_OUT_OF_INDEXES) != (LONG)TLS_OUT_OF_INDEXES)
+            TlsFree(slot);
+    }
+    TlsSetValue((DWORD)g_timeoutSlot, (LPVOID)(ULONG_PTR)timeoutMs);
+}
+
+static DWORD XboxTLS_IoTimeoutForThisThread() {
+    if (g_timeoutSlot == (LONG)TLS_OUT_OF_INDEXES)
+        return XBOXTLS_IO_TIMEOUT_MS;
+    DWORD ms = (DWORD)(ULONG_PTR)TlsGetValue((DWORD)g_timeoutSlot);
+    return ms != 0 ? ms : XBOXTLS_IO_TIMEOUT_MS;
+}
+
+static void XboxTLS_SetSocketOptions(SOCKET sock) {
+    BOOL opt_true = TRUE;
+    int recvBufferSize = XBOXTLS_RECV_BUFFER_SIZE;
+
+    setsockopt(sock, SOL_SOCKET, XBOX_SO_BYPASS_SECURITY, (PCSTR)&opt_true, sizeof(opt_true));
+    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, (PCSTR)&recvBufferSize, sizeof(recvBufferSize));
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (PCSTR)&opt_true, sizeof(opt_true));
+
+    DWORD timeoutMs = XboxTLS_IoTimeoutForThisThread();
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (PCSTR)&timeoutMs, sizeof(timeoutMs));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (PCSTR)&timeoutMs, sizeof(timeoutMs));
+}
+
+// ---------------------------------------------------------------------------
+// Which cipher suites a connection offers
+// ---------------------------------------------------------------------------
+//
+// The console decrypts ChaCha20-Poly1305 at about 25 MB/s on one core, and
+// AES-128-GCM at about 5 (Settings' speed test, BearSSL's own code for both).
+// archive.org's storage servers (ia8....us.archive.org) take AES-GCM over
+// ChaCha20 even when ChaCha20 is offered first - the server's preference
+// wins - which held every download connection under about 4 MB/s. Offered
+// ChaCha20 alone, they take it. So an archive.org connection offers only
+// ChaCha20, unless that host has refused it before; everything else keeps
+// the full list, as no other server here has been measured.
+
+// Per-thread settings: a thread-local slot each, allocated the first time
+// any thread uses one.
+static volatile LONG g_suitesSlot = (LONG)TLS_OUT_OF_INDEXES;
+static volatile LONG g_lastSuiteSlot = (LONG)TLS_OUT_OF_INDEXES;
+
+static DWORD XboxTLS_Slot(volatile LONG *slot) {
+    if (*slot == (LONG)TLS_OUT_OF_INDEXES) {
+        DWORD fresh = TlsAlloc();
+        if (fresh == TLS_OUT_OF_INDEXES)
+            return TLS_OUT_OF_INDEXES;
+        // Another thread may have got there first; keep whichever won.
+        if (InterlockedCompareExchange(slot, (LONG)fresh, (LONG)TLS_OUT_OF_INDEXES) != (LONG)TLS_OUT_OF_INDEXES)
+            TlsFree(fresh);
+    }
+    return (DWORD)*slot;
+}
+
+void XboxTLS_SetThreadSuites(int mode) {
+    DWORD slot = XboxTLS_Slot(&g_suitesSlot);
+    if (slot != TLS_OUT_OF_INDEXES)
+        TlsSetValue(slot, (LPVOID)(ULONG_PTR)mode);
+}
+
+unsigned short XboxTLS_LastSuiteForThisThread(void) {
+    if (g_lastSuiteSlot == (LONG)TLS_OUT_OF_INDEXES)
+        return 0;
+    return (unsigned short)(ULONG_PTR)TlsGetValue((DWORD)g_lastSuiteSlot);
+}
+
+static void XboxTLS_NoteSuite(unsigned short suite) {
+    DWORD slot = XboxTLS_Slot(&g_lastSuiteSlot);
+    if (slot != TLS_OUT_OF_INDEXES)
+        TlsSetValue(slot, (LPVOID)(ULONG_PTR)suite);
+}
+
+// Hosts that refused ChaCha20 alone. Few, so a short list; a spin lock, as
+// connections are made from several threads.
+#define NO_CHACHA_MAX 16
+static char g_noChacha[NO_CHACHA_MAX][64];
+static int g_noChachaCount = 0;
+static volatile LONG g_noChachaLock = 0;
+
+static void NoChachaLock() {
+    while (InterlockedCompareExchange(&g_noChachaLock, 1, 0) != 0)
+        Sleep(0);
+}
+
+static void NoChachaUnlock() {
+    InterlockedExchange(&g_noChachaLock, 0);
+}
+
+static bool XboxTLS_RefusedChacha(const char *host) {
+    bool found = false;
+    NoChachaLock();
+    for (int i = 0; i < g_noChachaCount && !found; ++i)
+        found = (_stricmp(g_noChacha[i], host) == 0);
+    NoChachaUnlock();
+    return found;
+}
+
+static void XboxTLS_NoteRefusedChacha(const char *host) {
+    NoChachaLock();
+    if (g_noChachaCount < NO_CHACHA_MAX) {
+        strncpy(g_noChacha[g_noChachaCount], host, sizeof(g_noChacha[0]) - 1);
+        g_noChacha[g_noChachaCount][sizeof(g_noChacha[0]) - 1] = '\0';
+        g_noChachaCount++;
+    }
+    NoChachaUnlock();
+}
+
+static bool XboxTLS_EndsWith(const char *s, const char *suffix) {
+    size_t n = strlen(s), m = strlen(suffix);
+    return n >= m && _stricmp(s + n - m, suffix) == 0;
+}
+
+static bool XboxTLS_OfferChachaOnly(const char *host) {
+    int mode = XBOXTLS_SUITES_DEFAULT;
+    if (g_suitesSlot != (LONG)TLS_OUT_OF_INDEXES)
+        mode = (int)(ULONG_PTR)TlsGetValue((DWORD)g_suitesSlot);
+    if (mode == XBOXTLS_SUITES_CHACHA)
+        return true;
+    if (mode == XBOXTLS_SUITES_SERVER_CHOICE)
+        return false;
+    return XboxTLS_EndsWith(host, "archive.org") && !XboxTLS_RefusedChacha(host);
+}
+
+static void XboxTLS_UseFastDownloadSuites(br_ssl_client_context* sc, bool chachaOnly) {
+    static const uint16_t suites[] = {
+        BR_TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+        BR_TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        BR_TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        BR_TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        BR_TLS_RSA_WITH_AES_128_GCM_SHA256,
+        BR_TLS_RSA_WITH_AES_128_CBC_SHA
+    };
+
+    br_ssl_engine_set_versions(&sc->eng, BR_TLS12, BR_TLS12);
+    // The first two are the ChaCha20 ones.
+    br_ssl_engine_set_suites(&sc->eng, suites, chachaOnly ? 2 : sizeof(suites) / sizeof(suites[0]));
+}
+
+
+
+
+
+/*
+ * Initializes a new XboxTLSContext and allocates internal structures.
+ *
+ * This function prepares a new TLS context for use in a BearSSL-based
+ * Xbox TLS connection. It allocates and zeroes an internal structure that
+ * will be used to manage TLS state and certificate verification.
+ *
+ * Parameters:
+ *   - ctx: Pointer to the XboxTLSContext to initialize
+ *   - hostname: Server hostname for TLS SNI (not used at this stage)
+ *
+ * Returns:
+ *   true if initialization succeeds, false on failure (e.g., OOM or bad input).
+ */
+bool XboxTLS_CreateContext(XboxTLSContext* ctx, const char* hostname) {
+    if (!ctx || !hostname) return false;
+
+    XboxTLSInternal* internal = (XboxTLSInternal*)malloc(sizeof(XboxTLSInternal));
+    if (!internal) return false;
+    memset(internal, 0, sizeof(XboxTLSInternal));
+
+    ctx->internal = internal;
+    return true;
+}
+
+
+/*
+ * Adds an RSA trust anchor (root certificate public key) to the XboxTLS context.
+ *
+ * This function appends a new X.509 trust anchor based on a raw RSA public key.
+ * It manually sets up the distinguished name (DN) and the RSA key parameters
+ * (modulus and exponent), and stores them in the internal anchor list.
+ *
+ * Parameters:
+ *   - ctx: Pointer to the XboxTLSContext
+ *   - dn: Distinguished name (ASN.1-encoded)
+ *   - dn_len: Length of the distinguished name
+ *   - n: RSA modulus (big-endian)
+ *   - n_len: Length of the modulus
+ *   - e: RSA public exponent (big-endian)
+ *   - e_len: Length of the exponent
+ *
+ * Returns:
+ *   true on success, false on failure (e.g. out of space, invalid input)
+ */
+bool XboxTLS_AddTrustAnchor_RSA(XboxTLSContext* ctx,
+    const unsigned char* dn, size_t dn_len,
+    const unsigned char* n, size_t n_len,
+    const unsigned char* e, size_t e_len) {
+
+    if (!ctx || !ctx->internal || dn_len == 0 || n_len == 0 || e_len == 0) return false;
+    XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
+    if (ic->anchor_count >= MAX_ANCHORS) return false;
+
+    br_x509_trust_anchor* ta = &ic->anchors[ic->anchor_count];
+    br_rsa_public_key* key;
+
+    memset(ta, 0, sizeof(*ta));
+
+    ta->dn.data = (unsigned char*)malloc(dn_len);
+    if (ta->dn.data == NULL) return false;
+    memcpy((void*)ta->dn.data, dn, dn_len);
+    ta->dn.len = dn_len;
+    ta->flags = BR_X509_TA_CA;
+
+    key = (br_rsa_public_key*)malloc(sizeof(br_rsa_public_key));
+    if (key == NULL)
+    {
+        free((void*)ta->dn.data);
+        ta->dn.data = NULL;
+        ta->dn.len = 0;
+        return false;
+    }
+
+    memset(key, 0, sizeof(*key));
+
+    key->n = (unsigned char*)malloc(n_len);
+    if (key->n == NULL)
+    {
+        free(key);
+        free((void*)ta->dn.data);
+        ta->dn.data = NULL;
+        ta->dn.len = 0;
+        return false;
+    }
+    memcpy(key->n, n, n_len);
+    key->nlen = n_len;
+
+    key->e = (unsigned char*)malloc(e_len);
+    if (key->e == NULL)
+    {
+        free(key->n);
+        free(key);
+        free((void*)ta->dn.data);
+        ta->dn.data = NULL;
+        ta->dn.len = 0;
+        return false;
+    }
+    memcpy(key->e, e, e_len);
+    key->elen = e_len;
+
+    ta->pkey.key_type = BR_KEYTYPE_RSA;
+    ta->pkey.key.rsa = *key;
+    free(key);
+    ic->anchor_count++;
+
+    return true;
+}
+
+
+
+/*
+ * Adds an EC (Elliptic Curve) trust anchor to the XboxTLS context.
+ *
+ * This function appends a new X.509 trust anchor based on a raw EC public key.
+ * It stores the distinguished name and curve parameters to be used for verifying
+ * server certificates signed using EC keys (e.g. P-256, P-384).
+ *
+ * Parameters:
+ *   - ctx: Pointer to the XboxTLSContext
+ *   - dn: Distinguished name (ASN.1-encoded)
+ *   - dn_len: Length of the distinguished name
+ *   - q: Elliptic curve public point (uncompressed format)
+ *   - q_len: Length of the EC point
+ *   - curve_id: Identifier for the EC curve (e.g. BR_EC_secp256r1)
+ *
+ * Returns:
+ *   true on success, false on failure (e.g. out of space, invalid input)
+ */
+bool XboxTLS_AddTrustAnchor_EC(XboxTLSContext* ctx,
+    const unsigned char* dn, size_t dn_len,
+    const unsigned char* q, size_t q_len,
+    XboxTLSCurve curve_id) {
+
+    if (!ctx || !ctx->internal || dn_len == 0 || q_len == 0) return false;
+    XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
+    if (ic->anchor_count >= MAX_ANCHORS) return false;
+
+    br_x509_trust_anchor* ta = &ic->anchors[ic->anchor_count];
+    br_ec_public_key* key;
+
+    memset(ta, 0, sizeof(*ta));
+
+    ta->dn.data = (unsigned char*)malloc(dn_len);
+    if (ta->dn.data == NULL) return false;
+    memcpy((void*)ta->dn.data, dn, dn_len);
+    ta->dn.len = dn_len;
+    ta->flags = BR_X509_TA_CA;
+
+    key = (br_ec_public_key*)malloc(sizeof(br_ec_public_key));
+    if (key == NULL)
+    {
+        free((void*)ta->dn.data);
+        ta->dn.data = NULL;
+        ta->dn.len = 0;
+        return false;
+    }
+
+    memset(key, 0, sizeof(*key));
+
+    key->q = (unsigned char*)malloc(q_len);
+    if (key->q == NULL)
+    {
+        free(key);
+        free((void*)ta->dn.data);
+        ta->dn.data = NULL;
+        ta->dn.len = 0;
+        return false;
+    }
+    memcpy(key->q, q, q_len);
+    key->qlen = q_len;
+    key->curve = (int)curve_id;
+
+    ta->pkey.key_type = BR_KEYTYPE_EC;
+    ta->pkey.key.ec = *key;
+    free(key);
+    ic->anchor_count++;
+
+    return true;
+}
+
+
+/*
+ * Establishes a secure TLS connection using the provided XboxTLS context.
+ *
+ * This function creates a TCP socket to the given IP address and port, performs a TLS
+ * handshake using BearSSL, and prepares the TLS engine to send and receive encrypted
+ * data over the established socket. It also initializes the certificate verification
+ * engine and configures the chosen hash algorithm and trust anchors.
+ *
+ * Parameters:
+ *   - ctx: Pointer to the XboxTLSContext previously initialized by XboxTLS_CreateContext.
+ *   - ip: Target server IP address (IPv4 string, e.g., "192.168.1.1").
+ *   - hostname: Hostname for TLS SNI (Server Name Indication) and certificate validation.
+ *   - port: TCP port to connect to (usually 443 for HTTPS).
+ *
+ * Returns:
+ *   true on successful socket and TLS setup, false on error (e.g., invalid input,
+ *   socket creation failure, connection error, invalid hash algorithm).
+ *
+ * Notes:
+ *   - This function uses BearSSL's minimal X.509 engine.
+ *   - Only one connection can be active per XboxTLSContext at a time.
+ *   - Use XboxTLS_Write / XboxTLS_Read for I/O after a successful connection.
+ */
+bool XboxTLS_Connect(XboxTLSContext* ctx, const char* ip, const char* hostname, int port) {
+    if (!ctx || !ctx->internal || !ip || !hostname) {
+        debug_tls("XboxTLS_Connect: Invalid arguments.");
+        return false;
+    }
+
+    XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
+    SOCKET sock = INVALID_SOCKET;
+    bool success = false;
+
+    __try
+    {
+        sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (sock == INVALID_SOCKET) {
+            debug_tls("Socket creation failed.");
+            int wsaErr = WSAGetLastError();
+            char debugBuf[64];
+            sprintf(debugBuf, "WSA Error: %d", wsaErr);
+            debug_tls(debugBuf);
+            return false;
+        }
+
+        XboxTLS_SetSocketOptions(sock);
+
+        sockaddr_in sa;
+        memset(&sa, 0, sizeof(sa));
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(port);
+        sa.sin_addr.s_addr = inet_addr(ip);
+        if (sa.sin_addr.s_addr == INADDR_NONE) {
+            debug_tls("inet_addr failed: Invalid IP format.");
+            closesocket(sock);
+            return false;
+        }
+
+        if (connect(sock, (struct sockaddr*)&sa, sizeof(sa)) == SOCKET_ERROR) {
+            int wsaErr = WSAGetLastError();
+            char debugBuf[64];
+            debug_tls("connect() failed.");
+            sprintf(debugBuf, "WSA Error: %d", wsaErr);
+            debug_tls(debugBuf);
+            closesocket(sock);
+            return false;
+        }
+
+        ic->sock = sock;
+
+        const br_hash_class* hash = XboxTLS_GetHashVTable(ctx->hashAlgo);
+        if (!hash) {
+            debug_tls("Invalid hash algorithm specified.");
+            closesocket(sock);
+            return false;
+        }
+
+        br_x509_minimal_init(&ic->xc, hash, ic->anchors, ic->anchor_count);
+        br_x509_minimal_set_rsa(&ic->xc, br_rsa_pkcs1_vrfy_get_default());
+        br_x509_minimal_set_ecdsa(&ic->xc, br_ec_get_default(), br_ecdsa_vrfy_asn1_get_default());
+
+        br_ssl_client_init_full(&ic->sc, &ic->xc, ic->anchors, ic->anchor_count);
+        ic->chachaOnly = XboxTLS_OfferChachaOnly(hostname);
+        strncpy(ic->host, hostname, sizeof(ic->host) - 1);
+        ic->host[sizeof(ic->host) - 1] = '\0';
+        XboxTLS_UseFastDownloadSuites(&ic->sc, ic->chachaOnly);
+        br_ssl_engine_set_buffer(&ic->sc.eng, ic->iobuf, sizeof(ic->iobuf), 1);
+        br_ssl_client_reset(&ic->sc, hostname, 0);
+        br_sslio_init(&ic->ioc, &ic->sc.eng, tls_socket_read, &ic->sock, tls_socket_write, &ic->sock);
+
+        success = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        debug_tls("XboxTLS_Connect: structured exception.");
+        if (sock != INVALID_SOCKET)
+            closesocket(sock);
+        return false;
+    }
+
+    return success;
+}
+
+
+
+/*
+ * Writes encrypted data over the active TLS connection.
+ *
+ * This function writes the provided plaintext buffer through BearSSL’s TLS engine,
+ * which handles encryption and framing. It also flushes the write buffer to ensure
+ * all data is transmitted immediately.
+ *
+ * Parameters:
+ *   - ctx: Pointer to an active XboxTLSContext with a live TLS connection.
+ *   - buf: Pointer to the data to send.
+ *   - len: Length of the data in bytes.
+ *
+ * Returns:
+ *   The number of bytes written on success, or -1 on failure.
+ *
+ * Notes:
+ *   - Always flushes the stream after writing.
+ *   - Uses BearSSL’s `br_sslio_write_all` and `br_sslio_flush`.
+ */
+// What a handshake's error code means, for the few seen in practice -
+// BearSSL's codes from bearssl_ssl.h and bearssl_x509.h - else nothing.
+static const char *TlsErrorMeaning(int err)
+{
+    switch (err)
+    {
+    case BR_ERR_IO:
+        return " (the connection dropped)";
+    case BR_ERR_X509_EXPIRED:
+    case BR_ERR_X509_TIME_UNKNOWN:
+        return " (the certificate's dates don't fit the console's clock - is the clock right?)";
+    case BR_ERR_X509_NOT_TRUSTED:
+        return " (a certificate chain the app doesn't trust)";
+    default:
+        return "";
+    }
+}
+
+int XboxTLS_Write(XboxTLSContext* ctx, const void* buf, int len) {
+    if (!ctx || !ctx->internal || !buf || len <= 0) {
+        debug_tls("XboxTLS_Write: Invalid arguments.");
+        return -1;
+    }
+
+    XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
+    int writeResult;
+
+    __try
+    {
+        writeResult = br_sslio_write_all(&ic->ioc, buf, len);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        debug_tls("XboxTLS_Write: structured exception in write_all.");
+        return -1;
+    }
+
+    // No longer "continuing anyway": the copy of BearSSL here used to be
+    // patched to accept an untrusted chain, which let anyone who could sit
+    // between the console and archive.org read requests carrying the user's
+    // keys. An untrusted chain now fails the handshake, so writeResult is
+    // negative below; this just says why, in the log.
+    if (ic->xc.err == BR_ERR_X509_NOT_TRUSTED) {
+        debug_tls("TLS certificate chain is not trusted - connection refused.");
+    }
+
+    if (writeResult < 0) {
+        int err = br_ssl_engine_last_error(&ic->sc.eng);
+        char msg[160];
+        sprintf(msg, "TLS write error code: %d%s", err, TlsErrorMeaning(err));
+        debug_tls(msg);
+
+        // The server turned the handshake down outright - a fatal alert -
+        // when offered ChaCha20 alone: offer it everything from now on. The
+        // caller's retry, if it has one, connects again with the full list.
+        if (ic->chachaOnly && err >= BR_ERR_RECV_FATAL_ALERT && err < BR_ERR_RECV_FATAL_ALERT + 256) {
+            XboxTLS_NoteRefusedChacha(ic->host);
+            sprintf(msg, "%.64s refused ChaCha20 - offering every cipher suite from now on", ic->host);
+            debug_tls(msg);
+        }
+        return -1;
+    }
+
+    __try
+    {
+        writeResult = br_sslio_flush(&ic->ioc);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        debug_tls("XboxTLS_Write: structured exception in flush.");
+        return -1;
+    }
+
+    if (writeResult != 0) {
+        int err = br_ssl_engine_last_error(&ic->sc.eng);
+        char msg[160];
+        sprintf(msg, "TLS flush error code: %d%s", err, TlsErrorMeaning(err));
+        debug_tls(msg);
+        return -1;
+    }
+
+    // The handshake is done by now: which suite it settled on.
+    XboxTLS_NoteSuite(ic->sc.eng.session.cipher_suite);
+    return len;
+}
+
+
+/*
+ * Reads decrypted data from the active TLS connection.
+ *
+ * This function receives data from the TLS socket and decrypts it using BearSSL.
+ * It blocks until data is available or an error occurs.
+ *
+ * Parameters:
+ *   - ctx: Pointer to an active XboxTLSContext with a live TLS connection.
+ *   - buf: Buffer to store the received plaintext data.
+ *   - len: Maximum number of bytes to read into the buffer.
+ *
+ * Returns:
+ *   The number of bytes read on success, or -1 on error.
+ */
+int XboxTLS_Read(XboxTLSContext* ctx, void* buf, int len) {
+    if (!ctx || !ctx->internal || !buf || len <= 0) {
+        debug_tls("XboxTLS_Read: Invalid arguments.");
+        return -1;
+    }
+
+    XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
+    unsigned char* src;
+    size_t available;
+
+    src = br_ssl_engine_recvapp_buf(&ic->sc.eng, &available);
+    if (src != NULL && available > 0) {
+        size_t copyLen = (size_t)len;
+
+        if (copyLen > available) {
+            copyLen = available;
+        }
+
+        memcpy(buf, src, copyLen);
+        br_ssl_engine_recvapp_ack(&ic->sc.eng, copyLen);
+        return (int)copyLen;
+    }
+
+    int r = br_sslio_read(&ic->ioc, buf, (size_t)len);
+    if (r < 0) {
+        // br_sslio_read returning <0 with err==BR_ERR_OK (0) just means the
+        // connection closed cleanly (normal end of a response) - not
+        // actually an error, so not worth the debug_tls() round trip (which
+        // does its own console render plus two separate file writes) on
+        // what happens at the end of every single request.
+        int err = br_ssl_engine_last_error(&ic->sc.eng);
+        if (err != BR_ERR_OK) {
+            char msg[64];
+            sprintf(msg, "TLS read error code: %d", err);
+            debug_tls(msg);
+        }
+    }
+
+    return r;
+}
+
+/*
+ * Frees all internal memory and closes the TLS connection.
+ *
+ * This function shuts down the TLS socket and releases any dynamic memory
+ * used by the TLS context, including trust anchors and cryptographic structures.
+ *
+ * Parameters:
+ *   - ctx: Pointer to the XboxTLSContext to be cleaned up.
+ *
+ * Notes:
+ *   - Safe to call even if the context is partially initialized.
+ *   - After calling, the context's internal pointer is set to NULL.
+ */
+void XboxTLS_Free(XboxTLSContext* ctx) {
+    if (!ctx || !ctx->internal) return;
+    XboxTLSInternal* ic = (XboxTLSInternal*)ctx->internal;
+
+    closesocket(ic->sock);
+
+    for (int i = 0; i < ic->anchor_count; ++i) {
+        free((void*)ic->anchors[i].dn.data);
+        if (ic->anchors[i].pkey.key_type == BR_KEYTYPE_RSA) {
+            free(ic->anchors[i].pkey.key.rsa.n);
+            free(ic->anchors[i].pkey.key.rsa.e);
+        } else if (ic->anchors[i].pkey.key_type == BR_KEYTYPE_EC) {
+            free(ic->anchors[i].pkey.key.ec.q);
+        }
+    }
+
+    free(ic);
+    ctx->internal = NULL;
+}

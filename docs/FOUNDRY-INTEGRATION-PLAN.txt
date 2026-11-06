@@ -1,0 +1,516 @@
+OMNI360 + GOD FOUNDRY: REVIEW, IMPLEMENTATION PLAN, AND AI HANDOFF
+Source review: 2026-11-05. Handoff finalized: 2026-11-06.
+Status: research and planning only. Implementation and deployment are NOT authorized by this request.
+
+1. ANSWER AND RECOMMENDATION
+
+Yes: a fork of Omni360 can use GOD Foundry as its source for searching,
+downloading, and installing games, DLC, XBLA, and compatible title updates
+directly from the Xbox 360. This is a substantial integration, but it does
+not require writing a new Xbox application or a new GoD converter.
+
+Omni360 already converts Xbox 360 disc images to GoD on the console. Its
+game installer downloads an archive in small pieces, builds a decompression
+index, and passes a random-access view of the ISO to GodConvert. It avoids
+writing a whole, oversized ISO as one file on the console.
+
+Implement two choices, independently from the choice of source provider:
+
+  A. Server conversion (default): Foundry prepares and validates the GoD.
+     The Xbox downloads the prepared package's individual files and installs
+     them, plus any explicitly selected DLC/title update components.
+
+  B. Xbox conversion (optional): Foundry supplies an immutable source archive.
+     Omni360 downloads it in pieces and uses its existing ISO-to-GoD engine.
+     DLC and title updates still come from validated server-side components.
+
+The console UI can retain Archive.org as a separate provider. "Foundry versus
+Archive.org" and "Server versus Xbox conversion" are different settings.
+Foundry access must not require Archive.org keys.
+
+For A, do not make downloading a complete ZIP to one Xbox file the default.
+Foundry's current ZIP64 bundles can exceed the Xbox filesystem's per-file
+limit. A manifest plus individual files is simpler, resumable, and avoids
+an unnecessary extraction stage. Keep existing ZIP downloads for PC users.
+A streaming ZIP64 installer could be added separately, but is unnecessary
+for a reliable first release. This still installs exactly the prepared GoD.
+
+This plan reduces ambiguity; it cannot guarantee zero follow-up changes.
+Compilation with the required Xbox toolchain and testing on the user's real
+console are mandatory before claiming playback and title updates work.
+
+2. WHAT WAS INSPECTED AND WHERE TO RESUME
+
+Workspace: /Users/TobiasEcke/Documents/ZenServer
+Reference clone: improvements/reference-omni360/
+Reviewed Omni360 commit: 92fbd7bbabb8b1b4c48463fb37636066545ea3e1
+Reference source: https://github.com/JustGillin/omni360
+Current local Foundry source: improvements/candidate/app/
+Earlier snapshot: improvements/baseline/app/
+Server, if a later implementation authorizes access: SSH ZenServer_no_passphrase
+Server application: /opt/xbox360
+Container: xbox360-iso2god
+Website: https://iso2god.mediahub.stream
+
+No remote fork was created. No website, server, credentials, or container
+was changed for this investigation. The public repository was cloned locally
+for inspection. This text is the saved handoff.
+
+Important Omni360 source locations:
+  src/main.cpp: controller actions, settings, authentication gates, UI flow.
+  src/GameListUI.cpp/.h: drawing, not the entire application controller.
+  src/StoreCatalog.cpp/.h and generated StoreTitles/XblaTitles/XbligTitles:
+    existing compiled catalog and source-specific identities.
+  src/GameInstaller.cpp/.h: Archive.org game requests, archive handling,
+    segmented downloads, conversion, installed bookkeeping.
+  src/GodConvert.cpp/.h: reusable GodSource, GodInspect, GodConvert.
+  src/DownloadQueue.cpp/.h: background DLC/TU/homebrew queue and status.
+  src/ArchiveOrgDLC.cpp/.h: existing add-on discovery and installation.
+  src/downloadFile.cpp/.h, HttpResponse.*, XboxTLS.*, dns.cpp:
+    HTTP, Range requests, TLS, and networking.
+  src/StfsParser.cpp, LibraryCache.cpp, CoverArt.cpp: local library/artwork.
+  src/UpdateCheck.cpp/.h, UpdateKey.h, settings.h: fork update settings.
+  Omni360.sln, XboxTLS2.vcxproj and .filters: native build configuration.
+  COMPILING.md, RELEASING.md, LICENSE: build/release requirements.
+
+Current code specifics that must influence implementation:
+  - GameRequest contains Archive.org item/ZIP names; the installer constructs
+    https://archive.org/download/... itself. A new URL alone is insufficient.
+  - StoreCatalog uses pointers into static arrays, including pointer-range
+    tests to identify Original Xbox entries. Do not pass fabricated dynamic
+    StoreDisc/StoreRelease objects through those assumptions.
+  - StartGameInstaller clears old staging; durable resume across application
+    restarts is not already implemented by the existing game path.
+  - The downloader's file mode and redirect handling need explicit adaptation.
+    Do not assume bearer headers, redirects, and resume all work automatically.
+  - Upstream uses BearSSL TLS 1.2 with embedded certificate trust anchors.
+    Preserve certificate/hostname verification and test the Foundry host.
+  - Upstream currently checks releases from JustGillin/omni360 and requires
+    a signature from its compiled update key. A fork needs its own updater.
+
+Current Foundry integration points:
+  app.py, db.py, pipeline.py, bundle.py, validation.py, xboxunity.py, unlock.py.
+  Existing /api/catalog, /api/jobs and /download/... are browser-oriented.
+  Flask has optional Basic authentication and a write-request CSRF header.
+  The deployment also uses browser authentication at the reverse proxy.
+  Existing conversion, validation and TU matching should be reused.
+  Loose GoD files already exist server-side; an installer need not extract ZIPs.
+  Combined ZIPs are ZIP_STORED/ZIP64 and may change as components are added.
+  Historical job snapshots can be partial or have an older directory layout.
+  Original sources are often ZIPs containing ISOs, cached under source-cache.
+  Some catalog metadata is unknown until processing; names are not reliable IDs.
+
+Before implementation, compare this local source with the live deployment
+and any newer upstream changes. Do not overwrite unrelated work or silently
+update the upstream baseline. Record the actual implementation commit.
+
+3. PREREQUISITES AND FIRST PROOF
+
+Build prerequisites specified by upstream: Windows, Visual Studio 2010, the
+official Xbox 360 XDK, and a console capable of running homebrew. Build the
+AtgFramework project before XboxTLS. New native sources must be registered
+in the project and filters. Use language/library features supported by that
+toolchain; do not assume a modern C++17 build or libxenon replacement.
+
+Before broad integration, prove three things:
+  1. An unmodified checkout builds and runs with the available toolchain.
+  2. The console can make a verified HTTPS request to the intended API host.
+  3. One known-good, prepared Foundry GoD launches when installed correctly.
+
+For the third check, first launch without an enabled title update or DLC,
+then add the strictly matched update, then DLC. The user previously saw an
+"apply update title" message followed by an exit. An API cannot establish
+whether that issue is a base package, update, or console-specific problem.
+Record actual console exploit, dashboard/Aurora setup, storage, and network.
+
+4. SERVER DATA MODEL AND IMMUTABLE ARTIFACTS
+
+Add migrations, not destructive database recreation. Suggested entities:
+  console_devices / device_tokens / pending_pairings;
+  releases and release_components with explicit compatibility metadata;
+  install_requests with persisted state and idempotency keys;
+  artifacts, artifact_files, source_artifacts and retention leases;
+  per-device install results, treated as reports rather than trusted proofs.
+
+Separate a catalog item, release/disc, component, job, artifact revision, and
+installed package. Never use the display name or download filename as identity.
+Record provider ID, stable release ID, source revision, Title ID, Media ID,
+content type, content ID when available, region/language, disc number/count,
+XEX version/base version, validation report, converter version, and processing
+policy. Keep unknown metadata explicitly unknown. Do not invent IDs from names.
+
+Index metadata from actual packages or executable inspection where possible.
+Allow searching unprocessed catalog entries, but mark metadata/availability
+and block automatic add-on matching until identity is established. Distinguish
+playable game discs from content/install discs. Do not blindly convert every
+disc of a multi-disc release to a separately playable GoD.
+
+Artifact publication must be atomic and immutable. A published artifact ID
+always refers to the same bytes, manifest, validation result and settings.
+Do not expose the mutable "current combined ZIP" as a resumable artifact.
+Do not assume old job ZIPs are complete console installations.
+
+Create a private snapshot by copying/reflinking, or use content-addressed
+objects; hardlinks are safe only if no writer can modify a shared inode.
+Compute per-file SHA-256 once, publish after validation, and store sizes and
+digests. Protect active artifacts and source archives from existing cleanup.
+Use bounded, documented retention and renewable leases for downloads/resume.
+Disk quotas and an explicit expired-artifact response are required.
+
+Capture policy per request: selected components, conversion location, unlock
+policy, TU choice, and converter version. Console jobs must not change global
+website settings. Reuse the existing queue; persist state through server
+restart, and deduplicate equivalent active work. Do not process the same ISO
+again if a matching validated artifact already exists.
+
+5. MACHINE API CONTRACT
+
+Create a versioned Flask blueprint such as /api/console/v1. Suggested routes:
+
+  GET  /capabilities
+    Protocol/minimum client version, supported conversion/source formats,
+    page/request limits, modes, checksum algorithms and maintenance state.
+  POST /pairings
+    Rate-limited device authorization start; returns opaque device secret,
+    short user code, verification URL, expiration and polling interval.
+  POST /pairings/token
+    Poll with the secret; receive a device token only after browser approval.
+  GET  /catalog?q=...&kind=...&cursor=...&limit=...
+    Search/paginate games, XBLA, DLC and updates; include availability states.
+  GET  /releases/<release_id>
+    Disc/edition identity, known compatible components, readiness and sizes.
+  POST /compatibility/resolve
+    Match add-ons/TUs for installed titles using actual locally read metadata;
+    validate input and disclose why a candidate is compatible or rejected.
+  POST /install-requests
+    Explicit release, components and conversion=server|console. Require an
+    Idempotency-Key; accept only server-owned IDs and bounded selections.
+  GET  /install-requests/<id>
+    Durable progress, warnings, errors, artifact references and retry timing.
+  GET  /artifacts/<artifact_id>/manifest
+    Immutable prepared-file manifest; ETag derived from exact manifest bytes.
+  GET/HEAD /artifacts/<artifact_id>/files/<file_id>
+    Immutable individual file, authenticated and Range-capable.
+  GET/HEAD /source-artifacts/<source_id>/file
+    Immutable original supported archive for console conversion, with Range.
+  POST /install-requests/<id>/events
+    Bounded, idempotent per-component installed/failed/cancelled reports.
+
+Browser-only protected routes approve pairings, list/revoke devices and view
+activity. A scoped token does not authorize website settings, upstream secrets,
+arbitrary paths/URLs, administrative cleanup or deletion of server libraries.
+
+Define and document JSON schemas/OpenAPI before implementing both clients.
+Use UTF-8, fixed-width hexadecimal identity strings, and decimal strings for
+byte counts/offsets that need uint64 parsing; do not route them through 32-bit
+integers or imprecise JSON conversions. Use opaque IDs rather than paths.
+Bound JSON size, nesting, text lengths, page size and file/component count.
+Cursor paging and asynchronous network requests must keep Xbox RAM bounded.
+
+Standardize errors, including UNPAIRED, TOKEN_REVOKED, NOT_READY, RATE_LIMITED,
+NO_SPACE, UNSUPPORTED_SOURCE, METADATA_UNKNOWN, INCOMPATIBLE_UPDATE,
+ARTIFACT_EXPIRED, ARTIFACT_CHANGED, and VALIDATION_FAILED. Return JSON for
+machine errors, with retry guidance; never return an HTML login page.
+
+Install-request states should distinguish queued, obtaining_source, converting,
+checking, ready, ready_with_warnings, failed, cancelled, and expired. Optional
+TU failure must not silently mark a base-game install failed or fully complete.
+Client polling obeys Retry-After/backoff and continues across transient errors.
+
+6. AUTHENTICATION, TRANSPORT AND FILE SECURITY
+
+Use a random, per-device bearer token with at least 256 bits of entropy, sent
+only in Authorization over verified HTTPS. Store only a token hash on the
+server; support revocation, rotation, device names, scopes and last-used time.
+Do not embed a shared master API key in the XEX. Device tokens on a modded
+console can be extracted, so limit their authority and server resource use.
+
+Recommended pairing: console displays a short code; user approves it on the
+existing browser-authenticated website. Codes expire quickly and are single
+use; polling requires a separate high-entropy secret. Rate-limit issuance,
+guessing and polling. Clear or mask tokens in UI and redact credentials/logs.
+Do not expose upstream DirForge/Archive.org credentials to the console.
+
+Configure Traefik/Authelia so only the dedicated machine API reaches the
+application without interactive browser authentication; the app must then
+validate device authorization itself. Keep browser routes protected. Adapt
+the app's Basic/CSRF middleware explicitly for the token blueprint, with
+tests showing no fall-through bypass. Pairing approval retains browser CSRF
+protection. A dedicated API hostname is also possible; choose one clear origin.
+
+Test the actual HTTPS hostname, certificate chain and TLS 1.2 compatibility
+using Omni360's trust anchors. Update trusted roots properly if necessary;
+never disable verification. Avoid redirects on authenticated machine routes.
+Never forward a Foundry token to Archive.org, GitHub or another host.
+
+File responses need Content-Length, stable ETag, Accept-Ranges, correct 206
+Content-Range and 416 behavior, HEAD, and If-Range semantics. Disable content
+encoding for binary downloads. Use 64-bit offsets end to end. Ensure proxy
+timeouts/buffering and worker occupancy support long downloads. If using
+internal acceleration, keep file authorization at the app boundary.
+
+Resolve opaque file IDs within approved snapshot roots. Reject traversal,
+symlink escapes, arbitrary filesystem access and user-supplied source URLs.
+Limit queued work, concurrent downloads, daily resource use and cache space
+per device. Token possession must not allow unlimited expensive conversions.
+
+7. PREPARED-PACKAGE MANIFEST AND MODE A
+
+Example shape (values are illustrative; freeze the actual schema in tests):
+  schema_version: 1
+  artifact_id, release_id, provider_id, created_at
+  conversion: "server"
+  components: [
+    { component_id, kind: "god", title_id, media_id, content_id,
+      content_type: "00007000", version, base_version, disc_number,
+      disc_count, validation, unlock_applied: false, files: [
+        { file_id, root: "content", relative_path:
+          "<TITLEID>/00007000/<PACKAGE>.data/Data0000",
+          role: "data", bytes: "...", sha256: "...", download_path: "..." },
+        { ... relative_path: "<TITLEID>/00007000/<PACKAGE>", role: "header" }
+      ] },
+    { ... kind: "dlc", content_type: "00000002", files: [...] },
+    { ... kind: "title_update", compatibility: {...}, files: [...] }
+  ]
+
+Relative content paths begin below Content/0000000000000000. A separately
+selected cache root handles legacy Cache updates. Do not prepend Content
+twice or trust drive letters supplied by the server. Informational documents,
+Extras, Unassigned files and server backup files are not install components.
+Preserve the real package basename from the validated manifest; do not rename
+server GoD headers to a guessed Media ID or a human game title.
+
+Implement a new prepared-package installer, sharing download/hash/queue
+utilities but not pretending a prepared GoD is a disc ZIP. For every file:
+verify origin and relative path, stream to staging, enforce length, verify
+SHA-256, and persist progress. Independently parse installed package headers
+and compare manifest identity. Verify GoD hash structures before commit;
+use the existing server validator's fixtures/expectations to catch regressions.
+
+Validate client paths: no .., absolute paths, colon, alternate roots, invalid
+FATX names or lengths, case-insensitive collisions, duplicated files, or
+oversized individual files. Reject unsupported packages clearly. Arbitrarily
+splitting an STFS file does not create an Xbox-installable content package.
+
+Preflight free space for staging, any source pieces, final output and rollback.
+Use a per-title/package lock across both modes and add-on installs. Download
+GoD data before making its header visible. Stage on the destination volume.
+Persist a small transaction journal and commit with controlled renames and
+backups; recovery must handle power loss at every step. Do not assume a
+multi-file package replacement is one atomic filesystem operation.
+
+Never delete a complete title directory to replace one disc. Preserve other
+discs, DLC, TUs and previous working versions. Stage single-file DLC/TUs too,
+verify them before replacement, and retain rollback until commit succeeds.
+Update local library/cache and installed bookkeeping only after commit.
+Track provider/release/artifact/component identity, not just ZIP names.
+
+Implement durable resume: artifact ID/revision + ETag + path + verified offset
+in an on-disk journal. Validate partial data on restart. If a Range response
+is 200, restart that file safely rather than appending. Changed bytes, bad
+Content-Range or expired artifacts must never be combined with old partials.
+Keep verified completed files; retry only missing/corrupt components.
+
+8. ORIGINAL-ARCHIVE DOWNLOAD AND MODE B
+
+Refactor GameRequest and source acquisition behind a provider-neutral archive
+descriptor: provider, release/source-artifact ID, same-origin URL, archive
+format, exact size/digest, selected member and expected disc identity.
+Retain the existing Archive.org provider separately, including its own auth.
+
+For Foundry, expose the cached original ZIP/RAR only after complete ingestion,
+size/digest validation and immutable publication. A catalog ID-based mutable
+cache pathname is not a source revision. If absent, create an explicit source
+fetch job, persist progress, and expose readiness through the install request.
+
+First support the source formats already proven by the inspected installer:
+ZIP64 stored/deflate ISO members and explicitly verified RAR variants. Declare
+capabilities and reject unsupported/encrypted/multipart/ambiguous archives.
+Audit member selection, ZIP64 offsets, checksum validation and segmented I/O.
+Bound member count, expanded size and decompression resources. Never extract
+an arbitrary archive directory tree or choose the first ISO without identity.
+
+Reuse the installer's small-piece download and GodSource/InflateSource flow.
+Do not write an 8 GB ISO into one Xbox file. A raw-ISO endpoint is optional:
+it needs a tested segmented file source or a suitable random-access adapter,
+and must not be presented as already implemented by replacing a URL.
+
+GodInspect reads actual Title ID, Media ID, disc count and executable versions.
+Compare these to expected identity, then convert through GodConvert into
+staging. Validate output before the same transactional commit used by mode A.
+Persist source-piece identity/checksums and decompression-index version for
+restart resume, or safely rebuild the index from verified pieces. The current
+startup staging cleanup must not destroy resumable Foundry transactions.
+
+Mode B is not an automatic fallback after a corrupt Mode A package. Report
+the failure; let the user explicitly choose a new mode/request. Installed game
+identity must prevent duplicate A/B installations of the same disc. Add-on
+selection and compatibility resolution work with actual post-inspection
+metadata, even when the server has not converted the game.
+
+9. DLC, XBLA, LICENSES AND TITLE UPDATES
+
+Use explicit component relationships and parsed package metadata, not fuzzy
+filename matching. DLC may lack a usable Media ID; do not invent one or apply
+TU matching rules blindly. Mark any edition/region/version restriction that
+is known, and explain unknown compatibility instead of claiming certainty.
+Let users install DLC for an already installed game without redownloading it.
+
+Preserve Foundry's existing license rule: GoD converter license entries remain
+intact. The optional unlock operation applies only to supported XBLA/DLC-type
+packages, with automatic backups. Do not unlock GoD or title updates. Do not
+reprocess unrelated old content when a new request is made. Publish distinct
+immutable artifact revisions for different unlock policies; a policy toggle
+does not relock files that were already changed. Do not add a broad client-side
+license patcher as part of this integration.
+
+Reuse the existing strict XboxUnity validation: actual Title ID, Media ID and
+XEX base version, package metadata/content ID, and size/integrity checks.
+Do not substitute whole-file SHA-1 for a package's content ID. Unknown identity
+blocks automatic selection. Return explicit "no compatible update" or a
+warning; never silently install an approximate filename match.
+
+Install content-style updates below <TITLEID>/000B0000 and supported legacy
+TU_* updates in the device's Cache root, according to validated metadata and
+the existing server rules. Check target-device support. Downloading a TU and
+activating it in Aurora are separate operations: unless reliable activation
+is implemented and tested, tell the user to enable it in Aurora. Do not promise
+an installed TU is active. Preserve/recover previous updates and avoid silently
+replacing another active version. Exclude avatar items from automatic DLC
+installation unless explicitly added as a supported, tested component type.
+
+10. XBOX UI AND PROVIDER ARCHITECTURE
+
+Add provider-neutral owned models and a provider interface for search, release
+details, components, install preparation, authentication and queue operations.
+Do not force remote data into pointers whose lifetime/identity depends on the
+compiled upstream catalog. Keep existing provider behavior independently usable.
+
+Add Foundry API client, pairing/settings storage, paged catalog/cache, manifest
+parser, prepared installer and transaction/resume journal as separate modules.
+Suggested names: FoundryClient, FoundryCatalog, PackageManifest,
+PreparedPackageInstaller and InstallJournal. Names are illustrative; keep
+existing queue state/thread conventions and make shutdown/cancellation safe.
+
+Settings:
+  Source: Foundry / Archive.org (if retained).
+  Foundry URL and paired device status; Pair, Test connection, Forget device.
+  Default conversion: Server / Xbox, overridden per install.
+  Separate configured content/cache destinations with capability checks.
+
+Title screen:
+  Edition/region/disc, installed status, server availability and check status.
+  Explicit game/DLC/TU selections, conversion mode, transfer/storage estimates.
+  Unknown compatibility and ready-with-warning messages in plain language.
+
+Queue:
+  Waiting for server, downloading, converting on Xbox, checking, installing.
+  Bytes/overall progress, cancel/retry/resume, actionable errors and warnings.
+  No network work or package operations on the drawing/controller thread.
+
+Reuse library scans and refresh after commit. Cache artwork separately; do
+not let artwork failure block installation. Use controlled URLs/proxying for
+artwork without leaking tokens or enabling server-side arbitrary URL fetching.
+Test long UTF-8 titles, controller navigation, offline state and bounded RAM.
+
+11. FOUNDRY WEBSITE CHANGES
+
+Add a Consoles page for pairing approvals, device naming, scopes, revocation
+and last activity. Show console install requests and their server processing
+state alongside existing jobs, without conflating "downloaded" with "installed"
+or "verified" with "tested on Xbox". Provide API/client compatibility status.
+
+Show release identity and compatible components clearly. Add request-specific
+conversion/unlock policy where appropriate. Preserve existing PC downloads,
+manual jobs, settings and browser authentication. API documentation and
+operator retention/quota settings belong in administration/help, not in the
+ordinary game installation flow.
+
+12. FORK, RELEASES AND UPDATES
+
+Fork only after implementation is authorized. Preserve upstream attribution,
+modification notices and vendored licenses. Upstream is AGPL-3.0; follow its
+source-distribution requirements, and do not commit proprietary SDK material.
+
+Give the fork a clear name/version and separate settings/installed state where
+needed to coexist with upstream. Point UpdateCheck at the fork's release feed.
+Create a new signing key outside the repository, embed only its public key,
+and sign each release's exact XEX bytes using the documented release process.
+Keep signature verification; never accept unsigned updates as a shortcut.
+An initial manual fork install is expected because upstream does not trust
+the fork's key. Test a real signed fork-to-fork update and rollback behavior.
+
+13. IMPLEMENTATION ORDER AND ACCEPTANCE GATES
+
+Phase 0: freeze reviewed baseline, obtain build/hardware prerequisites, prove
+HTTPS and one known-good Foundry GoD launch. Record the existing TU problem
+separately if still reproducible. No live deployment merely to test the API.
+
+Phase 1: finalize versioned schemas, authentication/pairing, migrations,
+immutable artifact builder, Range endpoints and retention. Test with a desktop
+API client against disposable copies of real package layouts.
+
+Phase 2: fork provider models, Foundry pairing/search, queue integration and
+mode A installer. First prove one game end to end on hardware, then resumability,
+multi-disc handling, DLC and strictly matched title updates.
+
+Phase 3: refactor source acquisition and add mode B using existing converter.
+Compare inspection metadata and validated output with server/native reference
+converters. Output need not be byte-identical where legitimate converter
+layouts differ; metadata, license policy, hash structures and playback must
+be correct. Keep A as default until both have passed the hardware gates.
+
+Phase 4: usability polish, signed fork updater, documentation, backup/restore,
+staging release and explicitly authorized production rollout.
+
+Required meaningful tests:
+  - Protocol/schema compatibility; unsupported client/server versions.
+  - Pair expiry/replay, revoked tokens, device isolation, scope enforcement,
+    unchanged browser authentication/CSRF, no credential logging/redirect leak.
+  - Pagination, unknown metadata, ambiguous editions and duplicate requests.
+  - Immutable bytes despite later conversion/DLC additions; leases versus cleanup.
+  - HEAD/Range/If-Range, 64-bit/ZIP64 sizes, 200 instead of 206, 416, truncation,
+    changed ETag, corrupt bytes, wrong hash, expired token and expired artifact.
+  - Traversal/symlink/case collisions, malicious manifests/archive members,
+    unsupported formats, RAM limits and full disk on server or console.
+  - Cancel/restart/reboot/power loss during download, validation and each commit
+    stage; recover without damaging the previously playable installation.
+  - Two modes targeting the same game, multiple discs, duplicate DLC, existing
+    alternate TUs, no full-title deletion, and accurate installed bookkeeping.
+  - Xbox 360 XGD2 and XGD3 fixtures, stored/deflate ZIP64, supported RAR if enabled.
+  - GoD license preserved in both modes; selected XBLA/DLC unlock on/off variants;
+    wrong Title ID/Media ID/base version updates rejected; no TU treated as DLC.
+  - Real console: install/launch base GoD, install/launch matched TU, verify DLC
+    in game, reboot/launch again, and test DLC-only for an already installed title.
+  - Each storage/mod configuration advertised by the fork, not only a desktop
+    parser test; actual TLS connection and network interruption on the console.
+  - Existing Foundry test suite and PC download flows remain working.
+  - Fork builds cleanly, own signed updater accepts valid releases and rejects
+    tampered XEX/signatures. Document exact source commit for every binary.
+
+Do not claim "everything works" merely because server checks or desktop
+conversion tests pass. Define release readiness by these hardware outcomes.
+
+14. DELIVERABLES FOR THE IMPLEMENTING AI
+
+Deliver reviewed code diffs for both repositories, database migrations with
+backup/rollback procedure, the frozen API schema and fixtures, machine-auth
+proxy configuration, tests/results, the fork's reproducible build instructions,
+signed release instructions, Xbox setup/pairing/install/resume guide, operator
+retention/quota guidance, and a tested staged deployment/rollback procedure.
+
+Keep a progress log with what was tested, exact commits and remaining gates.
+Do not store real API tokens/private signing keys in that log or fixtures.
+Ask only for genuinely missing build/hardware access or product decisions;
+use this plan's defaults otherwise. The current request authorizes planning,
+not code edits, deployment, publishing or a remote fork. Seek implementation
+authorization in a future session before starting those operations.
+
+Primary reference links:
+https://github.com/JustGillin/omni360/tree/92fbd7bbabb8b1b4c48463fb37636066545ea3e1
+https://github.com/JustGillin/omni360/blob/92fbd7bbabb8b1b4c48463fb37636066545ea3e1/src/GameInstaller.h
+https://github.com/JustGillin/omni360/blob/92fbd7bbabb8b1b4c48463fb37636066545ea3e1/src/GodConvert.h
+https://github.com/JustGillin/omni360/blob/92fbd7bbabb8b1b4c48463fb37636066545ea3e1/src/StoreCatalog.cpp
+https://github.com/JustGillin/omni360/blob/92fbd7bbabb8b1b4c48463fb37636066545ea3e1/COMPILING.md
+https://github.com/JustGillin/omni360/blob/92fbd7bbabb8b1b4c48463fb37636066545ea3e1/RELEASING.md
+https://github.com/JustGillin/omni360/blob/92fbd7bbabb8b1b4c48463fb37636066545ea3e1/LICENSE

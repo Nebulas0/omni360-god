@@ -1,0 +1,2570 @@
+/*
+FILE : ArchiveOrgDLC.cpp
+PROJECT : Omni360
+DESCRIPTION : archive.org IAS3 key auth, DLC lookup (msx360gcdlc item
+              metadata), RAR header-only parsing (no decompression - see
+              note below), and per-member download via archive.org's
+              server-side archive extraction ("virtual path") URLs.
+
+Why no RAR decompression: archive.org's own /download/{item}/{rarfile}/{path}
+URL form serves an individual member of a RAR/ZIP already-extracted, streamed
+server-side. We only need to know which internal paths exist, which lives in
+the RAR's own header/file-table - so we parse just that (no compression
+codec needed at all).
+
+Confirmed on real hardware this session: every file in msx360gcdlc is marked
+"private":"true" in its own metadata, and a fully anonymous request to a
+/download/ URL gets a bare 401 straight from nginx before any archive.org
+application code runs - so real authentication is required. See
+BuildIas3AuthHeader's comment in ArchiveOrgDLC.h for why this uses IAS3 keys
+rather than a scraped browser login session.
+*/
+
+#include "ArchiveOrgDLC.h"
+#include "downloadFile.h"
+#include "parsing.h"
+#include "cJSON.h"
+#include "RarHeaders.h"
+#include "RarUnpack.h"
+#include "settings.h"
+
+#include <xtl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+
+#define ARCHIVE_ITEM "msx360gcdlc"
+#define ARCHIVE_METADATA_URL "https://archive.org/metadata/" ARCHIVE_ITEM
+#define ARCHIVE_DOWNLOAD_BASE "https://archive.org/download/" ARCHIVE_ITEM "/"
+#define ARCHIVE_DOWNLOAD_ROOT "https://archive.org/download/"
+
+#define ERROR_LOG(s) (printFunction("\nERROR: %s\n", s))
+
+// See ArchiveOrgKeysRejected. Set by NoteAuthStatus, cleared on entry to each
+// public call that sends keys.
+static bool g_keysRejected = false;
+
+// Records whether a keyed request was refused, and passes the status through
+// so it can wrap a request in place. 401 is archive.org not accepting the
+// credentials at all; 403 is it accepting who you are but not letting you
+// have the file - both are fixed in the same place, the keys, so both count.
+// Requests made without keys never set it: a 401 on those means something
+// else entirely.
+static int NoteAuthStatus(int status, const char *authHeader)
+{
+    if ((status == 401 || status == 403) && authHeader != NULL && authHeader[0] != '\0')
+        g_keysRejected = true;
+    return status;
+}
+
+bool ArchiveOrgKeysRejected()
+{
+    return g_keysRejected;
+}
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+
+static unsigned short ReadLE16(const unsigned char *p)
+{
+    return (unsigned short)(p[0] | (p[1] << 8));
+}
+
+static unsigned long ReadLE32(const unsigned char *p)
+{
+    return (unsigned long)p[0] | ((unsigned long)p[1] << 8) |
+           ((unsigned long)p[2] << 16) | ((unsigned long)p[3] << 24);
+}
+
+// One redirect hop, reusing DumpResponse's existing Location-capture (it
+// writes the redirect URL into the same buffer used for the response body
+// when downloadIntoFile is false) rather than adding new redirect-parsing
+// logic. archive.org's /download/ endpoint redirects to a specific storage
+// node; /metadata/ does not, but this is harmless to use for both.
+//
+// ioCachedRedirectUrl is an optional in/out cache of the resolved datanode
+// URL for this same `url`. ListDlcMembers calls this dozens/hundreds of
+// times in a row against the exact same archive.org URL (walking one file's
+// RAR headers via small Range requests), and archive.org's /download/
+// endpoint always 302s a given item/file to the same datanode - so paying
+// for a full connect+TLS handshake against archive.org itself, every single
+// time, just to be told the identical Location again, was pure waste (and a
+// real cost: TLS handshakes are the most CPU-expensive part of this whole
+// flow on the 360's software-crypto BearSSL stack). When the cache is
+// populated, this skips straight to the datanode with a single hop instead
+// of two; if that ever stops working (expired/moved), it clears the cache
+// and falls back to the normal two-hop path to re-resolve it.
+// One buffer-mode GET: over the session's kept-open connection when there is
+// one, otherwise a connection of its own (see HttpsSession in downloadFile.h).
+static int FetchToBuffer(HttpsSession *session, const std::string &url, const char *headers,
+                         char *dataBuffer, unsigned long long *dataBufferSize,
+                         void printFunction(const char *_format, ...))
+{
+    if (session != NULL)
+        return HttpsSessionGet(session, url, headers, dataBuffer, dataBufferSize);
+
+    return httpRequestHTTPS(url, HTTP_GET, NULL, headers, "", dataBuffer, dataBufferSize, false,
+                            NULL, 0, printFunction);
+}
+
+// session is optional: pass one to make a run of these calls share
+// connections (ListDlcMembers does), or NULL for a connection per request.
+//
+// This one leaves the keys-rejected flag alone - see HttpGetFollowRedirect,
+// below, for the version that records it.
+static int HttpGetFollowRedirectRaw(const std::string &url, char *dataBuffer, unsigned long long *dataBufferSize,
+                                    const char *extraHeaderLines, const char *authHeader,
+                                    void printFunction(const char *_format, ...),
+                                    std::string *ioCachedRedirectUrl = NULL,
+                                    HttpsSession *session = NULL)
+{
+    char combinedHeaders[IAS3_AUTH_HEADER_MAX + 96] = "";
+    if (authHeader != NULL && authHeader[0] != '\0')
+    {
+        _snprintf(combinedHeaders, sizeof(combinedHeaders), "%s%s",
+                 authHeader, extraHeaderLines != NULL ? extraHeaderLines : "");
+    }
+    else if (extraHeaderLines != NULL)
+    {
+        strncpy(combinedHeaders, extraHeaderLines, sizeof(combinedHeaders) - 1);
+    }
+
+    unsigned long long bufSize = *dataBufferSize;
+
+    if (ioCachedRedirectUrl != NULL && !ioCachedRedirectUrl->empty())
+    {
+        int cachedStatus = FetchToBuffer(session, *ioCachedRedirectUrl, combinedHeaders[0] ? combinedHeaders : NULL,
+                                         dataBuffer, dataBufferSize, printFunction);
+        if (cachedStatus == 200 || cachedStatus == 206)
+            return cachedStatus;
+
+        // Cached datanode URL didn't pan out this time (expired, moved,
+        // whatever) - fall through to the normal two-hop path below, which
+        // will re-resolve and overwrite the cache with a fresh value.
+        ioCachedRedirectUrl->clear();
+        *dataBufferSize = bufSize;
+    }
+
+    int status = FetchToBuffer(session, url, combinedHeaders[0] ? combinedHeaders : NULL,
+                               dataBuffer, dataBufferSize, printFunction);
+
+    if (status == 302)
+    {
+        char redirectUrl[2048];
+        strncpy(redirectUrl, dataBuffer, sizeof(redirectUrl) - 1);
+        redirectUrl[sizeof(redirectUrl) - 1] = '\0';
+
+        {
+            char safeUrl[2048];
+            LogEscapePercent(redirectUrl, safeUrl, sizeof(safeUrl));
+            printFunction("Following redirect to: %s\n", safeUrl);
+        }
+
+        if (ioCachedRedirectUrl != NULL)
+            *ioCachedRedirectUrl = redirectUrl;
+
+        *dataBufferSize = bufSize;
+        status = FetchToBuffer(session, std::string(redirectUrl), combinedHeaders[0] ? combinedHeaders : NULL,
+                               dataBuffer, dataBufferSize, printFunction);
+    }
+
+    return status;
+}
+
+// The same, recording a refusal for ArchiveOrgKeysRejected. Only the final
+// answer counts: a failed attempt on the cached datanode is retried from
+// scratch inside, so it says nothing about the keys yet.
+static int HttpGetFollowRedirect(const std::string &url, char *dataBuffer, unsigned long long *dataBufferSize,
+                                 const char *extraHeaderLines, const char *authHeader,
+                                 void printFunction(const char *_format, ...),
+                                 std::string *ioCachedRedirectUrl = NULL,
+                                 HttpsSession *session = NULL)
+{
+    int status = HttpGetFollowRedirectRaw(url, dataBuffer, dataBufferSize, extraHeaderLines, authHeader,
+                                          printFunction, ioCachedRedirectUrl, session);
+    return NoteAuthStatus(status, authHeader);
+}
+
+// Lowercases and collapses every run of non-alphanumeric characters to a
+// single space, trimming leading/trailing space. Used so "Call of Duty 2:
+// Bonus Pack" and "Call.of.Duty.2.DLC.RF.X360-ZTM.rar" can be compared
+// word-for-word regardless of the punctuation scene-release names use.
+static void NormalizeForMatch(const char *in, char *out, size_t outSize)
+{
+    size_t o = 0;
+    bool lastWasSpace = true; // true so we never emit a leading space
+
+    for (size_t i = 0; in[i] != '\0' && o + 1 < outSize; ++i)
+    {
+        unsigned char c = (unsigned char)in[i];
+
+        if (isalnum(c))
+        {
+            out[o++] = (char)tolower(c);
+            lastWasSpace = false;
+        }
+        else if (!lastWasSpace)
+        {
+            out[o++] = ' ';
+            lastWasSpace = true;
+        }
+    }
+
+    while (o > 0 && out[o - 1] == ' ')
+        --o; // trim a trailing space left by the loop above
+
+    out[o] = '\0';
+}
+
+// Trims a trailing disc marker off an already-normalized query, in place.
+//
+// Multi-disc installs carry the disc in their STFS display name - real
+// examples from a live library are "Battlefield 3 Disc 2 of 2" and "Max Payne
+// 3 Disc 1 of 2" - but the DLC archive is named for the GAME, with no disc in
+// it at all. Left alone those titles don't merely score low, they score
+// themselves out of existence twice over: the unmatched words "disc", "of"
+// and two copies of the disc number drag the ratio down to 60, and then the
+// missing NUMBER trips the 40-point series penalty meant to keep "Halo 3" away
+// from "Halo 4". Final score 20 against a threshold of 50, so a game with
+// perfectly good DLC reports nothing found.
+//
+// Truncating at the marker rather than deleting individual words is
+// deliberate: everything after it is disc bookkeeping, never part of the
+// title.
+//
+// Two guards keep this from eating a legitimate name. The marker is only
+// honoured when something precedes it, so a title that opens with the word
+// never loses everything; and the following word must be a number, so
+// "disc" used as an ordinary noun is left alone.
+static void StripDiscSuffix(char *normalized)
+{
+    char *p = normalized;
+
+    while (*p != '\0')
+    {
+        char *wordStart = p;
+        while (*p != '\0' && *p != ' ')
+            ++p;
+
+        size_t wordLen = (size_t)(p - wordStart);
+
+        char *next = p;
+        while (*next == ' ')
+            ++next;
+
+        bool isDiscWord = (wordLen == 4 && strncmp(wordStart, "disc", 4) == 0) ||
+                          (wordLen == 2 && strncmp(wordStart, "cd", 2) == 0);
+
+        if (isDiscWord && wordStart != normalized && *next >= '0' && *next <= '9')
+        {
+            char *cut = wordStart;
+            while (cut > normalized && cut[-1] == ' ')
+                --cut;
+
+            *cut = '\0';
+            return;
+        }
+
+        p = next;
+    }
+}
+
+// Pulls the next space-delimited word out of a normalized string, advancing
+// the cursor. Returns false once there are none left.
+static bool NextWord(const char **cursor, char *out, size_t outSize)
+{
+    const char *p = *cursor;
+
+    while (*p == ' ')
+        ++p;
+
+    if (*p == '\0')
+    {
+        *cursor = p;
+        return false;
+    }
+
+    size_t o = 0;
+    while (*p != '\0' && *p != ' ')
+    {
+        if (o + 1 < outSize)
+            out[o++] = *p;
+        ++p; // keep advancing even past the buffer, so the cursor lands correctly
+    }
+
+    out[o] = '\0';
+    *cursor = p;
+    return true;
+}
+
+// True if word appears in haystack as a WHOLE word, not as a substring. Both
+// are already normalized to lowercase words separated by single spaces, so
+// the boundary test is just "space or end on each side". Substring matching
+// would be far too loose here - "war" would hit "warfare", "ops" would hit
+// "tops".
+static bool ContainsWholeWord(const char *haystack, const char *word)
+{
+    size_t wlen = strlen(word);
+    if (wlen == 0)
+        return false;
+
+    const char *p = haystack;
+    while ((p = strstr(p, word)) != NULL)
+    {
+        bool atStart = (p == haystack) || (p[-1] == ' ');
+        bool atEnd = (p[wlen] == '\0') || (p[wlen] == ' ');
+
+        if (atStart && atEnd)
+            return true;
+
+        ++p;
+    }
+
+    return false;
+}
+
+static bool IsNumericWord(const char *word)
+{
+    if (*word == '\0')
+        return false;
+
+    for (const char *p = word; *p != '\0'; ++p)
+    {
+        if (*p < '0' || *p > '9')
+            return false;
+    }
+
+    return true;
+}
+
+// Scores how well a candidate filename matches a game name, 0-100.
+//
+// This replaces a strict word-prefix match, which required the filename to
+// BEGIN with the game's words and so failed on two real cases from a live
+// library:
+//
+//   - Inserted words. "Halo: Combat Evolved Anniversary" against
+//     "Halo.1.Combat.Evolved.Anniversary.DLC.RF.X360-ZTM.rar" - the "1" the
+//     release group added breaks a prefix match at the second word, even
+//     though every word of the title is present.
+//   - Abbreviated install names. A package whose Display Name is
+//     "CoD: World at War" can never prefix-match
+//     "Call.of.Duty.World.at.War...", because "cod" isn't how the filename
+//     starts - or appears at all.
+//
+// So: score by how much of the query is present ANYWHERE in the candidate,
+// weighted by word length, and let the caller show a ranked list rather than
+// trying to be certain. Weighting by length is what keeps "at"/"of"/"the"
+// from carrying a match on their own while "anniversary" counts heavily.
+static int ScoreDlcMatch(const char *candidateNorm, const char *queryNorm)
+{
+    int totalWeight = 0;
+    int matchedWeight = 0;
+    bool numberMissing = false;
+
+    const char *cursor = queryNorm;
+    char word[128];
+
+    while (NextWord(&cursor, word, sizeof(word)))
+    {
+        int weight = (int)strlen(word);
+        totalWeight += weight;
+
+        if (ContainsWholeWord(candidateNorm, word))
+            matchedWeight += weight;
+        else if (IsNumericWord(word))
+            numberMissing = true;
+    }
+
+    if (totalWeight == 0)
+        return 0;
+
+    int score = (matchedWeight * 100) / totalWeight;
+
+    // A missing number is a much stronger signal than its one character of
+    // weight suggests: it's usually the difference between entries in a
+    // series. Without this, "Fallout 3" scores 87 against "Fallout New Vegas"
+    // purely on the strength of "fallout", and "Halo 3" scores 80 against
+    // "Halo 4".
+    if (numberMissing)
+        score -= 40;
+
+    return (score < 0) ? 0 : score;
+}
+
+// Below this, a candidate isn't offered at all. Deliberately permissive -
+// the user picks from a ranked list, so the cost of one extra plausible entry
+// is far lower than the cost of hiding the right one.
+#define DLC_MATCH_MIN_SCORE 50
+
+// ---------------------------------------------------------------------------
+// Auth
+// ---------------------------------------------------------------------------
+
+bool BuildIas3AuthHeader(const std::string &accessKey, const std::string &secretKey,
+                        char *outHeader, unsigned long long outHeaderSize)
+{
+    if (accessKey.empty() || secretKey.empty())
+        return false;
+
+    int written = _snprintf(outHeader, outHeaderSize, "Authorization: LOW %s:%s\r\n",
+                            accessKey.c_str(), secretKey.c_str());
+
+    // _snprintf (unlike snprintf) doesn't null-terminate on truncation, and
+    // returns -1 rather than the would-be length in that case.
+    if (written < 0 || (unsigned long long)written >= outHeaderSize)
+    {
+        outHeader[outHeaderSize - 1] = '\0';
+        return false;
+    }
+
+    return true;
+}
+
+// archive.org's S3 service, not archive.org itself. Its certificate chains to
+// the same Go Daddy Root G2 anchor TrustAnchors.h already carries (through a
+// "GoDaddy TLS Root CA - R1" cross-signed by G2), so no new anchor is needed.
+// Answers 200 with JSON either way; "authorized" is the verdict. Confirmed
+// with deliberately fake keys:
+//
+//   {"error": "The AWS Access Key Id you provided does not exist in our
+//    records.", "accesskey": "fakeaccess000000", "authorized": false}
+#define ARCHIVE_S3_CHECK_AUTH_URL "https://s3.us.archive.org/?check_auth=1"
+
+KeyCheckResult CheckArchiveOrgKeys(const char *authHeader, char *outReason, size_t outReasonSize,
+                                   void printFunction(const char *_format, ...))
+{
+    if (outReason != NULL && outReasonSize > 0)
+        outReason[0] = '\0';
+
+    if (authHeader == NULL || authHeader[0] == '\0')
+        return KEYS_REJECTED;
+
+    char buffer[4096];
+    unsigned long long bufferSize = sizeof(buffer) - 1;
+
+    // Raw: this reports its verdict through its own return value, and it
+    // runs on the UI thread - recording a refusal here could land in the
+    // middle of a download on the worker and make that download's failure
+    // look like refused keys. See the threading note in ArchiveOrgDLC.h.
+    int status = HttpGetFollowRedirectRaw(ARCHIVE_S3_CHECK_AUTH_URL, buffer, &bufferSize,
+                                          NULL, authHeader, printFunction);
+
+    // Anything but a 200 means no verdict was given - offline, a TLS failure,
+    // the service down. That is "couldn't check", never "wrong keys": telling
+    // someone their keys are bad because their network is would send them
+    // off to fix the wrong thing.
+    if (status != 200)
+    {
+        printFunction("Key check: no answer from archive.org (status %d)\n", status);
+        return KEYS_UNCHECKED;
+    }
+
+    buffer[bufferSize < sizeof(buffer) ? bufferSize : sizeof(buffer) - 1] = '\0';
+
+    cJSON *json = cJSON_Parse(buffer);
+    if (json == NULL)
+    {
+        printFunction("Key check: reply was not JSON\n");
+        return KEYS_UNCHECKED;
+    }
+
+    KeyCheckResult result = KEYS_UNCHECKED;
+
+    cJSON *authorized = cJSON_GetObjectItemCaseSensitive(json, "authorized");
+    if (cJSON_IsBool(authorized))
+    {
+        result = cJSON_IsTrue(authorized) ? KEYS_ACCEPTED : KEYS_REJECTED;
+
+        cJSON *error = cJSON_GetObjectItemCaseSensitive(json, "error");
+        if (result == KEYS_REJECTED && cJSON_IsString(error) && error->valuestring != NULL &&
+            outReason != NULL && outReasonSize > 0)
+        {
+            strncpy(outReason, error->valuestring, outReasonSize - 1);
+            outReason[outReasonSize - 1] = '\0';
+        }
+    }
+
+    cJSON_Delete(json);
+
+    printFunction("Key check: %s\n", result == KEYS_ACCEPTED ? "accepted"
+                                   : result == KEYS_REJECTED ? "rejected" : "no verdict in reply");
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// DLC lookup (metadata)
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Collection listings, kept for the session
+// ---------------------------------------------------------------------------
+//
+// Every search used to fetch its collection's whole metadata listing - the
+// same few hundred KB for every game, since a search is a match against all
+// of it - which made it most of the wait. The listings barely change, so
+// each is fetched the first time it's needed and kept until the app exits;
+// every search after the first only has to match.
+//
+// Only the searches use these, and they run on one thread (the search worker
+// in SearchWorker.cpp), so there's nothing to lock.
+
+struct ItemListing
+{
+    char *json; // NUL-terminated; NULL until fetched
+    unsigned long long size;
+};
+
+static ItemListing g_dlcListing = {NULL, 0};
+static ItemListing g_titleUpdateListing = {NULL, 0};
+
+// The listing's JSON text, fetching it if it isn't held yet. NULL if it
+// couldn't be fetched - and a failure isn't kept, so the next search tries
+// again rather than failing forever.
+//
+// bufferLimit bounds the response; the buffer is shrunk to fit afterwards.
+static const char *ItemListingJson(ItemListing &listing, const char *url, unsigned long long bufferLimit,
+                                   void printFunction(const char *_format, ...))
+{
+    if (listing.json != NULL)
+    {
+        printFunction("  Using the collection listing fetched earlier (%I64u bytes)\n", listing.size);
+        return listing.json;
+    }
+
+    char *buffer = (char *)malloc((size_t)bufferLimit);
+    if (buffer == NULL)
+    {
+        ERROR_LOG("malloc failed for metadata buffer");
+        return NULL;
+    }
+
+    unsigned long long bufferSize = bufferLimit - 1;
+
+    // Metadata is public - no keys needed or sent here.
+    int status = HttpGetFollowRedirect(url, buffer, &bufferSize, NULL, NULL, printFunction);
+
+    if (status != 200)
+    {
+        printFunction("ERROR: could not fetch archive.org metadata (status %d)\n", status);
+        free(buffer);
+        return NULL;
+    }
+
+    // The HTTP layer NUL-terminates the body; this just makes sure of it
+    // before the buffer is trimmed to the body's length.
+    buffer[bufferSize] = '\0';
+    char *trimmed = (char *)realloc(buffer, (size_t)bufferSize + 1);
+    if (trimmed != NULL)
+        buffer = trimmed;
+
+    listing.json = buffer;
+    listing.size = bufferSize;
+    return listing.json;
+}
+
+static void DropItemListing(ItemListing &listing)
+{
+    free(listing.json);
+    listing.json = NULL;
+    listing.size = 0;
+}
+
+int FindDlcRarFilenames(const std::string &gameName, DlcRarMatch *outMatches, int maxMatches,
+                        void printFunction(const char *_format, ...))
+{
+    // The listing for this item runs ~256KB; generous headroom.
+    const char *listing = ItemListingJson(g_dlcListing, ARCHIVE_METADATA_URL, 2 * 1024 * 1024, printFunction);
+    if (listing == NULL)
+        return -1;
+
+    cJSON *json = cJSON_Parse(listing);
+
+    if (json == NULL)
+    {
+        ERROR_LOG("failed to parse archive.org metadata JSON");
+        DropItemListing(g_dlcListing); // fetch it afresh next time rather than fail forever
+        return -1;
+    }
+
+    cJSON *files = cJSON_GetObjectItemCaseSensitive(json, "files");
+    if (!cJSON_IsArray(files))
+    {
+        ERROR_LOG("archive.org metadata had no files array");
+        cJSON_Delete(json);
+        return -1;
+    }
+
+    char normalizedQuery[512];
+    NormalizeForMatch(gameName.c_str(), normalizedQuery, sizeof(normalizedQuery));
+
+    // A multi-disc title carries its disc in the display name; the archive
+    // never does. See StripDiscSuffix.
+    size_t beforeStrip = strlen(normalizedQuery);
+    StripDiscSuffix(normalizedQuery);
+
+    if (strlen(normalizedQuery) != beforeStrip)
+        printFunction("  Matching on \"%s\" (disc marker trimmed from the title)\n", normalizedQuery);
+
+    int matchCount = 0;
+    cJSON *file;
+    cJSON_ArrayForEach(file, files)
+    {
+        cJSON *name = cJSON_GetObjectItemCaseSensitive(file, "name");
+        if (!cJSON_IsString(name) || name->valuestring == NULL)
+            continue;
+
+        // Only .rar entries are DLC packs in this collection; the item also
+        // lists its own metadata/derivative files we don't want to match.
+        size_t nameLen = strlen(name->valuestring);
+        if (nameLen < 4 || _stricmp(name->valuestring + nameLen - 4, ".rar") != 0)
+            continue;
+
+        char normalizedName[512];
+        NormalizeForMatch(name->valuestring, normalizedName, sizeof(normalizedName));
+
+        int score = ScoreDlcMatch(normalizedName, normalizedQuery);
+        if (score < DLC_MATCH_MIN_SCORE)
+            continue;
+
+        cJSON *size = cJSON_GetObjectItemCaseSensitive(file, "size");
+        unsigned long long fileSize = 0;
+        if (cJSON_IsString(size) && size->valuestring != NULL)
+        {
+            fileSize = _atoi64(size->valuestring);
+        }
+        else if (cJSON_IsNumber(size))
+        {
+            fileSize = (unsigned long long)size->valuedouble;
+        }
+
+        // Keep the BEST maxMatches, not the first maxMatches. The old code
+        // stopped at the first N in archive.org's own file order, which for a
+        // loose match could fill up with weak hits and drop the right one
+        // simply because it appeared later in the listing.
+        int slot = -1;
+
+        if (matchCount < maxMatches)
+        {
+            slot = matchCount++;
+        }
+        else
+        {
+            int worst = 0;
+            for (int i = 1; i < matchCount; ++i)
+            {
+                if (outMatches[i].score < outMatches[worst].score)
+                    worst = i;
+            }
+
+            if (score > outMatches[worst].score)
+                slot = worst;
+        }
+
+        if (slot < 0)
+            continue;
+
+        outMatches[slot].item[0] = '\0'; // this collection
+        strncpy(outMatches[slot].filename, name->valuestring, DLC_RAR_FILENAME_LEN - 1);
+        outMatches[slot].filename[DLC_RAR_FILENAME_LEN - 1] = '\0';
+        outMatches[slot].size = fileSize;
+        outMatches[slot].score = score;
+    }
+
+    cJSON_Delete(json);
+
+    // Best first. Insertion sort - matchCount is capped at 16, so anything
+    // cleverer would be noise.
+    for (int i = 1; i < matchCount; ++i)
+    {
+        DlcRarMatch key = outMatches[i];
+        int j = i - 1;
+
+        while (j >= 0 && outMatches[j].score < key.score)
+        {
+            outMatches[j + 1] = outMatches[j];
+            --j;
+        }
+
+        outMatches[j + 1] = key;
+    }
+
+    return matchCount;
+}
+
+// ---------------------------------------------------------------------------
+// RAR header walk (no decompression - see file header comment)
+// ---------------------------------------------------------------------------
+
+// Header parsing itself lives in RarHeaders.cpp, which handles both RAR4 and
+// RAR5 and is tested on a PC against archives made by rar.exe.
+
+// The pack's URL: its item, then its file name, percent-encoded - the DLC
+// collection's scene names need none, but Xbox Live Arcade's are plain names,
+// "Zuma's Revenge!.rar".
+static std::string PackUrl(const DlcRarMatch &pack)
+{
+    std::string url = ARCHIVE_DOWNLOAD_ROOT;
+    url += (pack.item[0] != '\0') ? pack.item : ARCHIVE_ITEM;
+    url += "/";
+
+    char encoded[DLC_RAR_FILENAME_LEN * 3 + 1];
+    if (UrlEncodeFormValue(pack.filename, encoded, sizeof(encoded)))
+        url += encoded;
+    else
+        url += pack.filename; // can't happen - the buffer fits the longest name
+    return url;
+}
+
+static bool IsHex8(const char *p)
+{
+    for (int i = 0; i < 8; ++i)
+    {
+        const char c = p[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f')))
+            return false;
+    }
+    return true;
+}
+
+// A member's path from its TitleID folder on - the part that mirrors the
+// console's Content folder - or NULL if it has no TitleID\ContentType pair
+// of folders. The DLC collection's paths start there; Xbox Live Arcade's have
+// the game's name in front: "Banjo Kazooie\58410954\000D0000\DA78...".
+static const char *ContentRelativePath(const char *internalPath)
+{
+    const char *segment = internalPath;
+    for (;;)
+    {
+        const bool isSep8 = IsHex8(segment) && (segment[8] == '\\' || segment[8] == '/');
+        if (isSep8 && IsHex8(segment + 9) && (segment[17] == '\\' || segment[17] == '/'))
+            return segment;
+
+        const char *next = strpbrk(segment, "\\/");
+        if (next == NULL)
+            return NULL;
+        segment = next + 1;
+    }
+}
+
+// Indie games are all content of one title, the Indie Games marketplace's,
+// as Marketplace Content. A few of archive.org's indie RARs leave those
+// folders out - Castle Miner Z's packages sit straight under its name - so a
+// package found loose in one of them belongs there. Packages are known by
+// their file name, the content ID: 42 hex digits for an indie game's.
+//
+// One RAR, "Castle Miner Z.rar", also holds a title update loose beside its
+// packages, tu32000100_00000000 - the only one in any of the indie items. It
+// is taken to be the Indie Games title's own update: without it, a console
+// offline from Xbox Live won't start an indie game ("you need to download
+// and apply the available update"). A lowercase "tu" update goes in its
+// title's 000B0000 folder, as DownloadTitleUpdate puts them.
+#define INDIE_ITEM_PREFIX   "XBOX_360_XBLIG"
+#define INDIE_CONTENT_PATH  "584E07D2\\00000002\\"
+#define INDIE_UPDATE_PATH   "584E07D2\\000B0000\\"
+
+// A loose file's name: the part after its last folder.
+static const char *LeafName(const char *path)
+{
+    const char *name = path;
+    for (const char *p = path; *p != '\0'; ++p)
+    {
+        if (*p == '\\' || *p == '/')
+            name = p + 1;
+    }
+    return name;
+}
+
+// "tu" then 8 hex digits, '_', 8 more: a title update's file name.
+static bool IsTitleUpdateName(const char *name)
+{
+    if (strlen(name) != 19 || (name[0] != 't' && name[0] != 'T') || (name[1] != 'u' && name[1] != 'U') ||
+        name[10] != '_')
+        return false;
+    for (int i = 2; i < 19; ++i)
+    {
+        if (i != 10 && !isxdigit((unsigned char)name[i]))
+            return false;
+    }
+    return true;
+}
+
+static bool IsLooseIndiePackage(const DlcRarMatch &pack, const char *internalPath)
+{
+    if (strncmp(pack.item, INDIE_ITEM_PREFIX, sizeof(INDIE_ITEM_PREFIX) - 1) != 0)
+        return false;
+    const char *name = internalPath;
+    for (const char *p = internalPath; *p != '\0'; ++p)
+    {
+        if (*p == '\\' || *p == '/')
+            name = p + 1;
+    }
+    if (strlen(name) != 42)
+        return false;
+    for (const char *p = name; *p != '\0'; ++p)
+    {
+        if (!isxdigit((unsigned char)*p))
+            return false;
+    }
+    return true;
+}
+
+// Where a member installs, under the content folder - its path from its
+// TitleID folder on, or for a loose indie package, the indie folder. False
+// if it's neither: a readme beside the packages.
+static bool MemberContentPath(const DlcRarMatch &pack, const char *internalPath, char *out, size_t outSize)
+{
+    const char *fromTitle = ContentRelativePath(internalPath);
+    if (fromTitle != NULL)
+    {
+        _snprintf(out, outSize, "%s", fromTitle);
+    }
+    else if (IsLooseIndiePackage(pack, internalPath))
+    {
+        const char *name = internalPath + strlen(internalPath) - 42;
+        _snprintf(out, outSize, "%s%s", INDIE_CONTENT_PATH, name);
+    }
+    else if (strncmp(pack.item, INDIE_ITEM_PREFIX, sizeof(INDIE_ITEM_PREFIX) - 1) == 0 &&
+             IsTitleUpdateName(LeafName(internalPath)))
+    {
+        _snprintf(out, outSize, "%s%s", INDIE_UPDATE_PATH, LeafName(internalPath));
+    }
+    else
+    {
+        return false;
+    }
+    out[outSize - 1] = '\0';
+    for (char *p = out; *p != '\0'; ++p)
+    {
+        if (*p == '/')
+            *p = '\\';
+    }
+    return true;
+}
+
+// Reads the content-type segment out of a member's internal path.
+//
+// Paths look like "53450848\00000002\CD97F6BE...", so this is the second
+// backslash-separated segment parsed as hex, after any folders in front of
+// the TitleID. Returns 0 when the path doesn't have that shape, which callers
+// treat as "unknown, keep it" rather than as a reason to discard something.
+static unsigned long MemberContentType(const char *internalPath)
+{
+    const char *relative = ContentRelativePath(internalPath);
+    if (relative != NULL)
+        internalPath = relative;
+    const char *firstSep = strchr(internalPath, '\\');
+    if (firstSep == NULL)
+        return 0;
+
+    const char *typeStart = firstSep + 1;
+    unsigned long value = 0;
+    int digits = 0;
+
+    for (const char *p = typeStart; *p != '\0' && *p != '\\'; ++p)
+    {
+        char c = *p;
+        unsigned long digit;
+
+        if (c >= '0' && c <= '9')       digit = (unsigned long)(c - '0');
+        else if (c >= 'A' && c <= 'F')  digit = (unsigned long)(c - 'A' + 10);
+        else if (c >= 'a' && c <= 'f')  digit = (unsigned long)(c - 'a' + 10);
+        else return 0; // not hex - this isn't the layout we expect
+
+        value = (value << 4) | digit;
+
+        if (++digits > 8)
+            return 0; // too long to be a content type
+    }
+
+    return (digits > 0) ? value : 0;
+}
+
+int ListDlcMembers(const DlcRarMatch &pack,
+                   DlcMember *outMembers, int maxMembers,
+                   const char *authHeader, void printFunction(const char *_format, ...),
+                   ListMembersProgressFn progressFn)
+{
+    g_keysRejected = false;
+
+    const unsigned long long archiveSize = pack.size;
+    std::string url = PackUrl(pack);
+
+    if (progressFn != NULL && !progressFn(0, archiveSize, 0, 0))
+        return -1; // cancelled
+
+    // Generous per-request chunk: real header fixed part is 32 bytes, and
+    // observed filenames are well under this; this is NOT the whole archive,
+    // just enough to read one header (RAR interleaves headers with each
+    // file's actual compressed data, so we can't read them all in one shot
+    // without downloading everything in between).
+    const unsigned long CHUNK_SIZE = 1024;
+    unsigned char chunk[CHUNK_SIZE];
+
+    unsigned long long pos = 0;
+    int count = 0;
+    int skippedAvatar = 0;
+    bool isFirstChunk = true;
+    RarFormat format = RAR_FORMAT_UNKNOWN; // known after the first chunk
+    unsigned long headLen = 0;             // see DlcMember::headLen
+
+    // Resolved once (on the first Range request below) and reused for every
+    // subsequent one against this same rarFilename, instead of re-resolving
+    // the same archive.org -> datanode redirect from scratch (a full extra
+    // TCP+TLS handshake) on every single small Range request while walking
+    // this file's headers - see the comment on HttpGetFollowRedirect.
+    std::string cachedDatanodeUrl;
+
+    // And the connection to that datanode is kept open across the whole walk
+    // rather than rebuilt for every header: the handshake was most of the time
+    // each of these requests took. Typically two connections for the entire
+    // walk - archive.org for the first redirect, then the datanode for every
+    // header after it.
+    //
+    // Closed by the guard on every way out of this function. If the session
+    // can't be opened, session is NULL and every request falls back to a
+    // connection of its own, which is how this worked before.
+    struct SessionGuard
+    {
+        HttpsSession *session;
+        ~SessionGuard() { HttpsSessionClose(session); }
+    } guard = { HttpsSessionOpen(printFunction) };
+
+    while (pos < archiveSize && count < maxMembers)
+    {
+        // Request exactly as many bytes as the buffer capacity we're about
+        // to pass below (CHUNK_SIZE - 1, one byte held back so
+        // DumpResponse's success-path null terminator - outputBuffer[
+        // totalWritten] = '\0' - never writes at chunk[CHUNK_SIZE]). This
+        // used to request CHUNK_SIZE (1024) bytes from the server while
+        // only telling the download function it had 1023 bytes of room -
+        // harmless against every server tried so far (a 401, or one that
+        // ignored Range and got rejected some other way first), but the
+        // first datanode that actually honored the Range request exactly as
+        // asked (returning the full 1024 bytes, status 206) tripped our own
+        // "Output Buffer Exhausted" check on its own correct response,
+        // which discarded the real data yet still returned 206 - misleading
+        // ListDlcMembers into parsing an untouched, stale/garbage chunk
+        // buffer as if it were real RAR header bytes ("file does not look
+        // like a RAR4 archive").
+        unsigned long long chunkLen = CHUNK_SIZE - 1;
+        unsigned long long endPos = pos + chunkLen - 1;
+        if (endPos >= archiveSize)
+            endPos = archiveSize - 1;
+
+        char rangeHeader[64];
+        _snprintf(rangeHeader, sizeof(rangeHeader), "Range: bytes=%I64u-%I64u\r\n", pos, endPos);
+
+        int status = HttpGetFollowRedirect(url, (char *)chunk, &chunkLen, rangeHeader, authHeader, printFunction,
+                                           &cachedDatanodeUrl, guard.session);
+
+        if (status != 206 && status != 200)
+        {
+            printFunction("ERROR: range request for RAR header failed (status %d) at offset %I64u\n", status, pos);
+            return -1;
+        }
+
+        // The first chunk starts with the archive signature, which says which
+        // of the two RAR formats this is (see RarHeaders.h); the first header
+        // follows it. Every later chunk starts exactly on a header.
+        unsigned long headerStart = 0;
+
+        if (isFirstChunk)
+        {
+            format = RarDetectFormat(chunk, (unsigned long)chunkLen, &headerStart);
+
+            if (format == RAR_FORMAT_UNKNOWN)
+            {
+                // Say what it actually is. "Not a RAR" alone can't tell a RAR
+                // variant this doesn't know from an error page served in the
+                // file's place, and those need very different fixes.
+                char hex[3 * 16 + 1] = "";
+                for (unsigned long i = 0; i < 16 && i < chunkLen; ++i)
+                    _snprintf(hex + i * 3, 4, "%02X ", chunk[i]);
+                hex[sizeof(hex) - 1] = '\0';
+                printFunction("ERROR: not a RAR archive (status %d, %I64u bytes); starts: %s\n",
+                              status, chunkLen, hex);
+                return -1;
+            }
+
+            printFunction("RAR%d archive\n", format == RAR_FORMAT_5 ? 5 : 4);
+            isFirstChunk = false;
+        }
+
+        RarEntry entry;
+        unsigned long long nextPos = 0;
+        int parseResult = RarParseHeader(format, chunk + headerStart, (unsigned long)chunkLen - headerStart,
+                                         &entry, &nextPos);
+
+        if (parseResult == RAR_HEADER_END)
+            break;
+
+        if (parseResult == RAR_HEADER_ENCRYPTED)
+        {
+            ERROR_LOG("this archive's headers are encrypted - its contents can't be listed");
+            return -1;
+        }
+
+        if (parseResult == RAR_HEADER_NEED_MORE)
+        {
+            // A header longer than the chunk. Not seen in practice: the
+            // longest headers here are a path of ~60 characters plus a few
+            // small extra records, well inside a kilobyte.
+            printFunction("Header didn't fit in %lu bytes at offset %I64u, this file/path may be unusually large\n", CHUNK_SIZE, pos);
+            return -1;
+        }
+
+        if (parseResult != RAR_HEADER_OK || nextPos == 0)
+        {
+            printFunction("ERROR: unreadable RAR%d header at offset %I64u\n", format == RAR_FORMAT_5 ? 5 : 4, pos);
+            return -1;
+        }
+
+        nextPos += headerStart; // measured from the chunk's start, signature included
+
+        // The first header is the main archive header, and everything up to
+        // its end is what an unpacked member's download needs ahead of it.
+        if (headLen == 0)
+            headLen = (unsigned long)(pos + nextPos);
+
+        // FATX can't hold a file of 4GB or more, so a member that size could
+        // never be installed - and DlcMember's sizes are 32-bit. Log it and
+        // leave it out rather than truncate its size.
+        bool isFileEntry = entry.isFile;
+        if (isFileEntry && (entry.unpSize > 0xFFFFFFFFULL || entry.packSize > 0xFFFFFFFFULL))
+        {
+            printFunction("  Skipping member too large for the console's file system: %s\n", entry.name);
+            isFileEntry = false;
+        }
+
+        DlcMember member;
+        if (isFileEntry)
+        {
+            memcpy(member.internalPath, entry.name, sizeof(member.internalPath) - 1);
+            member.internalPath[sizeof(member.internalPath) - 1] = '\0';
+            member.packSize = (unsigned long)entry.packSize;
+            member.unpSize = (unsigned long)entry.unpSize;
+            member.stored = entry.stored && !entry.encrypted && !entry.split && entry.packSize == entry.unpSize;
+            member.dataStart = pos + headerStart + entry.dataOffset;
+            member.canUnpack = !entry.encrypted && !entry.split;
+            member.solid = entry.solid;
+            member.headerStart = pos + headerStart;
+            member.dataEnd = member.dataStart + entry.packSize;
+            member.headLen = headLen;
+        }
+
+        // A file outside any TitleID\ContentType folders - a readme beside
+        // the packages - isn't content, and has nowhere to go on the console.
+        if (isFileEntry && !MemberContentPath(pack, member.internalPath, member.contentPath, sizeof(member.contentPath)))
+        {
+            printFunction("  Skipping a file outside the content folders: %s\n", member.internalPath);
+            isFileEntry = false;
+        }
+
+        if (isFileEntry && count < maxMembers)
+        {
+            unsigned long memberType = MemberContentType(member.contentPath);
+
+            if (memberType == STFS_CONTENT_AVATAR_ITEM)
+            {
+                // Avatar items, not game content. Confirmed against a real
+                // pack: Sonic Generations' DLC archive holds twelve members,
+                // and eleven of them are avatar items under 00009000 - so
+                // without this, nearly all of a download is clothing for an
+                // avatar rather than the DLC someone actually asked for.
+                skippedAvatar++;
+            }
+            else if (memberType != STFS_CONTENT_MARKETPLACE && memberType != 0)
+            {
+                // Something neither DLC nor avatar data. Kept rather than
+                // dropped - only one pack has been examined closely, and
+                // silently discarding a content type we simply haven't seen
+                // yet is a worse failure than downloading one extra file.
+                // The log line is how we find out what else is out there.
+                printFunction("  Note: member has content type %08lX (not marketplace content), keeping it anyway: %s\n",
+                              memberType, member.internalPath);
+                outMembers[count] = member;
+                count++;
+            }
+            else
+            {
+                outMembers[count] = member;
+                count++;
+            }
+        }
+
+        // nextPos is a delta from the start of the chunk we just parsed
+        // (i.e. from `pos` as it was for this iteration), not an absolute
+        // archive offset - see RarParseHeader. This used
+        // to be `pos = nextPos;`, which only ever happened to work for the
+        // very first header (where pos was already 0), and silently
+        // "teleported" pos to essentially arbitrary values on every header
+        // after that - explaining why a 2.3GB archive with many real DLC
+        // files inside only ever turned up a single (and not even
+        // necessarily correct) member.
+        pos = pos + nextPos;
+
+        if (progressFn != NULL && !progressFn(pos < archiveSize ? pos : archiveSize, archiveSize, count, skippedAvatar))
+        {
+            printFunction("  Reading the file list was cancelled\n");
+            return -1;
+        }
+    }
+
+    if (skippedAvatar > 0)
+        printFunction("  Skipped %d avatar item(s); %d file(s) to install\n", skippedAvatar, count);
+
+    return count;
+}
+
+// ---------------------------------------------------------------------------
+// Fetch one member (already-extracted by archive.org server-side) and write
+// it straight into the console's content folder.
+// ---------------------------------------------------------------------------
+
+// Where a member lands on disk.
+//
+// The RAR's own internal path mirrors the console's layout
+// ({TitleID}\{ContentType}\{ContentID}) from its TitleID folder on, so the
+// destination is that part of it under the content root - any folders in
+// front of it, like an arcade game's name, are left out. Shared by the download and the "is it already
+// there?" check so the two can never disagree about where a file belongs -
+// which is exactly the kind of drift that makes an install check quietly
+// useless.
+static std::string DlcMemberDestination(const DlcMember &member, const std::string &contentBasePath)
+{
+    std::string relativePath = member.contentPath; // see MemberContentPath
+
+    // A no-op for every archive seen so far - these store '\\' already - but
+    // harmless insurance against a differently-packaged one.
+    for (size_t i = 0; i < relativePath.size(); ++i)
+    {
+        if (relativePath[i] == '/')
+            relativePath[i] = '\\';
+    }
+
+    return contentBasePath + "\\" + relativePath;
+}
+
+bool DlcMemberIsInstalled(const DlcMember &member, const std::string &contentBasePath)
+{
+    std::string destPath = DlcMemberDestination(member, contentBasePath);
+
+    FILE *f = fopen(destPath.c_str(), "rb");
+    if (f == NULL)
+        return false;
+
+    fseek(f, 0, SEEK_END);
+    long onDisk = ftell(f);
+    fclose(f);
+
+    if (onDisk < 0)
+        return false;
+
+    // Size has to match, not just existence. A download cancelled partway
+    // through (B, confirmed, stops it mid-transfer) can leave a
+    // short file behind, and treating that as installed would skip it forever
+    // while the game stayed broken. unpSize is the real uncompressed size
+    // straight from the RAR header, so this is a genuine check rather than a
+    // guess.
+    return ((unsigned long)onDisk == member.unpSize);
+}
+
+// ---------------------------------------------------------------------------
+// Downloading into place
+// ---------------------------------------------------------------------------
+
+// Measured the same way DlcMemberIsInstalled does - fopen and seek to the end -
+// because that is the method proven on the console, and this size decides
+// whether a file gets deleted. GetFileAttributesExA was used here first and
+// reported a 1-byte size for a file the download had left at well over a
+// megabyte; whatever the cause, it isn't worth trusting for that decision.
+static bool FileSizeOnDisk(const char *path, unsigned long long *outSize)
+{
+    FILE *f = fopen(path, "rb");
+    if (f == NULL)
+        return false;
+
+    bool ok = (_fseeki64(f, 0, SEEK_END) == 0);
+    __int64 size = ok ? _ftelli64(f) : -1;
+    fclose(f);
+
+    if (size < 0)
+        return false;
+    *outSize = (unsigned long long)size;
+    return true;
+}
+
+// See ArchiveOrgDiskFull. Set by DownloadUrlToFile.
+static bool g_diskFull = false;
+static unsigned long long g_diskNeeded = 0;
+static unsigned long long g_diskFree = 0;
+
+bool DriveFreeSpace(const std::string &path, unsigned long long *outFree)
+{
+    size_t colon = path.find(':');
+    if (colon == std::string::npos)
+        return false;
+
+    std::string root = path.substr(0, colon + 1) + "\\";
+    ULARGE_INTEGER freeToCaller;
+    if (!GetDiskFreeSpaceExA(root.c_str(), &freeToCaller, NULL, NULL))
+        return false;
+
+    *outFree = freeToCaller.QuadPart;
+    return true;
+}
+
+bool ArchiveOrgDiskFull(unsigned long long *outNeeded, unsigned long long *outFree)
+{
+    if (outNeeded != NULL) *outNeeded = g_diskNeeded;
+    if (outFree != NULL) *outFree = g_diskFree;
+    return g_diskFull;
+}
+
+// A little room beyond the file itself: FATX allocates whole clusters, so a
+// file takes slightly more than its size, and filling a drive to the last
+// byte is asking for trouble with everything else on it.
+#define DISK_SPACE_MARGIN (4ULL * 1024 * 1024)
+
+// Where a download in progress is written before being moved into place.
+//
+// Not "<name>.partial" beside the real file, which is what this first did:
+// FATX limits a file name to 42 characters, and a DLC package's name is its
+// content ID - exactly 42 - so that name couldn't be created at all
+// (confirmed on hardware: every attempt failed to open the file). Instead the
+// file keeps its real name, in a staging folder at the root of the same drive.
+// A move within one drive is a rename, so putting it into place is still a
+// single step, and nothing half-written ever sits in a content folder.
+#define STAGING_FOLDER "Omni360-partial"
+
+static std::string StagingPathFor(const std::string &destPath)
+{
+    size_t colon = destPath.find(':');
+    size_t lastSep = destPath.find_last_of('\\');
+    if (colon == std::string::npos || lastSep == std::string::npos || lastSep < colon)
+        return "";
+
+    std::string folder = destPath.substr(0, colon + 1) + "\\" STAGING_FOLDER;
+    CreateDirectoryA(folder.c_str(), NULL); // fine if it already exists
+
+    return folder + "\\" + destPath.substr(lastSep + 1);
+}
+
+// Makes every folder in dirPath, one level at a time - the XDK's
+// CreateDirectory won't make parents. It starts from the drive, not from the
+// content folder: a drive that has never had content installed on it has no
+// Content\0000000000000000 to start under, and without this the download
+// finishes and then fails to move into place with error 3 (path not found).
+static void CreateDirectoryTree(const std::string &dirPath)
+{
+    size_t at = dirPath.find('\\');
+
+    while (at != std::string::npos)
+    {
+        CreateDirectoryA(dirPath.substr(0, at).c_str(), NULL); // ok if it already exists
+        at = dirPath.find('\\', at + 1);
+    }
+
+    CreateDirectoryA(dirPath.c_str(), NULL);
+}
+
+// Moves a finished staging copy over destPath, replacing any older copy in
+// one step.
+static bool MoveIntoPlace(const std::string &tempPath, const std::string &destPath,
+                          void printFunction(const char *_format, ...))
+{
+    if (MoveFileExA(tempPath.c_str(), destPath.c_str(), MOVEFILE_REPLACE_EXISTING))
+        return true;
+
+    // If the replacing form isn't honoured, fall back to delete-then-move.
+    DeleteFileA(destPath.c_str());
+    if (MoveFileA(tempPath.c_str(), destPath.c_str()))
+        return true;
+
+    // The download itself is complete and correct - kept, not deleted, so a
+    // full-size file isn't thrown away over a rename.
+    printFunction("ERROR: downloaded, but could not move it into place (error %lu).\n", GetLastError());
+    printFunction("       The complete file is at %s\n", tempPath.c_str());
+    return false;
+}
+
+// Downloads url to destPath without ever leaving an incomplete file under
+// destPath's own name.
+//
+// The body goes to a staging copy (see StagingPathFor) and is moved into place
+// only once it has arrived whole and at the expected size. Writing straight to destPath,
+// as this used to, meant any download that failed partway - a dropped
+// connection, a server error mid-stream, the console switched off - left a
+// short file exactly where a real one belongs. The game list's "DLC INSTALLED"
+// marker takes a file there as proof the content is installed, so it went on
+// claiming a download had worked when it hadn't; and a dashboard scanning the
+// folder would have found a truncated package.
+//
+// A failure mid-transfer is retried, twice, from the start: a stream breaking
+// partway is usually transient on archive.org's side. Refusals (401/403) and
+// missing files (404) are not retried - another attempt gets the same answer.
+//
+// expectedSize is the size the file must end up, or 0 if unknown. Returns the
+// final HTTP status, as httpRequestHTTPS does.
+static int DownloadUrlToFile(const std::string &url, const std::string &destPath, const char *authHeader,
+                             unsigned long long expectedSize,
+                             void printFunction(const char *_format, ...), DownloadProgressFn progressFn)
+{
+    const std::string tempPath = StagingPathFor(destPath);
+    if (tempPath.empty())
+    {
+        printFunction("ERROR: no drive in destination path: %s\n", destPath.c_str());
+        return -1;
+    }
+
+    const int MAX_ATTEMPTS = 3;
+    int httpStatus = 0;
+
+    g_diskFull = false;
+    g_diskNeeded = expectedSize;
+    g_diskFree = 0;
+
+    // Refused before a byte is fetched if it can't fit. Only a known free
+    // space counts against it - if the drive can't report one, go ahead.
+    unsigned long long freeSpace = 0;
+    if (expectedSize > 0 && DriveFreeSpace(destPath, &freeSpace) &&
+        freeSpace < expectedSize + DISK_SPACE_MARGIN)
+    {
+        printFunction("ERROR: not enough space - needs %I64u bytes, the drive has %I64u free\n",
+                      expectedSize, freeSpace);
+        g_diskFull = true;
+        g_diskFree = freeSpace;
+        return -2;
+    }
+
+    for (int attempt = 1; attempt <= MAX_ATTEMPTS; ++attempt)
+    {
+        if (attempt > 1)
+        {
+            printFunction("  Retrying (attempt %d of %d)\n", attempt, MAX_ATTEMPTS);
+            Sleep(2000);
+        }
+
+        httpStatus = httpRequestHTTPS(url, HTTP_GET, NULL, authHeader,
+                                      tempPath, NULL, NULL, true,
+                                      NULL, 0, printFunction, expectedSize, progressFn);
+
+        if (httpStatus == 302)
+        {
+            // File-mode requests don't follow redirects: httpRequestHTTPS writes
+            // the redirect URL into the file as a throwaway line and hands back
+            // 302. Re-resolve it through a small buffer-mode request rather than
+            // reading it back out of the file, then fetch the real body - which
+            // reopens the file "wb" and overwrites that line.
+            char redirectBuffer[2048] = "";
+            unsigned long long redirectSize = sizeof(redirectBuffer) - 1;
+            httpRequestHTTPS(url, HTTP_GET, NULL, authHeader, "",
+                             redirectBuffer, &redirectSize, false, NULL, 0, printFunction);
+
+            // progressFn goes on the real body fetch only - the redirect
+            // resolution above is a couple of KB of header, and reporting it
+            // would briefly drive the progress bar with unrelated numbers.
+            httpStatus = httpRequestHTTPS(std::string(redirectBuffer), HTTP_GET, NULL,
+                                          authHeader, tempPath,
+                                          NULL, NULL, true, NULL, 0, printFunction, expectedSize, progressFn);
+        }
+
+        NoteAuthStatus(httpStatus, authHeader);
+
+        if (httpStatus == 200 || httpStatus == 206)
+        {
+            // DumpResponse checks the size against what the server declared;
+            // this checks it against what the archive says it should be, which
+            // also covers a response that declared no size at all.
+            unsigned long long onDisk = 0;
+            if (expectedSize == 0 || (FileSizeOnDisk(tempPath.c_str(), &onDisk) && onDisk == expectedSize))
+                break;
+
+            printFunction("  Downloaded %I64u of %I64u bytes - incomplete\n", onDisk, expectedSize);
+            httpStatus = -1;
+        }
+
+        // A cancel is the caller asking to stop - trying again would ignore it.
+        if (httpStatus == 401 || httpStatus == 403 || httpStatus == 404 || httpStatus == HTTP_STATUS_CANCELLED)
+            break;
+
+        // Ran out of space mid-transfer - something else filled the drive, or
+        // the up-front check couldn't be made. Retrying just fills it again.
+        // The staging file is about to be rewritten, so its space counts as
+        // available.
+        unsigned long long staged = 0;
+        FileSizeOnDisk(tempPath.c_str(), &staged);
+        if (expectedSize > 0 && DriveFreeSpace(destPath, &freeSpace) &&
+            freeSpace + staged < expectedSize + DISK_SPACE_MARGIN)
+        {
+            printFunction("ERROR: the drive filled up during the download\n");
+            g_diskFull = true;
+            g_diskFree = freeSpace + staged;
+            break;
+        }
+    }
+
+    if (httpStatus != 200 && httpStatus != 206)
+    {
+        DeleteFileA(tempPath.c_str());
+        return httpStatus;
+    }
+
+    return MoveIntoPlace(tempPath, destPath, printFunction) ? httpStatus : -1;
+}
+
+// The most archive.org's RAR extraction (view_archive.php) sends to a console.
+// It unpacks far faster than a console reads, the server in front of it
+// buffers at most 1 GiB of the difference, and the extraction then sits idle
+// until it times out and the response ends - cleanly, a few MB past 1 GiB.
+// Measured on Lego Rock Band's 1.37 GB DLC package: all of it in 55 s at PC
+// speed; at 3 MB/s it ended at 1,084,590,394 bytes, the same place the
+// console's three attempts did at 1.1 MB/s and at 411 KB/s. The extraction
+// ignores Range, so there is no picking it back up, and a retry hits the same
+// wall. A file within this always arrives whole.
+#define EXTRACTED_SIZE_LIMIT (1024ULL * 1024 * 1024)
+
+// See ArchiveOrgDlcTooLarge. Set by DownloadDlcMember.
+static bool g_tooLarge = false;
+
+bool ArchiveOrgDlcTooLarge()
+{
+    return g_tooLarge;
+}
+
+// A resumed download reports progress for the range it asked for. This adds
+// back what was already on disk, so the bar carries on from where it was
+// instead of starting over. Module state rather than a closure, for the same
+// one-thread reason as g_diskFull - see ArchiveOrgDiskFull.
+static DownloadProgressFn g_resumeProgressFn = NULL;
+static unsigned long long g_resumeBase = 0;
+static unsigned long long g_resumeTotal = 0;
+
+static bool ResumedProgress(unsigned long long bytesDone, unsigned long long bytesTotal,
+                            unsigned long long bytesPerSec, unsigned long long secondsRemaining)
+{
+    return g_resumeProgressFn(g_resumeBase + bytesDone, g_resumeTotal, bytesPerSec, secondsRemaining);
+}
+
+// Downloads bytes [from, from + length) of the RAR into tempPath. The RAR is
+// served as a plain file and so honours Range: each attempt asks only for
+// what tempPath doesn't have yet and adds it to the end. A connection that
+// drops at 80% costs the last few MB, not the whole file.
+//
+// tempPath is kept when this gives up, so the next try - even from a new
+// queue job - carries on from it. Its name is the package's content ID, so a
+// file there can only be an earlier piece of this same member.
+//
+// alsoNeeds is space wanted on top of the range itself (the unpacked file,
+// when the range is compressed data). Progress is reported against
+// reportTotal, with the range as its first `length` bytes. Returns 206 once
+// tempPath holds the whole range, or the status that stopped it.
+static int DownloadRarRange(const std::string &rarUrl, unsigned long long from, unsigned long long length,
+                            const std::string &tempPath, const std::string &destPath, unsigned long long alsoNeeds,
+                            const char *authHeader, void printFunction(const char *_format, ...),
+                            DownloadProgressFn progressFn, unsigned long long reportTotal)
+{
+    unsigned long long staged = 0;
+    if (FileSizeOnDisk(tempPath.c_str(), &staged) && staged > length)
+    {
+        printFunction("  The staged copy is larger than the download (%I64u of %I64u bytes) - starting over\n", staged, length);
+        DeleteFileA(tempPath.c_str());
+        staged = 0;
+    }
+    else if (staged > 0)
+    {
+        printFunction("  Picking up an earlier download at %I64u of %I64u bytes\n", staged, length);
+    }
+
+    g_diskFull = false;
+    g_diskNeeded = length + alsoNeeds;
+    g_diskFree = 0;
+
+    unsigned long long freeSpace = 0;
+    if (DriveFreeSpace(destPath, &freeSpace) && freeSpace + staged < length + alsoNeeds + DISK_SPACE_MARGIN)
+    {
+        printFunction("ERROR: not enough space - needs %I64u more bytes, the drive has %I64u free\n",
+                      length + alsoNeeds - staged, freeSpace);
+        g_diskFull = true;
+        g_diskFree = freeSpace + staged;
+        return -2;
+    }
+
+    // Attempts in a row that got nothing. One that moves the file on starts
+    // the count again, so a download that keeps dropping but keeps moving
+    // isn't given up on; MAX_TOTAL stops one that never ends.
+    const int MAX_FRUITLESS = 3;
+    const int MAX_TOTAL = 30;
+    int fruitless = 0;
+    int httpStatus = 206;
+
+    for (int attempt = 1; staged < length && attempt <= MAX_TOTAL && fruitless < MAX_FRUITLESS; ++attempt)
+    {
+        if (attempt > 1)
+        {
+            printFunction("  Resuming at %I64u of %I64u bytes (attempt %d)\n", staged, length, attempt);
+            Sleep(2000);
+        }
+
+        // archive.org's /download/ URL redirects to a storage server, and a
+        // redirect followed in file mode would be written into the file. So
+        // resolve it first with a one-byte request, then append from there.
+        std::string fileUrl = rarUrl;
+        {
+            char redirect[2048] = "";
+            unsigned long long redirectLen = sizeof(redirect) - 1;
+            char headers[IAS3_AUTH_HEADER_MAX + 64];
+            _snprintf(headers, sizeof(headers), "%sRange: bytes=0-0\r\n", authHeader != NULL ? authHeader : "");
+            headers[sizeof(headers) - 1] = '\0';
+            int status = httpRequestHTTPS(rarUrl, HTTP_GET, NULL, headers, "", redirect, &redirectLen, false,
+                                          NULL, 0, printFunction);
+            NoteAuthStatus(status, authHeader);
+            if (status == 302)
+                fileUrl = redirect;
+            else if (status != 206 && status != 200)
+            {
+                httpStatus = status;
+                if (status == 401 || status == 403 || status == 404)
+                    break;
+                fruitless++;
+                continue;
+            }
+        }
+
+        char headers[IAS3_AUTH_HEADER_MAX + 96];
+        _snprintf(headers, sizeof(headers), "%sRange: bytes=%I64u-%I64u\r\n", authHeader != NULL ? authHeader : "",
+                  from + staged, from + length - 1);
+        headers[sizeof(headers) - 1] = '\0';
+
+        g_resumeProgressFn = progressFn;
+        g_resumeBase = staged;
+        g_resumeTotal = reportTotal;
+
+        httpStatus = httpRequestHTTPS(fileUrl, HTTP_GET, NULL, headers, tempPath, NULL, NULL, true,
+                                      NULL, 0, printFunction, length - staged,
+                                      progressFn != NULL ? ResumedProgress : NULL, true);
+        NoteAuthStatus(httpStatus, authHeader);
+
+        unsigned long long before = staged;
+        staged = 0;
+        FileSizeOnDisk(tempPath.c_str(), &staged);
+
+        if (httpStatus == HTTP_STATUS_CANCELLED || httpStatus == 401 || httpStatus == 403 || httpStatus == 404)
+            break;
+
+        if (staged > length)
+        {
+            // Can't happen with a 206 for the range asked; if it somehow does,
+            // the copy is no good.
+            printFunction("ERROR: the staged copy overran the download (%I64u of %I64u bytes)\n", staged, length);
+            DeleteFileA(tempPath.c_str());
+            return -1;
+        }
+
+        if (staged > before)
+            fruitless = 0;
+        else
+            fruitless++;
+
+        if (DriveFreeSpace(destPath, &freeSpace) && staged < length &&
+            freeSpace < (length - staged) + alsoNeeds + DISK_SPACE_MARGIN)
+        {
+            printFunction("ERROR: the drive filled up during the download\n");
+            g_diskFull = true;
+            g_diskFree = freeSpace + staged;
+            break;
+        }
+    }
+
+    g_resumeProgressFn = NULL;
+
+    if (staged != length)
+    {
+        printFunction("  Stopped at %I64u of %I64u bytes - kept, the next try carries on from there\n", staged, length);
+        return (httpStatus == 200 || httpStatus == 206) ? -1 : httpStatus;
+    }
+
+    return 206;
+}
+
+// A stored member's bytes are the file, so the range is the file.
+static int DownloadStoredMember(const std::string &rarUrl, const DlcMember &member, const std::string &destPath,
+                                const char *authHeader, void printFunction(const char *_format, ...),
+                                DownloadProgressFn progressFn)
+{
+    const std::string tempPath = StagingPathFor(destPath);
+    if (tempPath.empty())
+    {
+        printFunction("ERROR: no drive in destination path: %s\n", destPath.c_str());
+        return -1;
+    }
+
+    int status = DownloadRarRange(rarUrl, member.dataStart, member.unpSize, tempPath, destPath, 0,
+                                  authHeader, printFunction, progressFn, member.unpSize);
+    if (status != 206)
+        return status;
+
+    return MoveIntoPlace(tempPath, destPath, printFunction) ? 206 : -1;
+}
+
+// Where a compressed member's download waits to be unpacked: a folder of its
+// own inside the staging folder, since the unpacked copy uses the same name.
+static std::string PackedPathFor(const std::string &destPath)
+{
+    std::string staged = StagingPathFor(destPath);
+    size_t lastSep = staged.find_last_of('\\');
+    if (staged.empty() || lastSep == std::string::npos)
+        return "";
+
+    std::string folder = staged.substr(0, lastSep) + "\\packed";
+    CreateDirectoryA(folder.c_str(), NULL); // fine if it already exists
+    return folder + staged.substr(lastSep);
+}
+
+// ---------------------------------------------------------------------------
+// Unpacking on the console, while it downloads
+// ---------------------------------------------------------------------------
+//
+// A compressed member is unpacked here - see RarUnpack.h. Its compressed bytes
+// are downloaded as a range of the RAR (resumable, like a stored member), and
+// the start of the RAR is fetched to go in front of them. A solid member needs
+// every member before it as well, so its range starts after that head.
+//
+// The unpacking runs on a thread of its own from the start, reading the
+// download as it lands (RarUnpackFeed), while the download carries on on the
+// calling thread as it always has. On a console the two go at about the same
+// speed - Lego Rock Band's 1.37 GB package took 7:47 to download and 8:57 to
+// unpack one after the other, and 7:26 for both together.
+
+// For one dmc_unrar can't do, for the caller to try archive.org's extraction.
+#define UNPACK_UNSUPPORTED (-4)
+#define MAX_HEAD_LEN (64 * 1024)
+
+bool DlcMemberUnpackedHere(const DlcMember &member)
+{
+    return !member.stored && member.canUnpack;
+}
+
+static unsigned long long PackedRangeStart(const DlcMember &member)
+{
+    return member.solid ? member.headLen : member.headerStart;
+}
+
+unsigned long long DlcMemberDownloadSize(const DlcMember &member)
+{
+    return DlcMemberUnpackedHere(member) ? member.dataEnd - PackedRangeStart(member) : member.unpSize;
+}
+
+static DWORD g_unpackStart = 0;
+
+struct OverlapUnpack
+{
+    const unsigned char *head;
+    unsigned long headLen;
+    std::string packedPath;
+    std::string tempPath;
+    const char *memberName;
+    RarUnpackFeed feed;
+    RarUnpackResult result;
+    volatile long finished; // the unpacking thread is done, `result` says how
+    void (*printFunction)(const char *_format, ...);
+};
+
+// One overlapped unpack at a time - the download worker's - so module state,
+// like g_resumeProgressFn.
+static OverlapUnpack *g_overlap = NULL;
+static DownloadProgressFn g_overlapProgressFn = NULL;
+static unsigned long long g_overlapLogged = 0;
+
+// The unpacking thread's progress. While the download runs, the Queue shows
+// the download, so this only logs now and then. Once it's done, this takes
+// over the bar for whatever unpacking is left.
+static bool OverlapUnpackProgress(unsigned long long written, unsigned long long total)
+{
+    const long state = InterlockedCompareExchange(&g_overlap->feed.state, 0, 0);
+    if (state == RAR_FEED_STOPPED)
+        return false;
+
+    if (written >= g_overlapLogged + 64ULL * 1024 * 1024 || written == total)
+    {
+        DWORD elapsed = GetTickCount() - g_unpackStart;
+        g_overlap->printFunction("  [unpack] %I64u of %I64u MB, %I64u KB/s\n", written / (1024 * 1024),
+                                 total / (1024 * 1024), elapsed > 0 ? written / elapsed : 0);
+        g_overlapLogged = written;
+    }
+
+    if (state == RAR_FEED_COMPLETE && g_overlapProgressFn != NULL)
+    {
+        DWORD elapsed = GetTickCount() - g_unpackStart;
+        unsigned long long speed = elapsed > 0 ? written * 1000 / elapsed : 0;
+        unsigned long long remaining = (speed > 0 && total > written) ? (total - written) / speed : 0;
+        return g_overlapProgressFn(written, total, speed, remaining);
+    }
+    return true;
+}
+
+// The download's progress: passed on, unless the unpacking has already
+// failed - then the rest of the download is no use, so it stops.
+static bool OverlapDownloadProgress(unsigned long long bytesDone, unsigned long long bytesTotal,
+                                    unsigned long long bytesPerSec, unsigned long long secondsRemaining)
+{
+    if (InterlockedCompareExchange(&g_overlap->finished, 0, 0) != 0 && g_overlap->result != RAR_UNPACK_OK)
+        return false;
+    return g_overlapProgressFn != NULL ? g_overlapProgressFn(bytesDone, bytesTotal, bytesPerSec, secondsRemaining)
+                                       : true;
+}
+
+static DWORD WINAPI OverlapUnpackEntry(LPVOID param)
+{
+    OverlapUnpack *o = (OverlapUnpack *)param;
+    o->result = RarUnpackMember(o->head, o->headLen, o->packedPath.c_str(), o->memberName, o->tempPath.c_str(),
+                                OverlapUnpackProgress, o->printFunction, &o->feed);
+    InterlockedExchange(&o->finished, 1);
+    return 0;
+}
+
+// The signature and main header, fetched again rather than kept from the
+// file list - a few dozen bytes, one request. *outHead is the caller's to free.
+static int FetchArchiveHead(const std::string &rarUrl, const DlcMember &member, const char *authHeader,
+                            void printFunction(const char *_format, ...), unsigned char **outHead)
+{
+    unsigned char *head = (unsigned char *)malloc(MAX_HEAD_LEN + 1);
+    if (head == NULL)
+        return -1;
+    unsigned long long headLen = MAX_HEAD_LEN;
+    char range[64];
+    _snprintf(range, sizeof(range), "Range: bytes=0-%lu\r\n", member.headLen - 1);
+    range[sizeof(range) - 1] = '\0';
+    int status = HttpGetFollowRedirect(rarUrl, (char *)head, &headLen, range, authHeader, printFunction);
+    if ((status != 206 && status != 200) || headLen != member.headLen)
+    {
+        printFunction("ERROR: couldn't read the start of the RAR (status %d, %I64u bytes)\n", status, headLen);
+        free(head);
+        return (status == 206 || status == 200) ? -1 : status;
+    }
+    *outHead = head;
+    return 206;
+}
+
+static int DownloadAndUnpackTogether(const std::string &rarUrl, const DlcMember &member, const std::string &destPath,
+                                     const char *authHeader, void printFunction(const char *_format, ...),
+                                     DownloadProgressFn progressFn)
+{
+    const std::string tempPath = StagingPathFor(destPath);
+    const std::string packedPath = PackedPathFor(destPath);
+    if (tempPath.empty() || packedPath.empty())
+    {
+        printFunction("ERROR: no drive in destination path: %s\n", destPath.c_str());
+        return -1;
+    }
+    if (member.headLen == 0 || member.headLen > MAX_HEAD_LEN || member.headLen > member.headerStart)
+    {
+        printFunction("ERROR: the RAR's main header isn't where it should be (%lu bytes)\n", member.headLen);
+        return UNPACK_UNSUPPORTED;
+    }
+
+    const unsigned long long from = PackedRangeStart(member);
+    const unsigned long long length = member.dataEnd - from;
+
+    unsigned char *head = NULL;
+    int status = FetchArchiveHead(rarUrl, member, authHeader, printFunction, &head);
+    if (status != 206)
+        return status;
+
+    // The unpacker opens it before the first byte may have landed.
+    FILE *touch = fopen(packedPath.c_str(), "ab");
+    if (touch != NULL)
+        fclose(touch);
+
+    OverlapUnpack o;
+    o.head = head;
+    o.headLen = member.headLen;
+    o.packedPath = packedPath;
+    o.tempPath = tempPath;
+    o.memberName = member.internalPath;
+    o.feed.finalSize = length;
+    o.feed.state = RAR_FEED_DOWNLOADING;
+    o.result = RAR_UNPACK_BAD_DATA;
+    o.finished = 0;
+    o.printFunction = printFunction;
+
+    g_overlap = &o;
+    g_overlapProgressFn = progressFn;
+    g_overlapLogged = 0;
+    g_unpackStart = GetTickCount();
+
+    printFunction("  Unpacking %s while it downloads (%I64u bytes to download, %lu unpacked)\n",
+                  member.internalPath, length, member.unpSize);
+
+    // On a core of its own: the download worker is on hardware thread 4.
+    HANDLE thread = CreateThread(NULL, 256 * 1024, OverlapUnpackEntry, &o, CREATE_SUSPENDED, NULL);
+    if (thread == NULL)
+    {
+        g_overlap = NULL;
+        free(head);
+        printFunction("ERROR: couldn't start the unpacking thread\n");
+        return -1;
+    }
+    XSetThreadProcessor(thread, 2);
+    ResumeThread(thread);
+
+    const DWORD downloadStart = GetTickCount();
+    status = DownloadRarRange(rarUrl, from, length, packedPath, destPath, member.unpSize,
+                              authHeader, printFunction, OverlapDownloadProgress, length);
+    const DWORD downloadSeconds = (GetTickCount() - downloadStart) / 1000;
+
+    // Whether the unpacking had already failed, and stopped the download -
+    // asked before the unpacking is told the download is over, which ends it
+    // with a failure of its own once the data runs out.
+    const bool unpackFailedFirst = InterlockedCompareExchange(&o.finished, 0, 0) != 0 && o.result != RAR_UNPACK_OK;
+
+    InterlockedExchange(&o.feed.state, status == 206 ? RAR_FEED_COMPLETE : RAR_FEED_STOPPED);
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
+    g_overlap = NULL;
+    g_overlapProgressFn = NULL;
+    free(head);
+
+    DWORD seconds = (GetTickCount() - g_unpackStart) / 1000;
+    printFunction("  Download took %lu:%02lu, download and unpacking together %lu:%02lu (unpack result %d)\n",
+                  (unsigned long)(downloadSeconds / 60), (unsigned long)(downloadSeconds % 60),
+                  (unsigned long)(seconds / 60), (unsigned long)(seconds % 60), (int)o.result);
+
+    // The download stopped on its own account - the network, a cancel, a full
+    // drive. What it got is kept for next time; the unpacking just ran out of
+    // data, and starts again then.
+    if (status != 206 && !unpackFailedFirst)
+        return status;
+
+    switch (o.result)
+    {
+    case RAR_UNPACK_OK:
+        DeleteFileA(packedPath.c_str());
+        return MoveIntoPlace(tempPath, destPath, printFunction) ? 206 : -1;
+
+    case RAR_UNPACK_CANCELLED:
+        return HTTP_STATUS_CANCELLED;
+
+    case RAR_UNPACK_WRITE_FAILED:
+    {
+        unsigned long long freeSpace = 0;
+        if (DriveFreeSpace(destPath, &freeSpace) && freeSpace < member.unpSize + DISK_SPACE_MARGIN)
+        {
+            g_diskFull = true;
+            g_diskNeeded = member.unpSize;
+            g_diskFree = freeSpace;
+        }
+        return -1;
+    }
+
+    case RAR_UNPACK_UNSUPPORTED:
+        DeleteFileA(packedPath.c_str());
+        return UNPACK_UNSUPPORTED;
+
+    default:
+        // Bad data or a name that isn't there: the download can't be trusted,
+        // so the next try fetches it again.
+        DeleteFileA(packedPath.c_str());
+        return -1;
+    }
+}
+
+// What DownloadDlcMember starts with: the member's archive.org extraction
+// URL, and where it installs, with its folders made.
+static bool PrepareMember(const DlcRarMatch &pack, const DlcMember &member, const std::string &contentBasePath,
+                          std::string *outUrl, std::string *outDestPath, void printFunction(const char *_format, ...))
+{
+    // Build the virtual-path URL: /download/{item}/{rarfile}/{urlencoded/internal/path}
+    // Each path SEGMENT is percent-encoded separately so the separators
+    // themselves become the literal "%2F" archive.org's own virtual-path
+    // parser expects between segments (confirmed from a real "view contents"
+    // link) - this splits on '\\' rather than '/' because these RAR
+    // archives (packaged on Windows for Xbox 360 content) store internal
+    // paths with backslash separators, confirmed on hardware from
+    // member.internalPath printing as "415608D8\00000002\<hash>". Splitting
+    // on '/' (as this used to) never finds a match, so the WHOLE path
+    // becomes one segment, and its backslashes get percent-encoded to
+    // "%5C" instead of joining segments with the "%2F" archive.org actually
+    // expects there - the wrong URL entirely, not just a display glitch.
+    char encodedPath[2048] = "";
+    char segment[512];
+    const char *p = member.internalPath;
+
+    while (*p != '\0')
+    {
+        const char *slash = strchr(p, '\\');
+        size_t segLen = slash ? (size_t)(slash - p) : strlen(p);
+
+        if (segLen >= sizeof(segment))
+        {
+            ERROR_LOG("internal path segment too long");
+            return false;
+        }
+
+        memcpy(segment, p, segLen);
+        segment[segLen] = '\0';
+
+        char encodedSegment[1024];
+        if (!UrlEncodeFormValue(segment, encodedSegment, sizeof(encodedSegment)))
+        {
+            ERROR_LOG("failed to URL-encode internal path segment");
+            return false;
+        }
+
+        if (strlen(encodedPath) + strlen(encodedSegment) + 4 >= sizeof(encodedPath))
+        {
+            ERROR_LOG("encoded internal path too long");
+            return false;
+        }
+
+        strcat(encodedPath, encodedSegment);
+
+        if (slash != NULL)
+        {
+            strcat(encodedPath, "%2F");
+            p = slash + 1;
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    // RESOLVED, and the diagnostic that asked it has been removed: the "%2F"
+    // separators here really were going missing from the LOG while being
+    // perfectly correct in memory. The giveaway was that the diagnostic
+    // reported len=64 - exactly right for the fully encoded path - while
+    // printing something much shorter and garbled, and the downloads built
+    // from it succeeded. It is a logging artifact, not a construction bug;
+    // see LogEscapePercent in parsing.h for the cause and the fix.
+    *outUrl = PackUrl(pack) + "/" + encodedPath;
+
+    // Destination mirrors the RAR's own internal path, e.g.
+    // {contentBasePath}\415607FF\00000002\66632C72...  - this already matches
+    // Content\0000000000000000\{TitleID}\{ContentType}\{ContentID}. The '/'
+    // replacement below is a no-op now that internalPath is known to already
+    // use '\\' (see the encodedPath comment above) - harmless to leave in
+    // case a differently-packaged archive ever does use '/', but not doing
+    // any real work against the files tested this session.
+    std::string destPath = DlcMemberDestination(member, contentBasePath);
+
+    // Create the Content\0000000000000000\TitleID\ContentType\ folders. The
+    // whole chain, from the drive down: the content folder itself may not be
+    // there on a drive that has never had anything installed on it, which a
+    // USB stick someone has just pointed the install folder at usually
+    // hasn't.
+    size_t lastSlash = destPath.find_last_of('\\');
+    if (lastSlash != std::string::npos)
+        CreateDirectoryTree(destPath.substr(0, lastSlash));
+
+    *outDestPath = destPath;
+    return true;
+}
+
+// Not unpackable here: archive.org's extraction, if the file is small enough
+// for it to deliver whole.
+static int ExtractOnServer(const std::string &url, const DlcMember &member, const std::string &destPath,
+                           const char *authHeader, void printFunction(const char *_format, ...),
+                           DownloadProgressFn progressFn)
+{
+    if (member.unpSize > EXTRACTED_SIZE_LIMIT)
+    {
+        printFunction("ERROR: %s can't be unpacked here, and at %lu bytes archive.org can't send it unpacked\n",
+                      member.internalPath, member.unpSize);
+        g_tooLarge = true;
+        return -1;
+    }
+    printFunction("  Asking archive.org to unpack it\n");
+    return DownloadUrlToFile(url, destPath, authHeader, member.unpSize, printFunction, progressFn);
+}
+
+bool DownloadDlcMember(const DlcRarMatch &pack, const DlcMember &member,
+                       const std::string &contentBasePath, const char *authHeader,
+                       void printFunction(const char *_format, ...),
+                       DownloadProgressFn progressFn)
+{
+    g_keysRejected = false;
+    g_diskFull = false;
+    g_tooLarge = false;
+
+    // Compressed in a way the console can't unpack, and too big for
+    // archive.org's extraction to deliver whole - see EXTRACTED_SIZE_LIMIT.
+    // Said now, rather than after three attempts that each spend a quarter of
+    // an hour on the same 1 GiB.
+    if (!member.stored && !member.canUnpack && member.unpSize > EXTRACTED_SIZE_LIMIT)
+    {
+        printFunction("ERROR: %s is %lu bytes and compressed - archive.org can't send a file that big to a console\n",
+                      member.internalPath, member.unpSize);
+        g_tooLarge = true;
+        return false;
+    }
+
+    std::string url, destPath;
+    if (!PrepareMember(pack, member, contentBasePath, &url, &destPath, printFunction))
+        return false;
+
+    printFunction("Downloading DLC member: %s -> %s\n", member.internalPath, destPath.c_str());
+
+    // A file already at destPath with the wrong size is a broken copy - the
+    // leftover of a download that failed before downloads went through a
+    // temporary file (DownloadUrlToFile). The file name is the package's
+    // content ID, derived from a hash of its own header, so a same-named file
+    // of a different size isn't some other valid version of it - and the size
+    // it should be comes straight from the archive. It's replaced on success;
+    // on failure it is
+    // removed as well, since it can't work and it makes the game list claim
+    // the DLC is installed.
+    unsigned long long existing = 0;
+    const bool damagedCopy = FileSizeOnDisk(destPath.c_str(), &existing) && existing != member.unpSize;
+    if (damagedCopy)
+        printFunction("  Replacing an incomplete earlier copy (%I64u of %lu bytes)\n", existing, member.unpSize);
+
+    // A stored member is read straight out of the RAR, and a compressed one
+    // downloaded the same way and unpacked as it lands - both pick up where
+    // they stopped. archive.org's extraction is the fallback, for what
+    // the console can't unpack: encrypted, split across volumes, or a method
+    // dmc_unrar doesn't do.
+    int httpStatus;
+    if (member.stored)
+        httpStatus = DownloadStoredMember(PackUrl(pack), member, destPath, authHeader, printFunction, progressFn);
+    else if (member.canUnpack)
+        httpStatus = DownloadAndUnpackTogether(PackUrl(pack), member, destPath, authHeader, printFunction, progressFn);
+    else
+        httpStatus = UNPACK_UNSUPPORTED;
+
+    if (httpStatus == UNPACK_UNSUPPORTED)
+        httpStatus = ExtractOnServer(url, member, destPath, authHeader, printFunction, progressFn);
+
+    if (httpStatus != 200 && httpStatus != 206)
+    {
+        printFunction("ERROR: failed to download DLC member (status %d)\n", httpStatus);
+        if (damagedCopy)
+            DeleteFileA(destPath.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Title updates - a separate archive.org item, see ArchiveOrgDLC.h
+// ---------------------------------------------------------------------------
+
+#define TITLE_UPDATE_ITEM "microsoft_xbox360_title-updates"
+#define TITLE_UPDATE_METADATA_URL "https://archive.org/metadata/" TITLE_UPDATE_ITEM
+#define TITLE_UPDATE_DOWNLOAD_BASE "https://archive.org/download/" TITLE_UPDATE_ITEM "/"
+
+// Pulls version and region out of a title-update filename.
+//
+// Names carry a variable number of parenthesised groups, so neither the
+// version nor the region sits at a fixed position. Two real examples:
+//
+//   Sonic Generations (World) (v1).zip
+//   Elder Scrolls V - Skyrim, The (Europe, USA) (En) (v10) (34F5B6C3) (Title Update).zip
+//
+// An earlier version of this read the LAST group as the version and the one
+// before it as the region, which works for the first name and is badly wrong
+// for the second: it reported version 0 and a region of "Title Update",
+// because the trailing groups there are a language, a checksum and a label.
+// Version 0 for everything also quietly broke the picker's sort, which orders
+// by version so the newest update lands under the cursor.
+//
+// So: scan every group. The one that looks exactly like "(v<digits>)" is the
+// version wherever it appears, and the FIRST group is the region - it is the
+// one position that has held the region in every name observed.
+static void ParseTitleUpdateName(const char *filename, int *outVersion, char *outRegion, size_t regionSize)
+{
+    *outVersion = 0;
+    if (regionSize > 0)
+        outRegion[0] = '\0';
+
+    const char *firstOpen = NULL;
+
+    for (const char *p = filename; *p != '\0'; ++p)
+    {
+        if (*p != '(')
+            continue;
+
+        if (firstOpen == NULL)
+            firstOpen = p;
+
+        const char *v = p + 1;
+        if (*v != 'v' && *v != 'V')
+            continue;
+
+        int value = 0;
+        const char *d = v + 1;
+        bool anyDigits = false;
+
+        while (*d >= '0' && *d <= '9')
+        {
+            value = value * 10 + (*d - '0');
+            anyDigits = true;
+            ++d;
+        }
+
+        // Must be the WHOLE group - "(v10)" is a version, "(various)" is not.
+        if (anyDigits && *d == ')')
+            *outVersion = value;
+    }
+
+    if (firstOpen == NULL || regionSize == 0)
+        return;
+
+    size_t o = 0;
+    for (const char *r = firstOpen + 1; *r != '\0' && *r != ')' && o + 1 < regionSize; ++r)
+        outRegion[o++] = *r;
+
+    outRegion[o] = '\0';
+}
+
+int FindTitleUpdates(const std::string &gameName, TitleUpdateMatch *outMatches, int maxMatches,
+                     void printFunction(const char *_format, ...))
+{
+    // A larger limit than the DLC item's: this listing runs to a thousand-plus
+    // entries where the DLC item is a few hundred. Metadata is public even
+    // though the files themselves are private - see ItemListingJson.
+    const char *listing = ItemListingJson(g_titleUpdateListing, TITLE_UPDATE_METADATA_URL, 4 * 1024 * 1024,
+                                          printFunction);
+    if (listing == NULL)
+        return -1;
+
+    cJSON *json = cJSON_Parse(listing);
+
+    if (json == NULL)
+    {
+        ERROR_LOG("failed to parse title-update metadata JSON");
+        DropItemListing(g_titleUpdateListing); // fetch it afresh next time rather than fail forever
+        return -1;
+    }
+
+    cJSON *files = cJSON_GetObjectItemCaseSensitive(json, "files");
+    if (!cJSON_IsArray(files))
+    {
+        ERROR_LOG("title-update metadata had no files array");
+        cJSON_Delete(json);
+        return -1;
+    }
+
+    char normalizedQuery[512];
+    NormalizeForMatch(gameName.c_str(), normalizedQuery, sizeof(normalizedQuery));
+
+    // A multi-disc title carries its disc in the display name; the archive
+    // never does. See StripDiscSuffix.
+    size_t beforeStrip = strlen(normalizedQuery);
+    StripDiscSuffix(normalizedQuery);
+
+    if (strlen(normalizedQuery) != beforeStrip)
+        printFunction("  Matching on \"%s\" (disc marker trimmed from the title)\n", normalizedQuery);
+
+    int matchCount = 0;
+    cJSON *file;
+
+    cJSON_ArrayForEach(file, files)
+    {
+        cJSON *name = cJSON_GetObjectItemCaseSensitive(file, "name");
+        if (!cJSON_IsString(name) || name->valuestring == NULL)
+            continue;
+
+        size_t nameLen = strlen(name->valuestring);
+        if (nameLen < 4 || _stricmp(name->valuestring + nameLen - 4, ".zip") != 0)
+            continue;
+
+        char normalizedName[512];
+        NormalizeForMatch(name->valuestring, normalizedName, sizeof(normalizedName));
+
+        // Same scorer as the DLC side. It behaves better here, if anything:
+        // these are ordinary game names rather than dot-separated scene
+        // releases, so more of the query tends to land as whole words.
+        int score = ScoreDlcMatch(normalizedName, normalizedQuery);
+        if (score < DLC_MATCH_MIN_SCORE)
+            continue;
+
+        cJSON *size = cJSON_GetObjectItemCaseSensitive(file, "size");
+        unsigned long long fileSize = 0;
+        if (cJSON_IsString(size) && size->valuestring != NULL)
+            fileSize = _atoi64(size->valuestring);
+        else if (cJSON_IsNumber(size))
+            fileSize = (unsigned long long)size->valuedouble;
+
+        // Keep the best maxMatches rather than the first maxMatches - see the
+        // same reasoning in FindDlcRarFilenames.
+        int slot = -1;
+
+        if (matchCount < maxMatches)
+        {
+            slot = matchCount++;
+        }
+        else
+        {
+            int worst = 0;
+            for (int i = 1; i < matchCount; ++i)
+            {
+                if (outMatches[i].score < outMatches[worst].score)
+                    worst = i;
+            }
+
+            if (score > outMatches[worst].score)
+                slot = worst;
+        }
+
+        if (slot < 0)
+            continue;
+
+        strncpy(outMatches[slot].filename, name->valuestring, TITLE_UPDATE_FILENAME_LEN - 1);
+        outMatches[slot].filename[TITLE_UPDATE_FILENAME_LEN - 1] = '\0';
+        outMatches[slot].size = fileSize;
+        outMatches[slot].score = score;
+
+        ParseTitleUpdateName(outMatches[slot].filename,
+                             &outMatches[slot].version,
+                             outMatches[slot].region,
+                             sizeof(outMatches[slot].region));
+    }
+
+    cJSON_Delete(json);
+
+    // Best first: score descending, then version descending so the newest
+    // update for the best-matching name is the one the picker lands on.
+    for (int i = 1; i < matchCount; ++i)
+    {
+        TitleUpdateMatch key = outMatches[i];
+        int j = i - 1;
+
+        while (j >= 0 && (outMatches[j].score < key.score ||
+                          (outMatches[j].score == key.score && outMatches[j].version < key.version)))
+        {
+            outMatches[j + 1] = outMatches[j];
+            --j;
+        }
+
+        outMatches[j + 1] = key;
+    }
+
+    return matchCount;
+}
+
+// ---------------------------------------------------------------------------
+// Zip central-directory probe (diagnostic - see ArchiveOrgDLC.h)
+// ---------------------------------------------------------------------------
+
+#define ZIP_EOCD_SIGNATURE 0x06054B50UL
+#define ZIP_CDFH_SIGNATURE 0x02014B50UL
+
+bool ReadTitleUpdateMember(const TitleUpdateMatch &update, const char *authHeader,
+                           char *outMemberName, unsigned long outMemberNameSize,
+                           unsigned long *outUnpackedSize,
+                           void printFunction(const char *_format, ...))
+{
+    if (outMemberName == NULL || outMemberNameSize == 0)
+        return false;
+
+    outMemberName[0] = '\0';
+    if (outUnpackedSize != NULL)
+        *outUnpackedSize = 0;
+
+    // Like Xbox Live Arcade's RAR names (see PackUrl), title-update names
+    // contain spaces and parentheses - "Ace Combat 6 (Europe) (v2).zip" - so
+    // the filename itself has to be percent-encoded before it can go in a URL
+    // at all. UrlEncodeFormValue encodes a space as %20 rather than '+', which
+    // is what makes it usable for a path segment here.
+    char encodedZip[512];
+    if (!UrlEncodeFormValue(update.filename, encodedZip, sizeof(encodedZip)))
+    {
+        ERROR_LOG("title-update filename too long to URL-encode");
+        return false;
+    }
+
+    std::string url = TITLE_UPDATE_DOWNLOAD_BASE + std::string(encodedZip);
+
+    if (update.size < 22)
+    {
+        ERROR_LOG("title-update zip is too small to contain a central directory");
+        return false;
+    }
+
+    std::string cachedDatanodeUrl;
+
+    // --- Step 1: the End of Central Directory record, at the tail of the file ---
+    //
+    // This is what makes zip easier than the RAR walk: one request describes
+    // the whole archive, instead of chaining through interleaved headers.
+    const unsigned long TAIL_SIZE = 1024;
+    unsigned char tail[TAIL_SIZE];
+
+    unsigned long long tailLen = TAIL_SIZE - 1; // one byte held back, matching the RAR path's hard-won buffer rule
+    unsigned long long tailStart = (update.size > tailLen) ? (update.size - tailLen) : 0;
+    unsigned long long tailEnd = update.size - 1;
+
+    char rangeHeader[64];
+    _snprintf(rangeHeader, sizeof(rangeHeader), "Range: bytes=%I64u-%I64u\r\n", tailStart, tailEnd);
+    rangeHeader[sizeof(rangeHeader) - 1] = '\0';
+
+    int status = HttpGetFollowRedirect(url, (char *)tail, &tailLen, rangeHeader, authHeader,
+                                       printFunction, &cachedDatanodeUrl);
+
+    if (status != 206 && status != 200)
+    {
+        printFunction("ERROR: range request for zip tail failed (status %d)\n", status);
+        return false;
+    }
+
+    // Scan backwards for the EOCD signature. Backwards because a zip comment,
+    // if present, sits after it - and because a stray matching byte pattern is
+    // likelier earlier in the data than at the true record.
+    long eocd = -1;
+    for (long i = (long)tailLen - 22; i >= 0; --i)
+    {
+        if (ReadLE32(tail + i) == ZIP_EOCD_SIGNATURE)
+        {
+            eocd = i;
+            break;
+        }
+    }
+
+    if (eocd < 0)
+    {
+        ERROR_LOG("no zip End of Central Directory record found in the file tail");
+        return false;
+    }
+
+    unsigned short entryCount = ReadLE16(tail + eocd + 10);
+    unsigned long cdSize = ReadLE32(tail + eocd + 12);
+    unsigned long cdOffset = ReadLE32(tail + eocd + 16);
+
+    printFunction("[TU] %s\n", update.filename);
+    printFunction("[TU]   entries=%u, central dir at %lu (%lu bytes)\n",
+                  (unsigned)entryCount, cdOffset, cdSize);
+
+    if (entryCount == 0 || cdSize == 0)
+    {
+        ERROR_LOG("zip central directory is empty");
+        return false;
+    }
+
+    // --- Step 2: the central directory itself ---
+    //
+    // Usually it is ALREADY in the tail buffer above and needs no second
+    // request at all. The central directory sits immediately before the EOCD
+    // record, so for a small archive - and these hold exactly one member - it
+    // falls comfortably inside the last kilobyte we just fetched. Confirmed on
+    // hardware: a 3084417-byte zip put its 93-byte central directory at
+    // 3084280, well within the tail read starting at 3083394.
+    //
+    // Asking for it again was not just wasteful, it failed: the second range
+    // request against the cached datanode URL came back 500, and the fallback
+    // then died on a buffer that was sized to the 93 bytes wanted rather than
+    // to the redirect URL the fallback had to store in it.
+    const unsigned long CD_BUFFER = 2048;
+    unsigned char cdFetch[CD_BUFFER];
+
+    const unsigned char *cd = NULL;
+    unsigned long long cdAvail = 0;
+
+    if (cdOffset >= tailStart && cdOffset < update.size)
+    {
+        // Narrowed to unsigned long before the pointer arithmetic: the offset
+        // is bounded by the tail size (a kilobyte) by the test above, and this
+        // is a 32-bit target, so there is no reason to do pointer maths in 64
+        // bits here.
+        unsigned long into = (unsigned long)(cdOffset - tailStart);
+
+        if (into >= tailLen)
+        {
+            ERROR_LOG("zip central directory offset landed outside the fetched tail");
+            return false;
+        }
+
+        cd = tail + into;
+        cdAvail = tailLen - into;
+    }
+    else
+    {
+        // Only for an archive whose central directory sits further back than
+        // the tail we read - not expected for these, but cheap to support.
+        //
+        // The size passed in is the BUFFER CAPACITY, not the number of bytes
+        // wanted: HttpGetFollowRedirect stores a 302's redirect URL in this
+        // same buffer before following it, so sizing it to the payload is what
+        // produces "Redirect URL buffer too small". The Range header is what
+        // limits how much is actually requested.
+        unsigned long long wanted = (cdSize < CD_BUFFER - 1) ? cdSize : (CD_BUFFER - 1);
+        unsigned long long cdEnd = cdOffset + wanted - 1;
+
+        _snprintf(rangeHeader, sizeof(rangeHeader), "Range: bytes=%lu-%I64u\r\n", cdOffset, cdEnd);
+        rangeHeader[sizeof(rangeHeader) - 1] = '\0';
+
+        unsigned long long cdLen = CD_BUFFER - 1;
+
+        status = HttpGetFollowRedirect(url, (char *)cdFetch, &cdLen, rangeHeader, authHeader,
+                                       printFunction, &cachedDatanodeUrl);
+
+        if (status != 206 && status != 200)
+        {
+            printFunction("ERROR: range request for zip central directory failed (status %d)\n", status);
+            return false;
+        }
+
+        cd = cdFetch;
+        cdAvail = cdLen;
+    }
+
+    if (cdAvail < 46 || ReadLE32(cd) != ZIP_CDFH_SIGNATURE)
+    {
+        ERROR_LOG("zip central directory header signature missing");
+        return false;
+    }
+
+    unsigned short method = ReadLE16(cd + 10);
+    unsigned long compressedSize = ReadLE32(cd + 20);
+    unsigned long uncompressedSize = ReadLE32(cd + 24);
+    unsigned short nameLen = ReadLE16(cd + 28);
+
+    char memberName[512];
+    unsigned short copyLen = nameLen;
+    if (copyLen > sizeof(memberName) - 1)
+        copyLen = sizeof(memberName) - 1;
+    if (46 + copyLen > cdAvail)
+        copyLen = (unsigned short)(cdAvail - 46);
+
+    memcpy(memberName, cd + 46, copyLen);
+    memberName[copyLen] = '\0';
+
+    // The member name is what decides where this installs: a lowercase "tu..."
+    // name belongs in Content\0000000000000000\{TitleID}\000B0000\, while an
+    // uppercase "TU_..." name goes to Cache instead. Both forms are in this
+    // archive - which one you get depends on the update's vintage, not on
+    // anything we control - so the caller has to branch per file.
+    printFunction("[TU]   member: \"%s\"\n", memberName);
+    printFunction("[TU]   method=%u (0=stored, 8=deflate), packed=%lu, unpacked=%lu\n",
+                  (unsigned)method, compressedSize, uncompressedSize);
+
+    strncpy(outMemberName, memberName, outMemberNameSize - 1);
+    outMemberName[outMemberNameSize - 1] = '\0';
+
+    if (outUnpackedSize != NULL)
+        *outUnpackedSize = uncompressedSize;
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Install one title update
+// ---------------------------------------------------------------------------
+
+// Everything before the last '/' or '\\' in a zip member name is folder
+// structure inside the archive (observed: "6BD87620/TU_19KA228_..."), and none
+// of it belongs in the destination - only the file itself does.
+static const char *MemberBaseName(const char *memberName)
+{
+    const char *base = memberName;
+
+    for (const char *p = memberName; *p != '\0'; ++p)
+    {
+        if (*p == '/' || *p == '\\')
+            base = p + 1;
+    }
+
+    return base;
+}
+
+// The console's Cache folder, derived from the configured content path rather
+// than hardcoded to Hdd1: someone who installs content to a USB drive has
+// their cache on that same device, and a hardcoded Hdd1 would quietly write to
+// the wrong one.
+static std::string CachePathFromContentPath(const std::string &contentBasePath)
+{
+    size_t firstSep = contentBasePath.find('\\');
+
+    std::string device = (firstSep != std::string::npos)
+                             ? contentBasePath.substr(0, firstSep)
+                             : contentBasePath;
+
+    return device + "\\Cache";
+}
+
+bool DownloadTitleUpdate(const TitleUpdateMatch &update, unsigned long titleId,
+                         const std::string &contentBasePath, const char *authHeader,
+                         void printFunction(const char *_format, ...),
+                         DownloadProgressFn progressFn)
+{
+    g_keysRejected = false;
+    g_diskFull = false;
+
+    char memberName[512];
+    unsigned long unpackedSize = 0;
+
+    if (!ReadTitleUpdateMember(update, authHeader, memberName, sizeof(memberName),
+                               &unpackedSize, printFunction))
+    {
+        return false;
+    }
+
+    const char *baseName = MemberBaseName(memberName);
+    if (baseName[0] == '\0')
+    {
+        ERROR_LOG("title update member has no filename");
+        return false;
+    }
+
+    // Case decides the destination, and it is genuinely the case rather than a
+    // naming style: lowercase "tu..." updates are the newer per-title form and
+    // live under the game's own content folder, while the older uppercase
+    // "TU_..." ones go in the shared Cache. Getting this wrong installs a real
+    // file to a place nothing will ever look.
+    std::string destPath;
+
+    if (baseName[0] == 't')
+    {
+        char titleFolder[64];
+        _snprintf(titleFolder, sizeof(titleFolder), "\\%08lX\\000B0000\\", titleId);
+        titleFolder[sizeof(titleFolder) - 1] = '\0';
+
+        destPath = contentBasePath + titleFolder + baseName;
+    }
+    else
+    {
+        destPath = CachePathFromContentPath(contentBasePath) + "\\" + baseName;
+    }
+
+    printFunction("Installing title update: %s -> %s\n", baseName, destPath.c_str());
+
+    // Create the destination folders, the same way the DLC path does it.
+    size_t lastSep = destPath.find_last_of('\\');
+    if (lastSep != std::string::npos)
+        CreateDirectoryTree(destPath.substr(0, lastSep));
+
+    // Same virtual-path trick the DLC side uses: archive.org extracts the
+    // member server-side, so nothing here has to understand deflate. If that
+    // turns out not to work for zip the request simply fails, and the caller
+    // reports it rather than writing a corrupt file.
+    char encodedZip[512];
+    char encodedMember[1024];
+
+    if (!UrlEncodeFormValue(update.filename, encodedZip, sizeof(encodedZip)) ||
+        !UrlEncodeFormValue(memberName, encodedMember, sizeof(encodedMember)))
+    {
+        ERROR_LOG("title update name too long to URL-encode");
+        return false;
+    }
+
+    std::string url = TITLE_UPDATE_DOWNLOAD_BASE + std::string(encodedZip) + "/" + encodedMember;
+
+    // Through a temporary file and renamed into place, with retries - see
+    // DownloadUrlToFile - so a failed transfer can't leave a truncated update
+    // where the dashboard will load it.
+    int httpStatus = DownloadUrlToFile(url, destPath, authHeader, unpackedSize, printFunction, progressFn);
+
+    if (httpStatus != 200 && httpStatus != 206)
+    {
+        printFunction("ERROR: title update download failed (status %d)\n", httpStatus);
+        printFunction("       If this is a 404, archive.org is not serving zip members\n");
+        printFunction("       pre-extracted, which would need inflate support here.\n");
+        return false;
+    }
+
+    return true;
+}

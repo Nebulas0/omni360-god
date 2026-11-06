@@ -1,0 +1,829 @@
+#ifndef GAME_LIST_UI_H
+#define GAME_LIST_UI_H
+
+#include "StfsParser.h"
+
+// Sets up the icon/quad-rendering shader + vertex declaration + a 1x1 white
+// texture (for solid-color rects), and this UI's own Font instance (Console
+// keeps its own privately, so we can't reuse it - see the fork's plan notes
+// on why a from-scratch render loop was needed here). Call once after
+// MakeConsole(...) has run, before any Render*/Show* call below.
+bool InitGameListUI();
+void ShutdownGameListUI();
+
+// ---------------------------------------------------------------------------
+// The shell: a sidebar of pages, with the current page beside it
+// ---------------------------------------------------------------------------
+//
+// main.cpp runs one loop that reads input, updates whichever page is showing
+// and draws one frame with the Render*Frame calls below - so this file only
+// draws, and never decides what a button does. The blocking screens further
+// down (progress, messages, confirmations) are still their own loops for now;
+// they draw the sidebar too, so the app reads as one place throughout.
+
+// In the order the sidebar lists them. Home, Library, Apps, Homebrew,
+// Emulators and Store are one group, Queue and Settings the other, with a
+// divider between.
+//
+// Home is the app's root, and the one page the sidebar isn't drawn over: it
+// has a nav row of its own across the top so the wallpaper can run the full
+// width. Everything else in the shell is unchanged by it - see
+// HomePageView below, and main.cpp's Home branch.
+enum ShellPage
+{
+    SHELL_PAGE_HOME,
+    SHELL_PAGE_LIBRARY,
+    SHELL_PAGE_APPS,
+    SHELL_PAGE_HOMEBREW,
+    SHELL_PAGE_EMULATORS,
+    SHELL_PAGE_STORE,
+    SHELL_PAGE_QUEUE,
+    SHELL_PAGE_SETTINGS,
+    SHELL_PAGE_COUNT
+};
+
+// A page's name, as the sidebar writes it - so Home's nav row and the
+// sidebar can't drift apart.
+const char *ShellPageName(ShellPage page);
+
+struct ShellSidebar
+{
+    // Whether this page draws it at all. It is the Games/Apps/Homebrew/
+    // Emulators group's own navigation, not the app's: Home, the Store, the
+    // Queue and Settings run full width without it, and setting this also
+    // moves where their content starts.
+    bool shown;
+
+    ShellPage page;       // the highlighted page
+    bool focused;         // the sidebar has focus, rather than the page
+    int libraryCount;     // shown beside Your Library
+    int appsCount;        // beside Apps
+    int homebrewCount;    // beside Homebrew
+    int emulatorsCount;   // beside Emulators
+    int queueCount;       // shown beside Queue; 0 shows nothing
+
+    // Pages left out of the sidebar - Apps, Homebrew or Emulators with no
+    // folders. The ones under them move up into their place.
+    bool hidden[SHELL_PAGE_COUNT];
+
+    // The drive content installs to, at the foot of the sidebar: a ring for
+    // how full it is, its name, and the free space in words.
+    float storageUsed;      // 0..1; negative hides the whole thing
+    char storageLabel[16];  // "Hdd1"
+    char storageDetail[32]; // "402 GB free"
+    char storageTotal[32];  // "of 931 GB"
+};
+
+// What every following frame draws in the sidebar, until it is called again.
+// Kept here rather than passed to each Render call so the blocking screens,
+// which main.cpp calls from deep inside a download, draw the same sidebar
+// without every caller having to carry it through. They always draw it
+// unfocused - while one of them is up, nothing in the sidebar can be chosen.
+void SetShellSidebar(const ShellSidebar &sidebar);
+
+// ---------------------------------------------------------------------------
+// Input
+// ---------------------------------------------------------------------------
+
+// One frame's controller state, from the first controller.
+//
+//   held    - buttons down right now
+//   pressed - buttons that went down this frame (edge-triggered)
+//   nav     - at most ONE of the D-pad direction bits, set on the frame a
+//             direction is first pushed and then repeatedly while it's held,
+//             so holding down scrolls a long list. The left stick counts as
+//             the D-pad here, whichever axis it's pushed further along.
+// The triggers, as buttons in UiInput's triggers: pulled past halfway.
+#define UI_TRIGGER_LEFT  0x01
+#define UI_TRIGGER_RIGHT 0x02
+
+struct UiInput
+{
+    WORD held;
+    WORD pressed;
+    WORD nav;
+    BYTE triggers; // UI_TRIGGER_*: those pulled since the last call
+};
+
+// Call once per frame.
+UiInput PollUiInput();
+
+// Call after anything that took over the screen for a while - a keyboard, a
+// download, a message. Whatever is held at that moment is treated as already
+// handled, so the A that answered a message can't also act on the page
+// underneath, and a held direction doesn't jump the moment control returns.
+void ResyncUiInput();
+
+// ---------------------------------------------------------------------------
+// Footer hints
+// ---------------------------------------------------------------------------
+
+enum UiButton
+{
+    UI_BUTTON_A,
+    UI_BUTTON_B,
+    UI_BUTTON_X,
+    UI_BUTTON_Y,
+    UI_BUTTON_LBRB,
+    UI_BUTTON_START,
+    UI_BUTTON_LTRT
+};
+
+// One button hint in the footer. shortLabel, when non-NULL, is used for every
+// hint if the full labels don't fit the width of the page - which happens on
+// a 640x480 screen, where the page beside the sidebar is narrow.
+struct UiHint
+{
+    UiButton button;
+    const WCHAR *label;
+    const WCHAR *shortLabel;
+};
+
+// ---------------------------------------------------------------------------
+// Pages
+// ---------------------------------------------------------------------------
+
+// Home: the focused game's wallpaper across the whole screen, a nav row
+// along the top in place of the sidebar, and a row of the games played most
+// recently under its name.
+//
+// Two things can have focus, and the page draws whichever has it: the nav
+// row, or the recents row. main.cpp owns which (HOME_FOCUS_* below) and does
+// the moving; this only draws.
+
+#define HOME_RECENTS_MAX 12
+#define HOME_NAV_MAX 8
+
+enum HomeFocus
+{
+    HOME_FOCUS_NAV,
+    HOME_FOCUS_RECENTS
+};
+
+// One tile in the recents row. The disc in the drive is one of these too,
+// drawn as the library's disc tile is, so Home needs no separate case.
+// Nothing under the name: what kind of package a game is and when it was
+// last played are the app's business rather than anyone else's, and the
+// disc's line only ever repeated the caption above it.
+struct HomeRecentView
+{
+    unsigned long titleId; // its cover, and the page's wallpaper; 0 for none
+    const char *name;
+    bool disc;             // the disc in the drive rather than a library game
+};
+
+// One button in the nav row. page is what main.cpp does with it when A is
+// pressed - it means nothing here. count, when above 0, is drawn as a pill
+// on the button, the way the sidebar draws the queue's.
+struct HomeNavView
+{
+    const char *label;
+    int page;   // a ShellPage, or -1 for something that isn't one
+    int count;
+};
+
+struct HomePageView
+{
+    // Along the top. clock and storage may be NULL; gamertag is NULL until
+    // there's a profile to show, and the row then starts with the app's name.
+    const char *gamertag;
+    const char *clock;
+    const char *storage;
+
+    HomeNavView nav[HOME_NAV_MAX];
+    int navCount;
+    int navFocus;
+
+    HomeRecentView recents[HOME_RECENTS_MAX];
+    int recentCount;
+    int recentFocus;
+    int recentScroll; // the first tile shown; the Render call moves it
+
+    int focus; // HOME_FOCUS_*
+
+    // Nothing played yet, so the row is a single card pointing at the Store.
+    const char *emptyTitle;
+    const char *emptyHint;
+};
+
+// How many recent tiles fit across, so main.cpp can page by a screenful.
+int HomeRecentsAcross();
+
+void RenderHomeFrame(HomePageView &view, const UiHint *hints, int hintCount);
+
+// What the disc's tile shows.
+enum LibraryDiscTile
+{
+    DISC_TILE_READY,       // a game disc, not installed - A plays it, START installs it
+    DISC_TILE_INSTALLED,   // already in the games folder
+    DISC_TILE_INSTALLING,  // on the Queue page now
+    DISC_TILE_READING,     // just gone in
+    DISC_TILE_UNREADABLE   // not a disc that can be installed
+};
+
+// The installed library.
+//
+// scroll is the first visible row. It's the caller's to keep between frames,
+// and the Render call moves it so the selected row stays on screen. Pass -1
+// to have it start with the selection in the middle of the view.
+//
+// count may be 0. The page then says the library is empty and names gamesPath
+// as the folder that was searched.
+//
+// bannerText, when non-NULL, is shown in a highlighted strip above the list
+// with a Y badge - for something the user needs to do in Settings, like adding
+// their archive.org keys.
+//
+// Cover art is loaded on the first frame and kept until ShutdownGameListUI or
+// ReleaseGameListIcons, so drawing this every frame costs no decoding.
+struct LibraryPageView
+{
+    const InstalledGame *games;
+    int count;
+    int selected;
+    int scroll;
+    const char *gamesPath;
+    const char *bannerText;
+    bool focused; // false while the sidebar has focus
+
+    // The Apps and Homebrew pages are this grid too. heading NULL is the
+    // library's own, with its empty-page text; otherwise emptyTitle and
+    // emptyHint say what an empty page says. Their apps have no package
+    // images, so isApps leaves the library's icons alone and names every
+    // tile that has no box art.
+    const char *heading;
+    const char *emptyTitle;
+    const char *emptyHint;
+    bool isApps;
+    const unsigned long *coverKeys; // an app's cover, by CoverArt.h's HomebrewCoverKey - one a game; NULL for the library
+
+    // The disc in the drive, as the first tile, when hasDisc. selected and
+    // scroll count it: game i is then item i + 1.
+    bool hasDisc;
+    LibraryDiscTile discTile;
+    const char *discName;      // the game's, or what's wrong with the disc
+    unsigned long discTitleId; // for its box art; 0 for none
+    float discProgress;        // DISC_TILE_INSTALLING: 0..1, negative when unknown
+};
+
+// The library is a grid of cover tiles. How many full rows fit - LB/RB page
+// by this many rows - and how many tiles there are across. scroll counts
+// rows, not games.
+int LibraryPageVisibleRows(const LibraryPageView &view);
+int LibraryGridColumns();
+
+// The Store's grid of covers - a letter's page, and a search's hits - is its
+// own width: it runs the full page where the library sits beside a sidebar,
+// so more tiles fit across. Anything moving about that grid has to count in
+// these, not the library's, or the focus walks it diagonally.
+int StoreGridColumns();
+
+void RenderLibraryFrame(LibraryPageView &view, const UiHint *hints, int hintCount);
+
+// Turns at most one cover that CoverArt.cpp has ready into a texture for the
+// tiles - decoding and cutting it first if it was just downloaded. Call once
+// per frame; a download costs a few tens of milliseconds the first time, a
+// cached cover next to nothing.
+void PumpCoverArt();
+
+// Drops the cached cover art, so the next library frame loads it afresh. Call
+// after rescanning the library: the cache is matched to the game list by count
+// alone, so a new library of the same size would otherwise show the old one's
+// covers.
+void ReleaseGameListIcons();
+
+// Builds up to maxNew of the library's icons that aren't built yet, so the
+// first library frame doesn't have to. True once they're all done.
+bool PrepareGameListIcons(const InstalledGame *games, int gameCount, int maxNew);
+
+// The startup screen, one frame per call: a bouncing dot for as long as
+// loaded is false, then the Omni360 mark forming and resting. True once it
+// has finished; FadeOutStartupScreen then lays the mark over every frame
+// that follows, fading, until the app shows through.
+bool RenderStartupFrame(bool loaded);
+void FadeOutStartupScreen();
+
+// A list of text rows with an optional second line each: Settings, and the
+// DLC pack and title update pickers.
+//
+// labels and sublabels are caller-owned arrays of `count` strings; sublabels
+// may be NULL entirely, or hold NULL for an individual row. scroll works as it
+// does for LibraryPageView.
+//
+// showCounter controls the "3 / 12" position readout, which means something
+// for a list of results and nothing for a short fixed menu.
+struct ListPageView
+{
+    const char *heading;
+    const char *subheading; // the line under the title; may be NULL
+    const char **labels;
+    const char **sublabels;
+    const char **sections;  // a heading over each row that starts a section, else NULL; may be NULL
+    int count;
+    int selected;
+    int scroll;
+    bool focused;
+    bool showCounter;
+};
+
+void RenderListFrame(ListPageView &view, const UiHint *hints, int hintCount);
+
+// Settings: slim rows under headings, as Aurora's Manage Paths. A row is a
+// heading with buttons on its right, a library folder (its checkbox, path
+// and status), or one setting on a line - its name, what it's set to, and
+// its controls on the right: buttons, checkboxes, or a value left and right
+// change. One help line at the foot says what the focused control does.
+//
+// focusRow and focusCol are the caller's: a heading without controls is
+// never focused. scroll, in pixels, is the caller's to keep between frames;
+// the Render call moves it so the focused row stays on screen.
+enum SettingsControlKind
+{
+    SETTINGS_CONTROL_BUTTON,
+    SETTINGS_CONTROL_CHECK,
+    SETTINGS_CONTROL_VALUE  // label is the value; valueIndex of valueCount marks where it sits
+};
+
+struct SettingsControlView
+{
+    SettingsControlKind kind;
+    const char *label;   // a checkbox's may be NULL - the row's name says it
+    bool on;             // a checkbox's
+    int valueIndex;
+    int valueCount;
+    bool compact;        // a value's: narrower, beside a folder's path
+    const char *help;    // for the help line, while it has focus
+};
+
+enum SettingsRowKind
+{
+    SETTINGS_VIEW_HEADING, // label, and any controls on the right
+    SETTINGS_VIEW_FOLDER,  // a checkbox (checked, locked), label the path, status on the right - then
+                           // its one value control, if it has one, which left and right change
+    SETTINGS_VIEW_LINE     // label, status beside it, controls on the right
+};
+
+#define SETTINGS_MAX_CONTROLS 3
+
+struct SettingsRowView
+{
+    SettingsRowKind kind;
+    const char *label;
+    const char *status;   // may be NULL
+    bool statusGreen;     // a folder's "Installs here"
+    bool checked;         // a folder's
+    bool locked;          // a folder's box can't change - dimmed
+    bool missing;         // a folder that isn't there: its path dimmed
+    const char *help;     // a folder's, for the help line
+    int controlCount;
+    SettingsControlView controls[SETTINGS_MAX_CONTROLS];
+};
+
+struct SettingsPageView
+{
+    const SettingsRowView *rows;
+    int count;
+    int focusRow;
+    int focusCol;
+    float scroll;
+    bool focused;
+};
+
+void RenderSettingsFrame(SettingsPageView &view, const UiHint *hints, int hintCount);
+
+// The Store's front page: one to five featured games - one large tile, the
+// rest smaller beside it - with their marketplace wallpaper, a row of four
+// buttons, and the A-Z tiles.
+//
+// focus runs through them in that order: STORE_FOCUS_FEATURED + 0 to the
+// featured count less one, then STORE_FOCUS_BUTTONS + 0..3, then
+// STORE_FOCUS_LETTERS + 0..26. The page scrolls so the A-Z tiles come into
+// view when one of them has focus; scroll is the caller's to keep between
+// frames, and the Render call eases it.
+#define STORE_FEATURED_MAX   5
+#define STORE_BUTTON_COUNT   4
+#define STORE_LETTER_COUNT   28 // All (STORE_LETTER_ALL), '#', then A to Z
+
+#define STORE_FOCUS_FEATURED 0
+#define STORE_FOCUS_BUTTONS  (STORE_FOCUS_FEATURED + STORE_FEATURED_MAX) // some featured slots may be unused
+#define STORE_FOCUS_LETTERS  (STORE_FOCUS_BUTTONS + STORE_BUTTON_COUNT)
+// Under the A to Z, the Collections: a row of wide cards, a series each,
+// that scrolls sideways. Focus on one is STORE_FOCUS_COLLECTIONS + its place.
+#define STORE_COLLECTIONS_MAX   32
+#define STORE_FOCUS_COLLECTIONS (STORE_FOCUS_LETTERS + STORE_LETTER_COUNT)
+// Under them, rows of games that scroll sideways - Popular, Top rated,
+// a genre each. Focus on a row's game is STORE_FOCUS_ROWS + row *
+// STORE_ROW_TILES_MAX + its place in the row.
+#define STORE_ROWS_MAX       16
+#define STORE_ROW_TILES_MAX  24
+#define STORE_FOCUS_ROWS     (STORE_FOCUS_COLLECTIONS + STORE_COLLECTIONS_MAX)
+#define STORE_FOCUS_COUNT    (STORE_FOCUS_ROWS + STORE_ROWS_MAX * STORE_ROW_TILES_MAX)
+
+struct StoreTileView;
+
+struct StoreRowView
+{
+    const char *name;
+    const StoreTileView *tiles;
+    int count;
+    int scroll; // the first game shown; the caller's to keep, the Render call moves it
+};
+
+struct StoreCollectionView
+{
+    const char *name;
+    unsigned long art; // the game whose wallpaper is its card
+    int count;         // its games
+};
+
+struct StoreFeaturedView
+{
+    unsigned long titleId; // for its wallpaper
+    const char *name;
+    const char *detail;    // under the name on the large tile; may be NULL
+};
+
+struct StoreButtonView
+{
+    const char *label;
+    bool disabled;         // drawn faded, marked SOON
+};
+
+struct StorePageView
+{
+    const char *featuredLabel; // over the featured tiles - "Featured", or an event's name
+    StoreFeaturedView featured[STORE_FEATURED_MAX];
+    int featuredCount;         // 1 to STORE_FEATURED_MAX
+    StoreCollectionView collections[STORE_COLLECTIONS_MAX];
+    int collectionCount;
+    int collectionScroll; // the first card shown; the caller's to keep, the Render call moves it
+    StoreRowView rows[STORE_ROWS_MAX];
+    int rowCount;
+    StoreButtonView buttons[STORE_BUTTON_COUNT];
+    const char *letters;   // STORE_LETTER_COUNT characters
+    int focus;
+    float scroll;          // pixels the page has moved up; starts at 0
+    bool focused;
+};
+
+// How many A-Z tiles fit across: they wrap onto as many rows as it takes.
+int StoreLettersPerRow();
+
+// How many of a row's games show across at once.
+int StoreRowTilesAcross();
+
+// How many Collections cards show across at once.
+int StoreCollectionsAcross();
+
+// Where featured tile i of count sits, before the page scrolls - and a
+// button's - for the D-pad to go to whichever is next to it.
+//   1: the large tile across the page
+//   2: the large tile and one as tall beside it
+//   3: the large tile and two stacked
+//   4: the large tile, one beside it, two half as wide under that
+//   5: the large tile and four beside it, two by two
+void StoreFeaturedTileRect(int count, int i, float *x, float *y, float *w, float *h);
+void StoreButtonRect(int i, float *x, float *y, float *w, float *h);
+
+void RenderStoreFrame(StorePageView &view, const UiHint *hints, int hintCount);
+
+// A page of the Store that is only rows of tiles scrolling sideways under its
+// header, laid out as the front page's rows of games are - the Homebrew
+// page's apps, homebrew and emulators. A row's tiles may be any number.
+// focusRow and focusPlace are the caller's; scroll, in pixels, and each row's
+// scroll, its first tile shown, are kept between frames and moved by the
+// Render call so the focused tile is on screen. A tile marked installed
+// carries an INSTALLED pill.
+struct StoreRowsView
+{
+    const char *title;
+    const char *subtitle;  // may be NULL
+    StoreRowView rows[STORE_ROWS_MAX];
+    const bool *installed[STORE_ROWS_MAX]; // each row's, a flag a tile; NULL for none
+    int rowCount;
+    int focusRow;
+    int focusPlace;
+    float scroll;
+    bool focused;
+};
+
+void RenderStoreRowsFrame(StoreRowsView &view, const UiHint *hints, int hintCount);
+
+// A section of the Store that is only its A-Z tiles - Xbox Live Arcade's -
+// laid out as the front page's are. focus is the letter, 0 to
+// STORE_LETTER_COUNT - 1.
+struct StoreSectionView
+{
+    const char *title;    // the header's
+    const char *subtitle;
+    const char *letters;  // STORE_LETTER_COUNT characters
+    const int *counts;    // the games under each; a letter with none is drawn faded
+    int focus;
+    bool focused;
+};
+
+void RenderStoreSectionFrame(StoreSectionView &view, const UiHint *hints, int hintCount);
+
+// Turns at most one image StoreArt.cpp has ready into a texture. Call once
+// per frame, as PumpCoverArt.
+void PumpStoreArt();
+
+// One letter's games: a grid of cover tiles like the library's. The covers on screen and the row after are
+// asked for as they come into view, and only those are kept.
+struct StoreTileView
+{
+    unsigned long titleId;  // for its cover; 0 for none
+    const char *name;
+    char letter;            // its A to Z tile's
+    bool indie;             // an indie game: no cover, so the indie banner beside its name
+};
+
+// The Filter and sort panel, down the right over a letter's grid: a row each
+// for a value left and right step through, a checkbox, or a button. Some
+// start a group, with a heading over them.
+enum StoreFilterRowKind
+{
+    STORE_FILTER_VALUE,
+    STORE_FILTER_CHECK,
+    STORE_FILTER_BUTTON
+};
+
+struct StoreFilterRowView
+{
+    StoreFilterRowKind kind;
+    const char *heading; // over the row; NULL for none
+    const char *label;
+    const char *value;   // a value's
+    bool canDown, canUp; // a value's: whether left and right go anywhere
+    bool on;             // a checkbox's
+    bool disabled;       // greyed out: it does nothing here
+};
+
+struct StoreFilterView
+{
+    const StoreFilterRowView *rows;
+    int count;
+    int focus;
+};
+
+struct StoreLetterView
+{
+    char letter;
+    const char *title;   // in place of the letter - a search's; NULL for the letter
+    const char *section; // before the count in the header - "Xbox Live Arcade"; NULL for none
+    const char *filter;  // the filters chosen - "USA, Shooters +2"; NULL for none
+    const char *filterAll; // every one of them, for a letter they've left empty
+    const StoreFilterView *panel; // open over the grid; NULL when it's closed
+    bool letterJumps;    // All games in A to Z order: the header names the focused game's letter
+    const StoreTileView *tiles;
+    int count;
+    int selected;
+    int scroll;  // rows, as LibraryPageView's
+    bool focused;
+};
+
+// Full rows on screen - LB/RB page by this many.
+int StoreLetterVisibleRows();
+
+void RenderStoreLetterFrame(StoreLetterView &view, const UiHint *hints, int hintCount);
+
+// A game's page: its wallpaper across the top, the box, the catalog's
+// details, its buttons, the synopsis and screenshots - and under them, More
+// like this, a row of games that scrolls sideways. Its versions are on a
+// panel down the right, open over the page while versionsOpen; Install
+// installs the chosen one, which is the best one unless someone chose.
+//
+// focus: STORE_GAME_FOCUS_BUTTONS + 0..3 is a button, STORE_GAME_FOCUS_SIMILAR
+// + i a game in the row. similarScroll is the row's first game shown, and
+// scroll how far the page has moved up to show it; on the panel,
+// versionFocus is the focused version and versionScroll the first shown.
+// The Render call keeps what's focused on screen. The buttons are Install,
+// Find DLC, Title updates and Uninstall; a NULL one isn't shown, and only
+// the last may be - Uninstall, while there's nothing installed to remove.
+#define STORE_GAME_BUTTONS        4
+#define STORE_GAME_FOCUS_BUTTONS  0
+#define STORE_GAME_FOCUS_SIMILAR  STORE_GAME_BUTTONS
+#define STORE_SIMILAR_MAX         24
+
+struct StoreVersionView
+{
+    const char *label;  // "USA, Europe  ·  Disc 2"
+    const char *detail; // "En, Fr, De  ·  Rev 1"; may be empty
+    const char *size;   // "6.2 GB"
+};
+
+// Whether the game on a game page can be installed, or is on its way or
+// already there.
+enum StoreInstallState
+{
+    STORE_INSTALL_AVAILABLE,  // green - A installs the chosen version
+    STORE_INSTALL_QUEUED,     // waiting its turn on the Queue page
+    STORE_INSTALL_INSTALLING, // the button fills as it goes
+    STORE_INSTALL_INSTALLED   // in the library
+};
+
+struct StoreGameView
+{
+    unsigned long titleId;  // for the wallpaper, box and screenshots
+    bool indie;             // an indie game: its box is the indie banner beside its name
+    const char *name;
+    const char *meta;       // "Bungie Studios  ·  Microsoft  ·  Shooter"; NULL while loading or for none
+    const char *players;    // may be NULL
+    float rating;           // 0..5; 0 hides the stars
+    unsigned long ratings;
+    const char *description; // NULL: the page explains there's no catalog entry
+    bool loading;           // the details haven't arrived yet
+    const int *screenshots; // their numbers, for STORE_ART_SCREEN + n
+    int screenshotCount;
+
+    const char *buttons[STORE_GAME_BUTTONS];
+    bool buttonDisabled[STORE_GAME_BUTTONS];
+    StoreInstallState install; // how the first button, Install, is drawn
+    float installFraction;     // while installing: 0..1, negative when unknown
+
+    const StoreVersionView *versions;
+    int versionCount;
+    int versionChosen;      // the one Install installs
+    bool versionsOpen;      // the panel
+    int versionFocus;
+    int versionScroll;
+
+    const StoreTileView *similar; // More like this; none hides the row
+    int similarCount;
+    int similarScroll;
+    float scroll;           // pixels the page has moved up; starts at 0
+
+    int focus;
+    bool focused;
+};
+
+void RenderStoreGameFrame(StoreGameView &view, const UiHint *hints, int hintCount);
+
+// A page with nothing to choose on it - a heading and a line or two of text.
+// For Store, which is a placeholder, and Queue while nothing is downloading.
+// detailLine may be NULL.
+void RenderPlaceholderFrame(const char *heading, const char *message, const char *detailLine,
+                            const UiHint *hints, int hintCount);
+
+// The download queue. Each row is one pack or title update, with the cover of
+// the game it's for, two lines of text and, while it's waiting or
+// downloading, a progress bar.
+enum QueueRowTone
+{
+    QUEUE_ROW_WAITING,
+    QUEUE_ROW_ACTIVE,
+    QUEUE_ROW_DONE,
+    QUEUE_ROW_FAILED
+};
+
+struct QueueRowView
+{
+    const char *title;    // the pack's or update's filename
+    const char *gameName;
+    const char *status;   // coloured by tone: "Waiting", "File 2 of 5", "Installed - restart your dashboard..."
+    const char *numbers;  // right-aligned beside the status while downloading; may be NULL
+    float fraction;       // the whole job, 0..1, the percentage beside the title; negative for none
+    bool showBar;
+
+    // A job of more than one step draws its bar in that many segments, as
+    // the console's own update does: those before step full, step's as far
+    // as stepFraction (negative: none yet), the rest empty. stepCount 0 or 1
+    // draws one bar, filled to fraction.
+    int step;
+    int stepCount;
+    float stepFraction;
+    float stepWidths[4]; // each segment's share of the bar's width, adding up to 1
+    int libraryIndex;     // whose icon to draw, into the view's games; -1 for none
+    unsigned long titleId; // whose box art - found even for a game that isn't in the library
+    QueueRowTone tone;
+};
+
+// A game that finished installing, as a tile in the row across the top of
+// the page. A card had three lines and a bar's worth of height to say
+// "Installed" in, and sat there saying it over whatever was still going;
+// the cover and the name are all that's left to tell. Only installs come
+// here - a job that failed or was stopped keeps its card, because the line
+// under it is the point of it.
+struct QueueRecentView
+{
+    const char *name;
+    int libraryIndex;      // whose icon, into the view's games; -1 for none
+    unsigned long titleId; // whose box art
+};
+
+// games/gameCount are the library, for the covers - the same array the
+// library page draws, so they share its cover cache.
+struct QueuePageView
+{
+    const InstalledGame *games;
+    int gameCount;
+    const QueueRowView *rows;
+    int count;
+    int selected;
+    int scroll;
+    bool focused;
+
+    // The row above the cards. recentFocused says the focus is up there
+    // rather than on them, which keeps their selection where it was.
+    const QueueRecentView *recents;
+    int recentCount;
+    int recentFocus;
+    int recentScroll;
+    bool recentFocused;
+};
+
+void RenderQueueFrame(QueuePageView &view, const UiHint *hints, int hintCount);
+
+// ---------------------------------------------------------------------------
+// Popup
+// ---------------------------------------------------------------------------
+
+// A short notice at the top right of the page - a download finishing or
+// failing, a pack added to the queue - that goes away on its own after a few
+// seconds and never takes input, so it can turn up on any page without
+// getting in the way. A new one replaces whatever is showing.
+//
+// Drawn by the shell's pages (the Render*Frame calls above), not by the
+// blocking screens, which carry their own messages.
+enum UiToastTone
+{
+    UI_TOAST_INFO,
+    UI_TOAST_SUCCESS,
+    UI_TOAST_ERROR
+};
+
+void ShowShellToast(const char *heading, const char *message, UiToastTone tone);
+
+// Something slow running behind the page, shown at the right of the footer
+// on whatever page is up - "Refreshing library" while the drive is read
+// again after an install. NULL clears it. It takes no input and blocks
+// nothing; it is only there so a page that is briefly out of date says so.
+void SetShellBusy(const char *label);
+
+// ---------------------------------------------------------------------------
+// Blocking screens
+// ---------------------------------------------------------------------------
+
+// Draws one progress-bar frame. Intended to be called repeatedly from inside
+// a download loop - see main.cpp's DlcProgressCallback, which drives it from
+// downloadFile.cpp's own read loop via DownloadProgressFn.
+//
+//   title      - what's being downloaded (the game or pack name)
+//   statusLine - which piece, e.g. "file 3 of 12"
+//   detailLine - live numbers, e.g. "12.4 MB / 48.0 MB - 1.2 MB/s - 3:21 left".
+//                May be NULL/empty when there's nothing to say yet.
+//   fraction0to1 - bar fill; clamped internally. Pass a negative value for an
+//                indeterminate download (unknown total size), which draws an
+//                empty trough rather than a misleading 0%.
+//   heading    - the screen heading. "Downloading" for the transfer itself;
+//                the steps before it name themselves.
+void RenderProgressFrame(const char *title, const char *statusLine,
+                         const char *detailLine, float fraction0to1,
+                         const char *heading = "Downloading");
+
+// Draws one non-interactive status frame and returns immediately - for the
+// blocking phases between screens (scanning the library, talking to
+// archive.org, reading a pack's file list), which otherwise leave the last
+// screen frozen or fall back to raw console text.
+//
+// detailLine may be NULL. Call it before starting the slow work, not after.
+void RenderStatusFrame(const char *heading, const char *message, const char *detailLine);
+
+// The frame left on screen as a game starts: its Xbox Live wallpaper - the
+// one the Store's game page shows - filling the screen, waiting a moment
+// for it if it isn't loaded. The name, as RenderStatusFrame draws it, for a
+// game the marketplace has no wallpaper for. titleId may be 0.
+void RenderLaunchFrame(const char *heading, const char *name, unsigned long titleId);
+
+// Draws a message and waits for B. For terminal states (nothing found, an
+// error, finished) that previously just printed a line and dropped the user
+// back to a console screen.
+void ShowMessageUI(const char *heading, const char *message, const char *detailLine);
+
+// Draws a title, a few wrapped paragraphs and a line beneath them - for an
+// update's release notes. body may hold '\n's; what doesn't fit is cut off.
+// With an actionLabel, A does that and returns true; B, or A without one,
+// returns false.
+bool ShowNotesUI(const char *heading, const char *title, const char *body, const char *footLine,
+                 const WCHAR *actionLabel = NULL);
+
+// An alert over the page, like the web's window.alert or SweetAlert: the page
+// as it was stays behind it, dimmed, and a card in the middle holds heading,
+// a few wrapped lines of message, an optional dimmer detailLine, and its
+// buttons. Left and right move between them, A presses the one with focus, B
+// cancels. Returns true for confirmLabel. With no cancelLabel there's only
+// the one button - an OK - and B closes it too.
+bool ShowAlertUI(const char *heading, const char *message, const char *detailLine, const char *confirmLabel,
+                 const char *cancelLabel);
+
+// An alert asking to go ahead - confirmLabel names what that does, e.g.
+// "Remove" - or Cancel. For actions that take long or can't be undone.
+bool ShowConfirmUI(const char *heading, const char *message, const char *detailLine,
+                   const char *confirmLabel);
+
+// A short list over the page, as Settings draws one, and waits: A picks a
+// row and returns its index, B returns -1. sublabels may be NULL.
+int ShowChoiceUI(const char *heading, const char *subheading, const char **labels, const char **sublabels,
+                 int count, const WCHAR *chooseLabel);
+
+#endif

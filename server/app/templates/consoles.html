@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Consoles · GOD Foundry</title>
+  <link rel="stylesheet" href="/static/app.css">
+  <style>
+    main {max-width:1100px;margin:auto;padding:36px 24px} a{color:inherit}
+    .console-card{padding:24px;border:1px solid var(--line);border-radius:16px;margin:20px 0;background:var(--white);box-shadow:var(--shadow)}
+    .console-card input{padding:12px;border:1px solid var(--line);border-radius:8px;background:white;color:var(--ink);max-width:100%}
+    .console-card button{padding:12px 18px;border:0;border-radius:8px;background:var(--teal);color:white;cursor:pointer}
+    .console-row{display:flex;gap:20px;align-items:center;justify-content:space-between;padding:16px 0;border-bottom:1px solid var(--line)}
+    .console-row p{margin:5px 0;color:var(--ink-soft);overflow-wrap:anywhere} #notice{min-height:24px} form{display:flex;flex-wrap:wrap;gap:16px;align-items:end} label{display:grid;gap:8px}
+  </style>
+</head>
+<body><main>
+  <a href="/">← Library workspace</a>
+  <p class="eyebrow">GOD FOUNDRY / XBOX 360</p>
+  <h1>Your consoles.</h1>
+  <p>Pair Omni360 GoD to browse and install your library directly from your Xbox.</p>
+  <section class="console-card">
+    <h2>Pair a console</h2>
+    <p>Open Foundry on the Xbox, choose Pair, and enter the code shown there. Approve only a console you recognize.</p>
+    <form id="pair-form">
+      <label>Xbox pairing code<input id="code" required maxlength="9" placeholder="ABCD-1234" autocomplete="off" pattern="[A-Fa-f0-9]{4}-[A-Fa-f0-9]{4}"></label>
+      <label>Device name<input id="name" maxlength="60" placeholder="Living room Xbox"></label>
+      <button type="submit">Approve console</button>
+    </form>
+    <p id="notice" role="status" aria-live="polite"></p>
+  </section>
+  <section class="console-card"><h2>Paired devices</h2><div id="devices">Loading…</div></section>
+  <section class="console-card"><h2>Recent console requests</h2><p>Ready means the server has prepared the download. Installation and playback happen on the Xbox. Enable installed title updates in Aurora.</p><div id="requests"></div></section>
+  <script src="/static/consoles.js" defer></script>
+</main></body></html>
