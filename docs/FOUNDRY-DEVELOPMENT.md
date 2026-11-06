@@ -31,10 +31,12 @@ InflateSource/GodConvert engine. RAR, original Xbox games and ambiguous archives
 are not advertised by the Foundry source API in this first implementation.
 The original provider's supported formats remain separate.
 
-The UI currently installs mode-B base games separately from add-ons. Use
-server mode/component selection for prepared add-ons. Online lookup of updates
-for a fresh mode-B game without server-side game metadata remains a follow-up
-acceptance item; do not claim that workflow is complete.
+The UI installs mode-B base games separately from add-ons. Use server
+mode/component selection for prepared add-ons. **Title updates for installed
+games** reads each local disc's execution ID and asks Foundry to fetch the
+latest exact XboxUnity match, including when the server never converted that
+game. The console independently checks the local game's identity before
+committing the downloaded update. Physical-console verification remains required.
 
 ## Server protocol
 
@@ -74,6 +76,13 @@ adding a TU. Explicit component IDs select prepared components, including DLC
 or a verified update. `unlock_packages` is an optional boolean captured for
 processing. GoD licenses are always preserved. Changing an already-unlocked
 digital package back requires source reprocessing, not a synthetic relock.
+
+To fetch a TU for a locally converted/installed game, submit an install request
+with `kind: "title_update"` and `game_identity` containing eight-digit hex
+`title_id`, `media_id`, and actual XEX `base_version`. No catalog release or ISO
+conversion is required. The endpoint fetches only from XboxUnity, validates the
+download against its content ID/size and the exact execution identity, and
+returns an ordinary immutable prepared manifest. Missing matches fail clearly.
 
 Artifact storage is separate from mutable combined ZIPs under
 `WORK_DIR/console`; snapshots are copied, SHA-256 hashed, validated and published
@@ -124,6 +133,6 @@ be presented as a compiled Foundry binary.
 - DLC visible in-game and matched TU launch/activation through Aurora.
 - Disk-full, cancellation, disconnected storage and power loss through commit.
 - Multi-disc and alternate-basename replacements preserve other content.
-- Fresh console-mode games can discover/fetch missing online TUs if advertised.
+- Online TU lookup for a fresh console-mode game, followed by an in-game launch.
 - Check the longer `FOUNDRY-INTEGRATION-PLAN.txt` against the delivered behavior;
   no untested or incomplete feature is a stable-release promise.

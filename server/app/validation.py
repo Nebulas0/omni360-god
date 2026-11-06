@@ -147,6 +147,8 @@ def validate_god(header: Path, *, full_data: bool = False) -> dict:
     if info is None or info.content_type != CONTENT_GOD:
         raise ValidationError("Invalid GoD header")
     h = header.read_bytes()
+    if len(h) >= 0x32C and not any(h[0x22C:0x32C]):
+        raise ValidationError("GoD license table is empty; reprocess the original disc image")
     if len(h) != 0xB000 or hashlib.sha1(h[0x344:]).digest() != h[0x32C:0x340]:
         raise ValidationError("GoD header checksum failed")
     parts = GodVolume(header).parts

@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import shutil
 import time
 import zipfile
 from pathlib import Path
@@ -11,6 +12,7 @@ from app import create_app
 from config import Config
 from console_api import ConsoleError, PREFIX, digest, safe_relative
 from package_fixtures import synthetic_iso, write_god, write_tu
+from xboxunity import TitleUpdateEntry, XboxUnityClient
 
 CSRF = {"X-Requested-With": "XMLHttpRequest"}
 
@@ -271,3 +273,61 @@ def test_captured_unlock_option_survives_setting_change(setup):
     assert json.loads(db.get_job(queued["job_id"])["options_json"])["unlock_packages"] is False
     with pytest.raises(ValueError, match="different settings"):
         db.enqueue_items([1], options={"unlock_packages": True})
+
+
+@pytest.mark.parametrize("cache", [False, True])
+def test_online_update_for_console_converted_game_needs_no_server_game_or_iso(setup, tmp_path, monkeypatch, cache):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    fixture = tmp_path / "fixture-tu"
+    raw = write_tu(fixture, base_version=2)
+    entry = TitleUpdateEntry("test-123", 3, "12345678", "Test update", len(raw), "", "00000002", raw[0x32C:0x340].hex(), "415607E1")
+    monkeypatch.setattr(XboxUnityClient, "get_title_updates", lambda self, title: [entry])
+
+    def download(self, update, target):
+        target.mkdir(parents=True, exist_ok=True)
+        result = target / ("TU_test_update" if cache else "tu_test_update")
+        shutil.copy2(fixture, result)
+        return result
+
+    monkeypatch.setattr(XboxUnityClient, "download_title_update", download)
+    value = {"kind": "title_update", "game_identity": {"title_id": "415607E1", "media_id": "12345678", "base_version": "00000002"}}
+    response = client.post(PREFIX + "/install-requests", json=value, headers={**h, "Idempotency-Key": "online-tu-test-123456"})
+    assert response.status_code == 200
+    s.prepare(s.get_request(response.json["id"]))
+    row = s.get_request(response.json["id"])
+    assert row["state"] == "ready" and row["job_id"] is None
+    manifest = client.get(f"{PREFIX}/artifacts/{row['artifact_id']}/manifest", headers=h).json
+    update = manifest["components"][0]
+    assert update["unlock_applied"] is False
+    assert update["compatibility"] == value["game_identity"]
+    assert update["files"][0]["root"] == ("cache" if cache else "content")
+    assert client.get(update["files"][0]["download_path"], headers=h).data == raw
+
+
+def test_online_update_unknown_identity_and_absent_match_are_explicit(setup, monkeypatch):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    headers = {**h, "Idempotency-Key": "online-tu-missing-123"}
+    assert client.post(PREFIX + "/install-requests", json={"kind": "title_update", "game_identity": {}}, headers=headers).status_code == 400
+    monkeypatch.setattr(XboxUnityClient, "get_title_updates", lambda self, title: [])
+    value = {"kind": "title_update", "game_identity": {"title_id": "415607E1", "media_id": "12345678", "base_version": "00000002"}}
+    response = client.post(PREFIX + "/install-requests", json=value, headers=headers)
+    with pytest.raises(ConsoleError, match="no update for this exact"):
+        s.prepare(s.get_request(response.json["id"]))
+
+
+def test_online_update_wrong_content_id_is_not_published(setup, tmp_path, monkeypatch):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    raw_path = tmp_path / "update"
+    raw = write_tu(raw_path)
+    entry = TitleUpdateEntry("test-bad", 3, "12345678", "Wrong ID", len(raw), "", "00000002", "AB"*20, "415607E1")
+    monkeypatch.setattr(XboxUnityClient, "get_title_updates", lambda self, title: [entry])
+    monkeypatch.setattr(XboxUnityClient, "download_title_update", lambda self, entry, target: raw_path)
+    value = {"kind": "title_update", "game_identity": {"title_id": "415607E1", "media_id": "12345678", "base_version": "00000002"}}
+    response = client.post(PREFIX + "/install-requests", json=value, headers={**h, "Idempotency-Key": "online-tu-wrong-12345"})
+    with pytest.raises(ValueError, match="content ID"):
+        s.prepare(s.get_request(response.json["id"]))
+    with s.connect() as c:
+        assert c.execute("SELECT count(*) FROM console_artifacts").fetchone()[0] == 0

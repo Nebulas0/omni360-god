@@ -29,6 +29,15 @@ def test_god_rejects_stale_or_missing_fragments(tmp_path):
         validate_god(header)
 
 
+def test_god_rejects_erased_license_table_even_when_hashes_are_valid(tmp_path):
+    header = write_god(tmp_path / "415607E1")
+    raw = bytearray(header.read_bytes())
+    raw[0x22C:0x32C] = bytes(0x100)
+    header.write_bytes(raw)
+    with pytest.raises(ValidationError, match="license table is empty"):
+        validate_god(header, full_data=True)
+
+
 def test_title_update_matches_content_id_not_full_file_sha1(tmp_path):
     path = tmp_path / "tu"
     raw = write_tu(path)

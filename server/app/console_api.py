@@ -24,10 +24,11 @@ from pathlib import Path, PurePosixPath
 from flask import Blueprint, Response, g, jsonify, request, send_file
 
 from db import Database, normalize_search_text, utc_now
-from formats import CONTENT_ARCADE, CONTENT_DLC, CONTENT_GOD, CONTENT_TITLE_UPDATE, parse_stfs_header
+from formats import CONTENT_ARCADE, CONTENT_DLC, CONTENT_GOD, CONTENT_TITLE_UPDATE, is_cache_title_update, parse_stfs_header
 from remote import RemoteClient
 from validation import validate_god, validate_title_update
 from unlock import is_unlocked, unlock_package
+from xboxunity import XboxUnityClient, XboxUnityError
 
 PREFIX = "/api/console/v1"
 SCOPES = {"catalog:read", "install:create", "artifact:read", "install:report"}
@@ -236,9 +237,23 @@ class ConsoleService:
         return {k: v for k, v in component.items() if not k.startswith("_")}
 
     def create_request(self, payload, idem):
-        if set(payload) - {"release_id", "conversion", "component_ids", "unlock_packages"}:
+        if set(payload) - {"release_id", "conversion", "component_ids", "unlock_packages", "kind", "game_identity"}:
             raise ConsoleError("INVALID_REQUEST", "Unknown installation option")
-        item = self.item(payload.get("release_id"))
+        identity = None
+        if payload.get("kind") == "title_update":
+            identity = payload.get("game_identity")
+            if not isinstance(identity, dict) or set(identity) != {"title_id", "media_id", "base_version"}:
+                raise ConsoleError("METADATA_UNKNOWN", "Read the installed game's Title ID, Media ID and XEX base version")
+            if any(not isinstance(v, str) or not re.fullmatch(r"[0-9A-Fa-f]{8}", v) for v in identity.values()):
+                raise ConsoleError("METADATA_UNKNOWN", "Invalid game execution identity")
+            identity = {k: v.upper() for k, v in identity.items()}
+            item = {"source_kind": "disc"}
+            release = "installed-" + "-".join(identity[k] for k in ("title_id", "media_id", "base_version"))
+        else:
+            if payload.get("kind") not in {None, "release"} or "game_identity" in payload:
+                raise ConsoleError("INVALID_REQUEST", "Unknown install request kind")
+            item = self.item(payload.get("release_id"))
+            release = payload["release_id"]
         mode = payload.get("conversion", "server")
         if mode not in {"server", "console"} or (mode == "console" and item["source_kind"] != "disc"):
             raise ConsoleError("UNSUPPORTED_SOURCE", "Xbox conversion is only available for disc archives")
@@ -248,8 +263,12 @@ class ConsoleService:
         unlock = payload.get("unlock_packages", self.config.effective_unlock_packages)
         if not isinstance(unlock, bool):
             raise ConsoleError("INVALID_REQUEST", "unlock_packages must be boolean")
-        normalized = {"release_id": payload["release_id"], "conversion": mode,
+        normalized = {"release_id": release, "conversion": mode,
                       "component_ids": sorted(set(ids)), "unlock_packages": unlock}
+        if identity:
+            if mode != "server" or ids:
+                raise ConsoleError("INVALID_REQUEST", "Title updates are prepared on the server")
+            normalized.update(kind="title_update", game_identity=identity, unlock_packages=False)
         encoded = json_bytes(normalized).decode()
         device = g.console_device["id"]
         with self.connect() as c:
@@ -325,6 +344,10 @@ class ConsoleService:
 
     def prepare(self, row):
         payload = json.loads(row["payload"])
+        if payload.get("kind") == "title_update":
+            self.update(row["id"], state="preparing", message="Finding the exact update for the installed game")
+            self.publish_update(row, payload)
+            return
         item = self.item(payload["release_id"])
         if payload["conversion"] == "console":
             self.update(row["id"], state="preparing", message="Preparing original archive")
@@ -533,6 +556,48 @@ class ConsoleService:
             shutil.rmtree(staging, ignore_errors=True)
             raise
 
+    def publish_update(self, row, payload):
+        if not self.config.xboxunity_tu_downloads:
+            raise ConsoleError("FEATURE_DISABLED", "Title-update downloads are disabled on the server", 409)
+        identity = payload["game_identity"]
+        rid, staging = secrets.token_hex(16), None
+        try:
+            client = XboxUnityClient(timeout=30, retries=2)
+            latest = client.select_latest_for_media_id(client.get_title_updates(identity["title_id"]),
+                                                       identity["media_id"], identity["base_version"])
+            if latest is None:
+                raise ConsoleError("NO_COMPATIBLE_UPDATE", "XboxUnity has no update for this exact Media ID and XEX base version", 404)
+            if not re.fullmatch(r"[0-9A-Fa-f]{40}", latest.sha1_hash):
+                raise ConsoleError("VALIDATION_FAILED", "XboxUnity did not supply a valid content ID")
+            self.check_quota(max(latest.size, 1024**3))
+            staging = self.root / (rid + ".partial")
+            staging.mkdir()
+            path = client.download_title_update(latest, staging / "incoming")
+            checked = validate_title_update(path, **identity, content_id=latest.sha1_hash, expected_size=latest.size)
+            cache = is_cache_title_update(path.name)
+            relative = safe_relative(path.name if cache else identity["title_id"] + "/000B0000/" + path.name)
+            root = "cache" if cache else "content"
+            key = root + "/" + relative
+            file_id = digest(key)[:32]
+            size, sha = self.copy_hash(path, staging / key)
+            shutil.rmtree(staging / "incoming")
+            component = {"component_id": file_id, "kind": "title_update", "name": path.name,
+                         "content_type": "000B0000", "unlock_applied": False, **checked,
+                         "compatibility": identity, "identity_source": "console_execution_id",
+                         "files": [{"file_id": file_id, "root": root, "relative_path": relative,
+                                    "role": "package", "bytes": size, "sha256": sha, "etag": sha,
+                                    "download_path": f"{PREFIX}/artifacts/{rid}/files/{file_id}"}]}
+            manifest = {"schema_version": 1, "artifact_id": rid, "provider_id": "foundry",
+                        "release_id": payload["release_id"], "conversion": "server", "created_at": utc_now(),
+                        "components": [component], "warnings": ["Enable this title update in Aurora after installation"]}
+            self.finish_artifact(row, rid, staging, manifest, "prepared")
+        except Exception as exc:
+            if staging:
+                shutil.rmtree(staging, ignore_errors=True)
+            if isinstance(exc, XboxUnityError):
+                raise ConsoleError("TITLE_UPDATE_FAILED", "XboxUnity lookup or download failed; retry later", 502) from exc
+            raise
+
     def finish_artifact(self, row, rid, staging, manifest, kind):
         raw = json_bytes(manifest)
         if len(raw) > 1024**2:
@@ -605,10 +670,11 @@ def register_console_api(app, config, database, runner, remote, start_background
 
     @api.get("/capabilities")
     def capabilities():
-        return jsonify(protocol_version=1, min_client_version="1.0.0", provider_id="foundry",
+        return jsonify(protocol_version=1, min_client_version="1.0.0-alpha.1", provider_id="foundry",
                        modes=["server", "console"], source_formats=["zip-stored", "zip-deflate"],
                        manifest_limit_bytes="1048576", max_page_size=50, max_components=100,
-                       max_file_bytes=str(MAX_FILE), checksums=["sha256"], pairing=True)
+                       max_file_bytes=str(MAX_FILE), checksums=["sha256"], pairing=True,
+                       online_title_updates=config.xboxunity_tu_downloads)
 
     @api.post("/pairings")
     def pair():

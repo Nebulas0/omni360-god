@@ -19,6 +19,7 @@
 #include <string.h>
 #include <time.h>
 #include <algorithm>
+#include <map>
 
 static const char *API="/api/console/v1";
 static const char *DEVICE="game:\\FoundryDevice.json";
@@ -41,6 +42,7 @@ struct Move
 {
     std::string root, from, to;
 };
+struct InstalledIdentity { std::string title, media, base; };
 static Device g_device;
 static Work g_work;
 static CRITICAL_SECTION g_lock;
@@ -202,7 +204,7 @@ static std::string Root(const Work &w,const std::string &kind)
 {
     if(kind=="games") return w.games;
     if(kind=="content") return w.content;
-    if(kind=="cache") return w.content.substr(0,w.content.find('\\'))+"\\Cache";
+    if(kind=="cache") return "Hdd1:\\Cache";
     return "";
 }
 static std::string Stage(const std::string &root,const std::string &aid) { return root+"\\_Foundry\\"+aid; }
@@ -309,6 +311,17 @@ static bool CheckPackage(const std::string &path,const FoundryComponent &c,std::
     header.resize(end);fseek(f,0,SEEK_SET);ok=fread(&header[0],1,end,f)==end;fclose(f);
     br_sha1_context sha;br_sha1_init(&sha);br_sha1_update(&sha,&header[0x344],end-0x344);unsigned char sum[20];br_sha1_out(&sha,sum);
     ok=ok&&memcmp(sum,&header[0x32c],20)==0&&Hex32(BE32(&header[0x360]))==c.titleId&&Hex32(BE32(&header[0x344]))==c.contentType;
+    if(!c.contentId.empty())
+    {
+        static const char hex[]="0123456789ABCDEF";std::string content;
+        for(unsigned i=0x32c;i<0x340;++i){content+=hex[header[i]>>4];content+=hex[header[i]&15];}
+        ok=ok&&content==c.contentId;
+    }
+    if(c.kind=="god")
+    {
+        bool licensed=false;for(unsigned i=0x22c;i<0x32c;++i)if(header[i])licensed=true;
+        ok=ok&&licensed;
+    }
     if(c.kind=="god"||c.kind=="title_update")ok=ok&&Hex32(BE32(&header[0x354]))==c.mediaId;
     if(c.kind=="title_update")ok=ok&&Hex32(BE32(&header[0x35c]))==c.baseVersion;
     if(!ok){*error="Package metadata does not match the installation";return false;}
@@ -405,7 +418,21 @@ static bool Commit(const Work &w,const FoundryManifest &m,std::string *error)
 }
 static bool Prepared(const Work &w,const FoundryManifest &m,std::string *error)
 {
-    if(!FreeSpace(w.games,m.totalBytes)||!FreeSpace(w.content,m.totalBytes)){*error="Not enough free space for staging and recovery";return false;}
+    std::map<std::string,unsigned long long> required;
+    for(size_t i=0;i<m.components.size();++i)
+    {
+        const FoundryComponent &c=m.components[i];std::string root=Root(w,c.kind=="god"?"games":c.files[0].root=="cache"?"cache":"content");
+        if(c.files[0].root=="cache"&&!Exists("Hdd1:\\")){*error="This legacy title update requires an internal Hdd1 Cache destination";return false;}
+        for(size_t j=0;j<c.files.size();++j)
+        {
+            const FoundryFile &f=c.files[j];unsigned long long staged=Length(Stage(root,m.id)+"\\files\\"+Native(f.path));
+            unsigned long long partial=Length(Stage(root,m.id)+"\\parts\\"+f.id+".part");
+            unsigned long long available=staged==f.bytes?staged:partial<=f.bytes?partial:0;
+            required[root]+=f.bytes-available;
+        }
+    }
+    for(std::map<std::string,unsigned long long>::const_iterator it=required.begin();it!=required.end();++it)
+        if(!FreeSpace(it->first,it->second)){*error="Not enough free space on the selected destination for staging and recovery";return false;}
     for(size_t i=0;i<m.components.size();++i)
     {
         const FoundryComponent &c=m.components[i];std::string root=Root(w,c.kind=="god"?"games":c.files[0].root=="cache"?"cache":"content");
@@ -684,14 +711,50 @@ static void BrowseUI(const char *games,const char *content,bool digital)
         QueueRelease(releases[pick],labels[pick],games,content,digital);return;
     }
 }
+static void OnlineUpdatesUI(const char *games,const char *content)
+{
+    cJSON *caps=NULL;if(!UiCall(std::string(API)+"/capabilities","",false,&caps))return;
+    bool available=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(caps,"online_title_updates"));cJSON_Delete(caps);
+    if(!available){ShowMessageUI("Title updates","This server does not enable online title-update requests",NULL);return;}
+    QueueJobSnapshot snap;if(SnapshotFoundryJobs(&snap,1)&&snap.state!=QUEUE_FINISHED){ShowMessageUI("Foundry","Wait for the active installation to finish",NULL);return;}
+    RenderProgressFrame("Title updates","Reading installed game execution IDs",NULL,-1,"Checking library");
+    std::vector<InstalledGame> installed(256);int found=EnumerateInstalledGames(games,&installed[0],(int)installed.size(),dprintf);
+    std::vector<InstalledIdentity> ids;std::vector<std::string> labels;
+    for(int i=0;i<found&&ids.size()<256;++i)
+    {
+        std::string dir=std::string(games)+"\\"+Hex32(installed[i].titleId)+"\\00007000";WIN32_FIND_DATAA fd;HANDLE h=FindFirstFileA((dir+"\\*").c_str(),&fd);
+        if(h==INVALID_HANDLE_VALUE)continue;
+        do {
+            if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)continue;
+            InstalledGodSource source(dir+"\\"+fd.cFileName);GodImageInfo info;
+            if(GodInspect(&source,&info)!=GOD_OK||info.title.contentType!=GOD_CONTENT_GAMES_ON_DEMAND)continue;
+            InstalledIdentity id;id.title=Hex32(info.title.titleId);id.media=Hex32(info.title.mediaId);id.base=Hex32(info.title.baseVersion);
+            bool duplicate=false;for(size_t j=0;j<ids.size();++j)if(ids[j].title==id.title&&ids[j].media==id.media&&ids[j].base==id.base)duplicate=true;
+            if(!duplicate&&ids.size()<256){ids.push_back(id);labels.push_back(std::string(installed[i].displayName)+" [Media "+id.media+"]");}
+        }while(FindNextFileA(h,&fd));FindClose(h);
+    }
+    FreeInstalledGames(&installed[0],found);ResyncUiInput();
+    if(ids.empty()){ShowMessageUI("Title updates","No installed Xbox 360 GoD game with a readable execution ID",NULL);return;}
+    std::vector<const char*> names;for(size_t i=0;i<labels.size();++i)names.push_back(labels[i].c_str());
+    int pick=ShowChoiceUI("Title updates","Find the latest exact match on XboxUnity through Foundry",&names[0],NULL,(int)names.size(),L"Find and install");if(pick<0)return;
+    cJSON *o=cJSON_CreateObject(),*identity=cJSON_AddObjectToObject(o,"game_identity");cJSON_AddStringToObject(o,"kind","title_update");
+    cJSON_AddStringToObject(identity,"title_id",ids[pick].title.c_str());cJSON_AddStringToObject(identity,"media_id",ids[pick].media.c_str());cJSON_AddStringToObject(identity,"base_version",ids[pick].base.c_str());
+    EnterCriticalSection(&g_lock);++g_device.sequence;bool saved=SaveDevice();std::string key=g_device.id+"_"+Decimal(g_device.sequence);LeaveCriticalSection(&g_lock);
+    if(!saved){cJSON_Delete(o);ShowMessageUI("Not queued","Could not save the request counter",NULL);return;}
+    char *raw=cJSON_PrintUnformatted(o);cJSON *reply=NULL;bool ok=FoundryUiCreate(raw,key,&reply);cJSON_free(raw);cJSON_Delete(o);if(!ok)return;
+    Work w;w.request=Text(reply,"id");w.name=labels[pick]+" - title update";w.games=games;w.content=content;cJSON_Delete(reply);
+    if(!FoundryHex(w.request,32)||!SaveWork(w)){ShowMessageUI("Not queued","Could not save the update request",NULL);return;}
+    EnterCriticalSection(&g_lock);g_work=w;InitSnap(w);InterlockedExchange(&g_cancel,0);g_pending=true;LeaveCriticalSection(&g_lock);SetEvent(g_wake);
+    ShowMessageUI("Title update queued","Foundry will download and check the exact matching update","Enable it in Aurora after installation. No approximate update will be installed.");
+}
 void OpenFoundryUI(const char *games,const char *content)
 {
     if(!g_started&&!StartFoundry(games,content)){ShowMessageUI("Foundry","Worker could not start",NULL);return;}
     for(;;)
     {
-        Device d=DeviceCopy();const char *names[]={"Search games","Search XBLA / DLC","Pair this console","Server address","Resume interrupted installation","Forget console token"};
-        const char *subs[]={"Server or Xbox conversion","Install prepared digital content",d.token.empty()?"Not paired":"Paired",d.origin.c_str(),"Checked files are reused","The website can also revoke access"};
-        int choice=ShowChoiceUI("GOD Foundry","Your server library on the Xbox",names,subs,6,L"Open");if(choice<0)return;
+        Device d=DeviceCopy();const char *names[]={"Search games","Search XBLA / DLC","Pair this console","Server address","Resume interrupted installation","Forget console token","Title updates for installed games"};
+        const char *subs[]={"Server or Xbox conversion","Install prepared digital content",d.token.empty()?"Not paired":"Paired",d.origin.c_str(),"Checked files are reused","The website can also revoke access","Exact execution ID match, including Xbox-converted games"};
+        int choice=ShowChoiceUI("GOD Foundry","Your server library on the Xbox",names,subs,7,L"Open");if(choice<0)return;
         if(choice==2){PairUI();continue;}
         if(choice==3)
         {
@@ -702,6 +765,7 @@ void OpenFoundryUI(const char *games,const char *content)
         }
         if(choice==5){if(ShowConfirmUI("Forget Foundry access","This removes the token from this Xbox","Revoke the device on the website to invalidate any copies.","Forget")){EnterCriticalSection(&g_lock);g_device.token.clear();g_device.id.clear();SaveDevice();LeaveCriticalSection(&g_lock);}continue;}
         if(d.token.empty()){PairUI();continue;}
+        if(choice==6){OnlineUpdatesUI(games,content);continue;}
         if(choice==4)
         {
             QueueJobSnapshot snap;bool active=SnapshotFoundryJobs(&snap,1)&&snap.state!=QUEUE_FINISHED;
