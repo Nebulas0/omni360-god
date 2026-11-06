@@ -4,6 +4,10 @@ Fork for [Nebulas0/omni360-god](https://github.com/Nebulas0/omni360-god).
 Browse GOD Foundry from the Xbox, pair a device token, and install prepared
 packages or download an ISO archive for on-console conversion.
 
+Based on upstream **Omni360 0.13.2-beta** (`830ca4a`), with the Foundry service
+integration and the fork's own signed updater preserved. Fork version:
+**1.0.0-alpha.2**.
+
 **Alpha source: the full Xbox XDK build and real-console acceptance tests are
 still required. No compiled Foundry XEX is available yet.**
 
@@ -88,7 +92,7 @@ Everything downloads and installs in the background while you keep browsing, wit
 
 Your library is read straight off the hard drive, covers and all, and games start from Omni360 just as they would from the dashboard - alongside your apps, homebrew and emulators, if you point it at folders for them. It opens on the games you played last, each under its own wallpaper, and keeps itself up to date, installing only releases signed with the project's key.
 
-**Status: beta (0.13.1-beta), working on real hardware.** Every kind of install has been run end to end on a modded console with a real library.
+**Upstream status: beta (0.13.2-beta), working on real hardware.** The upstream project reports end-to-end console testing; this fork's Foundry integration still needs its own XDK build and console checks.
 
 <br>
 

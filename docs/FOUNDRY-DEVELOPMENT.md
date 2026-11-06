@@ -1,7 +1,7 @@
 # Omni360 GoD / Foundry integration
 
-This is a source integration under development, based on upstream commit
-`d0f3e5e79e19cc54e439de9bde418dbebf2f7964`. It is **not yet verified by an
+This is a source integration under development, based on upstream **0.13.2-beta**, commit
+`830ca4a419f368bb2bb600c28449488cbf0ba5a5`. It is **not yet verified by an
 Xbox XDK build or a physical Xbox test**. Do not label a release stable until
 those checks pass. The ordinary Linux CI job does not produce an XEX.
 
