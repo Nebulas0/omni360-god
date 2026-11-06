@@ -364,3 +364,100 @@ def test_online_update_wrong_content_id_is_not_published(setup, tmp_path, monkey
         s.prepare(s.get_request(response.json["id"]))
     with s.connect() as c:
         assert c.execute("SELECT count(*) FROM console_artifacts").fetchone()[0] == 0
+
+
+def test_retried_install_keeps_original_default_after_global_toggle_changes(setup):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    release, _ = seed_game(s)
+    headers = {**h, "Idempotency-Key": "lost-response-toggle-123"}
+    first = client.post(PREFIX + "/install-requests", json={"release_id": release}, headers=headers)
+    s.config.save_unlock_packages(False)
+    retry = client.post(PREFIX + "/install-requests", json={"release_id": release}, headers=headers)
+    assert retry.status_code == 200 and retry.json["id"] == first.json["id"]
+    assert retry.json["selection"]["unlock_packages"] is True
+    assert client.post(PREFIX + "/install-requests", json={"release_id": release, "unlock_packages": False}, headers=headers).status_code == 409
+
+
+def test_expired_request_exposes_saved_selection_before_periodic_cleanup(setup):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    release, _ = seed_game(s)
+    row = prepare(client, s, h, release)
+    with s.connect() as c:
+        c.execute("UPDATE console_artifacts SET expires=0")
+    status = client.get(PREFIX + "/install-requests/" + row["id"], headers=h).json
+    assert status["state"] == "expired"
+    assert status["selection"]["release_id"] == release
+
+
+def test_game_release_does_not_offer_another_disc_or_edition_as_its_base(setup):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    release, header = seed_game(s)
+    other = header.with_name("87654321")
+    raw = bytearray(header.read_bytes())
+    raw[0x354:0x358] = (0x87654321).to_bytes(4, "big")
+    raw[0x32C:0x340] = hashlib.sha1(raw[0x344:]).digest()
+    other.write_bytes(raw)
+    components = client.get(PREFIX + "/releases/" + release, headers=h).json["components"]
+    assert [c["media_id"] for c in components if c["kind"] == "god"] == ["12345678"]
+
+
+def test_source_ingestion_resumes_the_same_partial_after_server_restart(setup, tmp_path, monkeypatch):
+    from console_api import ConsoleService, RemoteClient
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    release, _ = seed_game(s)
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as out:
+        out.writestr("game.iso", synthetic_iso())
+    raw = archive.read_bytes()
+    with s.connect() as c:
+        c.execute("UPDATE catalog_items SET remote_size=? WHERE id=1", (len(raw),))
+    seen = []
+
+    def interrupted(self, source_path, destination, expected_size=0, progress=None):
+        seen.append(destination)
+        partial = destination.with_name(destination.name + ".part")
+        if len(seen) == 1:
+            partial.write_bytes(raw[:50])
+            raise RuntimeError("simulated server exit during source download")
+        assert destination == seen[0] and partial.read_bytes() == raw[:50]
+        destination.write_bytes(raw)
+        partial.unlink()
+        return len(raw)
+
+    monkeypatch.setattr(RemoteClient, "download_file", interrupted)
+    response = client.post(PREFIX + "/install-requests", json={"release_id": release, "conversion": "console"},
+                           headers={**h, "Idempotency-Key": "source-restart-123456"})
+    row = s.get_request(response.json["id"])
+    with pytest.raises(RuntimeError, match="simulated server exit"):
+        s.prepare(row)
+    restarted = ConsoleService(s.config, s.database, s.runner, s.remote)
+    recovered = restarted.get_request(row["id"])
+    assert recovered["state"] == "queued"
+    restarted.prepare(recovered)
+    assert restarted.get_request(row["id"])["state"] == "ready"
+    assert len(seen) == 2
+
+
+def test_failed_publication_is_not_registered_and_old_orphans_are_cleaned(setup):
+    import sqlite3
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    release, _ = seed_game(s)
+    with s.connect() as c:
+        c.executescript("CREATE TRIGGER reject_ready BEFORE UPDATE OF state ON console_requests WHEN NEW.state='ready' BEGIN SELECT RAISE(ABORT,'publication interrupted'); END;")
+    with pytest.raises(sqlite3.IntegrityError, match="publication interrupted"):
+        prepare(client, s, h, release)
+    with s.connect() as c:
+        assert c.execute("SELECT count(*) FROM console_artifacts").fetchone()[0] == 0
+    orphans = [p for p in s.root.iterdir() if p.is_dir() and len(p.name) == 32]
+    assert len(orphans) == 1
+    s.cleanup()
+    assert orphans[0].exists()
+    old = time.time() - s.retention - 10
+    os.utime(orphans[0], (old, old))
+    s.cleanup()
+    assert not orphans[0].exists()

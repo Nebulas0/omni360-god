@@ -533,6 +533,7 @@ int DumpResponse(XboxTLSContext *ctx,
 
         if (!headersDone)
         {
+            const unsigned long long previousHeaderLen = headerLen;
             int copyLen = r;
             int headerEnd;
 
@@ -561,8 +562,13 @@ int DumpResponse(XboxTLSContext *ctx,
 
             headersDone = true;
             chunked = HeaderContainsToken(headerBuffer, headerEnd, "Transfer-Encoding", "chunked");
-            body = headerBuffer + headerEnd;
-            bodyLen = headerLen - headerEnd;
+            // Only the header needs the bounded scratch buffer. Body bytes in
+            // this TLS read can extend beyond it (especially after a split
+            // header); consume them directly from the original network read.
+            const int consumed = headerEnd - (int)previousHeaderLen;
+            if (consumed < 0 || consumed > r) goto failure;
+            body = buffer + consumed;
+            bodyLen = r - consumed;
             totalContentLength = parseContentLength(headerBuffer, headerEnd);
 
             // archive.org's view_archive.php (used to serve an already-
@@ -589,7 +595,7 @@ int DumpResponse(XboxTLSContext *ctx,
                     (!policy->json && knownTotalSize && totalContentLength!=knownTotalSize))
                 {
                     printFunction("Immutable download response did not match its request\n");
-                    responseCode=-1;
+                    responseCode=status>=400?status:-1;
                     goto failure;
                 }
             }
@@ -992,7 +998,7 @@ redirectSuccess:
 
 failure:
 
-    if (responseCode == 200)
+    if (responseCode >= 200 && responseCode < 300)
     {
         responseCode = -1;
     }

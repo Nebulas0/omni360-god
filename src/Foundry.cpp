@@ -36,7 +36,7 @@ struct Device
 };
 struct Work
 {
-    std::string request, name, games, content;
+    std::string request, name, games, content, body, key, origin, device;
 };
 struct Move
 {
@@ -50,6 +50,7 @@ static HANDLE g_thread=NULL, g_wake=NULL;
 static volatile LONG g_stop=0, g_cancel=0, g_uiCancel=0;
 static bool g_started=false,g_pending=false,g_used=false,g_delivered=false;
 static QueueJobSnapshot g_snap;
+static unsigned long long g_transferBase=0,g_transferTotal=0;
 
 static std::string Text(const cJSON *o,const char *k)
 {
@@ -141,22 +142,41 @@ static void Phase(const char *name,float fraction=-1.0f,unsigned long long done=
 static bool Cancelled() { return InterlockedCompareExchange(&g_cancel,0,0)||InterlockedCompareExchange(&g_stop,0,0); }
 static bool DownloadProgress(unsigned long long done,unsigned long long total,unsigned long long speed,unsigned long long left)
 {
+    done+=g_transferBase;if(g_transferTotal)total=g_transferTotal;
     EnterCriticalSection(&g_lock);g_snap.bytesDone=done;g_snap.bytesTotal=total;g_snap.bytesPerSec=speed;g_snap.secondsLeft=left;
     g_snap.fraction=total?(float)((double)done/total):-1.0f;LeaveCriticalSection(&g_lock);return !Cancelled();
 }
 static bool UiProgress(unsigned long long,unsigned long long,unsigned long long,unsigned long long)
 { return !InterlockedCompareExchange(&g_uiCancel,0,0); }
 
-static bool Call(const std::string &path,const std::string &body,bool auth,cJSON **reply,std::string *error,bool ui=false)
+static bool RetryPause(unsigned attempt,bool ui=false)
+{
+    unsigned ticks=std::min(300U,10U*(attempt+1)*(attempt+1));
+    for(unsigned i=0;i<ticks;++i)
+    {
+        if(ui?InterlockedCompareExchange(&g_uiCancel,0,0)!=0:Cancelled())return false;
+        Sleep(100);
+    }
+    return true;
+}
+
+static bool Call(const std::string &path,const std::string &body,bool auth,cJSON **reply,std::string *error,bool ui=false,const std::string &key="",int *lastStatus=NULL,unsigned attempts=6)
 {
     Device d=DeviceCopy();
     if(!FoundryOrigin(d.origin)||path.compare(0,strlen(API),API)!=0||path.find_first_of("\r\n")!=std::string::npos)
     { *error="Invalid Foundry URL";return false; }
     std::string headers=auth?"Authorization: Bearer "+d.token+"\r\n":"";
+    if(!key.empty()) headers+="Idempotency-Key: "+key+"\r\n";
     HttpResponsePolicy policy;policy.json=true;
-    std::vector<char> buffer(1024*1024+1);unsigned long long len=buffer.size()-1;
-    int status=httpRequestHTTPS(d.origin+path,body.empty()?HTTP_GET:HTTP_POST,body.empty()?NULL:body.c_str(),headers.c_str(),"",
-        &buffer[0],&len,false,NULL,0,dprintf,0,ui?UiProgress:NULL,false,&policy);
+    std::vector<char> buffer(1024*1024+1);unsigned long long len=0;int status=0;
+    for(unsigned attempt=0;attempt<attempts;++attempt)
+    {
+        std::fill(buffer.begin(),buffer.end(),0);len=buffer.size()-1;
+        status=httpRequestHTTPS(d.origin+path,body.empty()?HTTP_GET:HTTP_POST,body.empty()?NULL:body.c_str(),headers.c_str(),"",
+            &buffer[0],&len,false,NULL,0,dprintf,0,ui?UiProgress:NULL,false,&policy);
+        if(!FoundryRetryableStatus(status)||attempt+1==attempts||!RetryPause(attempt,ui))break;
+    }
+    if(lastStatus)*lastStatus=status;
     if(len>=buffer.size()) len=buffer.size()-1;buffer[(size_t)len]=0;
     cJSON *result=cJSON_Parse(&buffer[0]);
     if(status<200||status>=300||!cJSON_IsObject(result))
@@ -217,7 +237,7 @@ static bool HashFile(const std::string &path,std::string *hash,unsigned long lon
 {
     FILE *f=fopen(path.c_str(),"rb");if(!f)return false;
     br_sha256_context sha;br_sha256_init(&sha);std::vector<unsigned char> block(256*1024);unsigned long long n=0;
-    size_t got;while((got=fread(&block[0],1,block.size(),f))>0){br_sha256_update(&sha,&block[0],got);n+=got;}
+    size_t got;while((got=fread(&block[0],1,block.size(),f))>0){if(Cancelled()){fclose(f);return false;}br_sha256_update(&sha,&block[0],got);n+=got;}
     bool ok=!ferror(f)&&(!expected||n==expected);fclose(f);
     unsigned char bytes[32];br_sha256_out(&sha,bytes);char text[65];
     for(int i=0;i<32;++i)sprintf(text+i*2,"%02x",bytes[i]);text[64]=0;*hash=text;return ok;
@@ -226,6 +246,32 @@ static unsigned long long Length(const std::string &path)
 {
     WIN32_FILE_ATTRIBUTE_DATA d;if(!GetFileAttributesExA(path.c_str(),GetFileExInfoStandard,&d))return 0;
     return ((unsigned long long)d.nFileSizeHigh<<32)|d.nFileSizeLow;
+}
+static bool RangeDownload(const std::string &url,const std::string &partial,unsigned long long fullSize,
+                          unsigned long long start,unsigned long long size,const std::string &sha,std::string *error)
+{
+    if(!size||start>fullSize||size>fullSize-start||!Parents(partial)){*error="Invalid download range or staging path";return false;}
+    if(Length(partial)>size)DeleteFileA(partial.c_str());
+    unsigned failures=0;
+    for(unsigned attempt=0;attempt<200 && failures<6;++attempt)
+    {
+        if(Cancelled()){*error="Paused; downloaded bytes are kept for resume";return false;}
+        unsigned long long before=Length(partial);if(before==size)return true;
+        Device d=DeviceCopy();std::string etag="\""+sha+"\"";
+        std::string headers="Authorization: Bearer "+d.token+"\r\nRange: bytes="+Decimal(start+before)+"-"+Decimal(start+size-1)+"\r\nIf-Range: "+etag+"\r\n";
+        std::string range="bytes "+Decimal(start+before)+"-"+Decimal(start+size-1)+"/"+Decimal(fullSize);
+        HttpResponsePolicy policy;policy.status=206;policy.etag=etag.c_str();policy.contentRange=range.c_str();
+        g_transferBase=before;g_transferTotal=size;
+        int status=httpRequestHTTPS(d.origin+url,HTTP_GET,NULL,headers.c_str(),partial,NULL,NULL,true,NULL,0,dprintf,size-before,DownloadProgress,before!=0,&policy);
+        unsigned long long after=Length(partial);
+        if(after<before||after>size){*error="Download length changed unexpectedly";return false;}
+        if(after==size)return true; // Full-file SHA-256/ZIP CRC is checked by the caller.
+        if(status==HTTP_STATUS_CANCELLED||Cancelled()){*error="Paused; downloaded bytes are kept for resume";return false;}
+        if(!FoundryRetryableStatus(status)&&status!=206){*error=status==401||status==403?"Pair this console again":"Server could not resume this immutable download";return false;}
+        failures=after>before?0:failures+1;
+        if(!RetryPause(failures))break;
+    }
+    *error="Connection interrupted; partial download is saved for resume";return false;
 }
 static bool Fetch(const std::string &path,const std::string &destination,unsigned long long bytes,const std::string &sha,std::string *error)
 {
@@ -236,23 +282,15 @@ static bool Fetch(const std::string &path,const std::string &destination,unsigne
     if(filesAt==std::string::npos){*error="Invalid staging destination";return false;}
     std::string partial=destination.substr(0,filesAt)+"\\parts\\"+path.substr(path.find_last_of('/')+1)+".part";
     if(!Parents(partial)){*error="Could not create partial-file storage";return false;}
-    unsigned long long offset=Length(partial);
-    if(offset>bytes){DeleteFileA(partial.c_str());offset=0;}
-    if(offset<bytes)
-    {
-        Device d=DeviceCopy();std::string headers="Authorization: Bearer "+d.token+"\r\n";
-        std::string etag="\""+sha+"\"",range;
-        HttpResponsePolicy policy;policy.status=offset?206:200;policy.etag=etag.c_str();
-        if(offset)
-        {
-            headers+="Range: bytes="+Decimal(offset)+"-\r\nIf-Range: "+etag+"\r\n";
-            range="bytes "+Decimal(offset)+"-"+Decimal(bytes-1)+"/"+Decimal(bytes);policy.contentRange=range.c_str();
-        }
-        int status=httpRequestHTTPS(d.origin+path,HTTP_GET,NULL,headers.c_str(),partial,NULL,NULL,true,NULL,0,dprintf,bytes-offset,DownloadProgress,offset!=0,&policy);
-        if(status!=policy.status){*error=Cancelled()?"Cancelled; downloaded parts are kept":"Download interrupted; retry to resume";return false;}
-    }
+    if(!RangeDownload(path,partial,bytes,0,bytes,sha,error))return false;
     if(Length(partial)<bytes){*error="Download interrupted; partial file kept for resume";return false;}
-    if(!HashFile(partial,&hash,bytes)||hash!=sha){DeleteFileA(partial.c_str());*error="Downloaded file failed its SHA-256 check";return false;}
+    if(!HashFile(partial,&hash,bytes)||hash!=sha)
+    {
+        if(Cancelled()){*error="Paused; downloaded file is kept for verification";return false;}
+        DeleteFileA(partial.c_str());
+        if(!RangeDownload(path,partial,bytes,0,bytes,sha,error))return false;
+        if(!HashFile(partial,&hash,bytes)||hash!=sha){if(!Cancelled())DeleteFileA(partial.c_str());*error="Downloaded file failed its SHA-256 check";return false;}
+    }
     DeleteFileA(destination.c_str());if(!MoveFileA(partial.c_str(),destination.c_str())){*error="Could not save the checked file";return false;}return true;
 }
 static unsigned long BE32(const unsigned char *p) {return ((unsigned long)p[0]<<24)|((unsigned long)p[1]<<16)|((unsigned long)p[2]<<8)|p[3];}
@@ -306,7 +344,9 @@ static bool CheckPackage(const std::string &path,const FoundryComponent &c,std::
     FILE *f=fopen(path.c_str(),"rb");if(!f){*error="Package is missing";return false;}
     std::vector<unsigned char> header(0x344);bool ok=fread(&header[0],1,header.size(),f)==header.size();
     if(!ok|| (memcmp(&header[0],"LIVE",4)&&memcmp(&header[0],"PIRS",4)&&memcmp(&header[0],"CON ",4))){fclose(f);*error="Invalid content header";return false;}
-    unsigned long size=BE32(&header[0x340]),end=(size+0xfff)&~0xfff;
+    unsigned long size=BE32(&header[0x340]);
+    if(size<0x971a||size>0x100000){fclose(f);*error="Invalid metadata length";return false;}
+    unsigned long end=(size+0xfff)&~0xfff;
     if(size<0x971a||end>0x100000||end>Length(path)){fclose(f);*error="Invalid metadata length";return false;}
     header.resize(end);fseek(f,0,SEEK_SET);ok=fread(&header[0],1,end,f)==end;fclose(f);
     br_sha1_context sha;br_sha1_init(&sha);br_sha1_update(&sha,&header[0x344],end-0x344);unsigned char sum[20];br_sha1_out(&sha,sum);
@@ -370,9 +410,10 @@ static bool Commit(const Work &w,const FoundryManifest &m,std::string *error)
 {
     ContentWriteLock lock;if(!lock.Ok()){*error="Could not lock content storage";return false;}
     std::vector<Move> moves;
-    for(size_t i=0;i<m.components.size();++i)
+    for(int pass=0;pass<2;++pass) for(size_t i=0;i<m.components.size();++i)
     {
         const FoundryComponent &c=m.components[i];std::string root=c.kind=="god"?"games":c.files[0].root=="cache"?"cache":"content";
+        if((c.kind=="god")!=(pass==0))continue;
         std::string staging="_Foundry/"+m.id;
         if(c.kind=="god")
         {
@@ -407,6 +448,8 @@ static bool Commit(const Work &w,const FoundryManifest &m,std::string *error)
             AddMove(&moves,root,staging+"/files/"+rel,rel);
         }
     }
+    for(size_t i=0;i<moves.size();++i)
+        if(Root(w,moves[i].root).size()+1+std::max(moves[i].from.size(),moves[i].to.size())>240){*error="Choose a shorter destination path for a recoverable Xbox installation";return false;}
     if(!SaveJournal(w,m.id,moves,false)){*error="Could not save the installation recovery journal";return false;}
     for(size_t i=0;i<moves.size();++i)
     {
@@ -436,7 +479,6 @@ static bool Prepared(const Work &w,const FoundryManifest &m,std::string *error)
     for(size_t i=0;i<m.components.size();++i)
     {
         const FoundryComponent &c=m.components[i];std::string root=Root(w,c.kind=="god"?"games":c.files[0].root=="cache"?"cache":"content");
-        if(c.kind=="title_update"&&!MatchingInstalledGame(w,m,c)){*error="Title update does not match the installed game's actual Media ID and base version";return false;}
         for(size_t j=0;j<c.files.size();++j)
         {
             if(Cancelled()){*error="Cancelled; checked files are kept for resume";return false;}
@@ -446,6 +488,10 @@ static bool Prepared(const Work &w,const FoundryManifest &m,std::string *error)
         const FoundryFile *package=&c.files[0];for(size_t j=0;j<c.files.size();++j)if(c.files[j].role=="header")package=&c.files[j];
         Phase("Checking package metadata");if(!CheckPackage(Stage(root,m.id)+"\\files\\"+Native(package->path),c,error))return false;
     }
+    // Validate TUs after every selected base game has arrived, independent of
+    // manifest component ordering.
+    for(size_t i=0;i<m.components.size();++i)
+        if(m.components[i].kind=="title_update"&&!MatchingInstalledGame(w,m,m.components[i])){*error="Title update does not match the installed game's actual Media ID and base version";return false;}
     if(Cancelled()){*error="Cancelled before installation; checked files are kept";return false;}
     Phase("Installing; recovery journal saved");return Commit(w,m,error);
 }
@@ -463,7 +509,15 @@ static bool ConsoleConvert(const Work &w,const FoundryManifest &m,std::string *e
 {
     const FoundrySource &s=m.source;std::string dir=Stage(w.games,m.id)+"\\source";
     if(Exists(dir+"\\corrupt.flag"))RemoveTree(dir);
-    if(!Dirs(dir)||!FreeSpace(w.games,s.bytes+s.unpacked+s.unpacked/20)){*error="Not enough space for source pieces and the converted game";return false;}
+    unsigned long long missing=s.bytes;
+    for(unsigned long long at=0;at<s.bytes;at+=PIECE)
+    {
+        char name[32];_snprintf(name,sizeof(name),"\\P%05lu.bin",(unsigned long)(at/PIECE));
+        unsigned long long size=std::min(PIECE,s.bytes-at),have=Length(dir+name);
+        if(have==size)missing-=size;
+        else {have=Length(dir+name+".partial");if(have<=size)missing-=have;}
+    }
+    if(!Dirs(dir)||!FreeSpace(w.games,missing)){*error="Not enough space for the remaining source download";return false;}
     ZipPieces pieces(dir.c_str(),PIECE);Device device=DeviceCopy();
     br_sha256_context sha;br_sha256_init(&sha);std::vector<unsigned char> buffer(256*1024);
     for(unsigned long long at=0;at<s.bytes;at+=PIECE)
@@ -473,12 +527,8 @@ static bool ConsoleConvert(const Work &w,const FoundryManifest &m,std::string *e
         if(Length(path)!=size)
         {
             Phase("Downloading ISO archive in pieces");
-            std::string partial=std::string(path)+".partial",etag="\""+s.sha256+"\"";
-            std::string headers="Authorization: Bearer "+device.token+"\r\nRange: bytes="+Decimal(at)+"-"+Decimal(at+size-1)+"\r\nIf-Range: "+etag+"\r\n";
-            std::string range="bytes "+Decimal(at)+"-"+Decimal(at+size-1)+"/"+Decimal(s.bytes);
-            HttpResponsePolicy policy;policy.status=206;policy.etag=etag.c_str();policy.contentRange=range.c_str();
-            int status=httpRequestHTTPS(device.origin+API+"/source-artifacts/"+m.id+"/file",HTTP_GET,NULL,headers.c_str(),partial,NULL,NULL,true,NULL,0,dprintf,size,DownloadProgress,false,&policy);
-            if(status!=206||Length(partial)!=size){*error="Source download interrupted; retry to resume";return false;}
+            std::string partial=std::string(path)+".partial";
+            if(!RangeDownload(std::string(API)+"/source-artifacts/"+m.id+"/file",partial,s.bytes,at,size,s.sha256,error))return false;
             DeleteFileA(path);if(!MoveFileA(partial.c_str(),path)){*error="Could not save source piece";return false;}
         }
         for(unsigned long long n=0;n<size;n+=buffer.size())
@@ -503,8 +553,10 @@ static bool ConsoleConvert(const Work &w,const FoundryManifest &m,std::string *e
     GodResult result=GodInspect(image,&info);
     if(result!=GOD_OK||info.title.contentType!=GOD_CONTENT_GAMES_ON_DEMAND||(!s.titleId.empty()&&Hex32(info.title.titleId)!=s.titleId))
     {free(points);*error="ISO inspection failed or the disc identity differs";return false;}
-    if(!FreeSpace(w.games,info.outputSize)){free(points);*error="Not enough room for the converted game";return false;}
-    std::string output=Stage(w.games,m.id)+"\\files";Dirs(output);char package[600];
+    std::string output=Stage(w.games,m.id)+"\\files";
+    RemoveTree(output); // Only this artifact's unpublished conversion, after journal recovery.
+    if(!FreeSpace(w.games,info.outputSize)){free(points);*error="Source is saved. Free space for the converted game, then resume";return false;}
+    Dirs(output);char package[600];
     {ReadAheadSource ahead(image,1024*1024,8);result=GodConvert(&ahead,info,output.c_str(),s.name.c_str(),NULL,0,ConvertProgress,NULL,package,sizeof(package));}
     free(points);if(result!=GOD_OK){*error=GodResultText(result);return false;}
     FoundryManifest generated;generated.id=m.id;FoundryComponent c;c.kind="god";c.titleId=Hex32(info.title.titleId);c.mediaId=Hex32(info.title.mediaId);c.contentType="00007000";
@@ -517,7 +569,51 @@ static bool SaveWork(const Work &w)
 {
     cJSON *o=cJSON_CreateObject();cJSON_AddStringToObject(o,"request",w.request.c_str());cJSON_AddStringToObject(o,"name",w.name.c_str());
     cJSON_AddStringToObject(o,"games",w.games.c_str());cJSON_AddStringToObject(o,"content",w.content.c_str());
+    cJSON_AddStringToObject(o,"body",w.body.c_str());cJSON_AddStringToObject(o,"key",w.key.c_str());
+    cJSON_AddStringToObject(o,"origin",w.origin.c_str());cJSON_AddStringToObject(o,"device",w.device.c_str());
     bool ok=WriteJson(JOB,o);cJSON_Delete(o);return ok;
+}
+static bool RememberWork(const Work &w,std::string *error)
+{
+    if(!SaveWork(w)){*error="Could not persist the resumable installation job";return false;}
+    EnterCriticalSection(&g_lock);g_work=w;LeaveCriticalSection(&g_lock);return true;
+}
+static bool NewRequestKey(Work *w,std::string *error)
+{
+    EnterCriticalSection(&g_lock);++g_device.sequence;bool saved=SaveDevice();
+    w->key=g_device.id+"_"+Decimal(g_device.sequence);w->origin=g_device.origin;w->device=g_device.id;LeaveCriticalSection(&g_lock);
+    if(!saved){*error="Could not save the request counter";return false;}
+    return RememberWork(*w,error);
+}
+static bool LoadWork(Work *w)
+{
+    cJSON *o=ReadJson(JOB,256*1024);if(!o)return false;
+    w->request=Text(o,"request");w->name=Text(o,"name");w->games=Text(o,"games");w->content=Text(o,"content");
+    w->body=Text(o,"body");w->key=Text(o,"key");w->origin=Text(o,"origin");w->device=Text(o,"device");cJSON_Delete(o);
+    bool pending=w->request.empty()&&!w->body.empty()&&w->body.size()<=65536&&!w->key.empty();
+    if(!w->key.empty()&&(w->key.size()<16||w->key.size()>96||w->key.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")!=std::string::npos))return false;
+    return (pending||FoundryHex(w->request,32))&&RootValid(w->games)&&RootValid(w->content)
+        && (w->origin.empty()||FoundryOrigin(w->origin)) && (w->device.empty()||FoundryHex(w->device,32));
+}
+static bool CreatePendingRequest(Work *w,std::string *error)
+{
+    Device d=DeviceCopy();
+    if(d.token.empty()||!FoundryHex(d.id,32)){*error="Pair this console before resuming";return false;}
+    if(!w->origin.empty()&&w->origin!=d.origin){*error="Select the original Foundry server before resuming this job";return false;}
+    if(!w->device.empty()&&w->device!=d.id)
+    {
+        if(w->body.empty()){*error="This legacy job belongs to the old pairing; choose the game again";return false;}
+        w->request.clear();w->key.clear();
+    }
+    if(w->origin.empty()||w->device.empty()){w->origin=d.origin;w->device=d.id;if(!RememberWork(*w,error))return false;}
+    if(!w->request.empty())return true;
+    if(w->body.empty()){*error="No saved selection is available; choose the game again";return false;}
+    if(w->key.empty()&&!NewRequestKey(w,error))return false;
+    cJSON *reply=NULL;
+    if(!Call(std::string(API)+"/install-requests",w->body,true,&reply,error,false,w->key))return false;
+    w->request=Text(reply,"id");cJSON_Delete(reply);
+    if(!FoundryHex(w->request,32)){*error="Server returned an invalid request ID";return false;}
+    return RememberWork(*w,error);
 }
 static void Finish(bool ok,const std::string &error)
 {
@@ -533,18 +629,40 @@ static void InitSnap(const Work &w)
     _snprintf(g_snap.gameName,sizeof(g_snap.gameName),"%s",w.name.c_str());_snprintf(g_snap.title,sizeof(g_snap.title),"Foundry: %s",w.name.c_str());
     g_snap.gameName[sizeof(g_snap.gameName)-1]=0;g_snap.title[sizeof(g_snap.title)-1]=0;g_used=true;g_delivered=false;
 }
+static bool QueuePayload(const char *body,const std::string &name,const char *games,const char *content,std::string *error)
+{
+    EnterCriticalSection(&g_lock);bool active=g_used&&g_snap.state!=QUEUE_FINISHED;LeaveCriticalSection(&g_lock);
+    if(active){*error="A Foundry installation is already active";return false;}
+    Work w;w.body=body?body:"";w.name=name;w.games=games;w.content=content;
+    if(w.body.empty()||w.body.size()>65536||!RootValid(w.games)||!RootValid(w.content)){*error="Invalid install selection or destination";return false;}
+    Device d=DeviceCopy();if(d.token.empty()||!FoundryHex(d.id,32)){*error="Pair this console first";return false;}
+    if(!NewRequestKey(&w,error))return false; // Persist body/key before any network request.
+    EnterCriticalSection(&g_lock);InitSnap(w);InterlockedExchange(&g_cancel,0);g_pending=true;LeaveCriticalSection(&g_lock);SetEvent(g_wake);return true;
+}
 static DWORD WINAPI Worker(LPVOID)
 {
     while(!InterlockedCompareExchange(&g_stop,0,0))
     {
         WaitForSingleObject(g_wake,INFINITE);if(g_stop)break;
         EnterCriticalSection(&g_lock);bool pending=g_pending;g_pending=false;Work w=g_work;g_snap.state=QUEUE_ACTIVE;LeaveCriticalSection(&g_lock);
-        if(!pending)continue;std::string error;bool ok=Recover(&error);std::string aid;
+        if(!pending)continue;std::string error;bool ok=Recover(&error)&&CreatePendingRequest(&w,&error);std::string aid;
         while(ok&&!Cancelled())
         {
             Phase("Waiting for server preparation");cJSON *reply=NULL;
             if(!Call(std::string(API)+"/install-requests/"+w.request,"",true,&reply,&error)){ok=false;break;}
-            std::string state=Text(reply,"state"),message=Text(reply,"message");aid=Text(reply,"artifact_id");cJSON_Delete(reply);
+            std::string state=Text(reply,"state"),message=Text(reply,"message");aid=Text(reply,"artifact_id");
+            if(w.body.empty())
+            {
+                const cJSON *selection=cJSON_GetObjectItemCaseSensitive(reply,"selection");
+                if(cJSON_IsObject(selection)){char *raw=cJSON_PrintUnformatted(selection);if(raw){w.body=raw;cJSON_free(raw);ok=RememberWork(w,&error);}}
+            }
+            cJSON_Delete(reply);if(!ok)break;
+            if(state=="expired"&&!w.body.empty())
+            {
+                w.request.clear();w.key.clear();
+                ok=NewRequestKey(&w,&error)&&CreatePendingRequest(&w,&error);
+                continue;
+            }
             if(state=="ready")break;
             if(state=="failed"||state=="expired"||state=="cancelled"){error=message;ok=false;break;}
             Phase(message.c_str());for(int i=0;i<30&&!Cancelled();++i)Sleep(100);
@@ -569,7 +687,7 @@ static DWORD WINAPI Worker(LPVOID)
         // a failed installation. The local journal remains the source of truth.
         cJSON *event=cJSON_CreateObject();cJSON_AddStringToObject(event,"event_id",(w.request+"_"+(ok?"installed":Cancelled()?"cancelled":"failed")).c_str());
         cJSON_AddStringToObject(event,"outcome",ok?"installed":Cancelled()?"cancelled":"failed");char *body=cJSON_PrintUnformatted(event);cJSON *ignored=NULL;std::string ignoredError;
-        Call(std::string(API)+"/install-requests/"+w.request+"/events",body,true,&ignored,&ignoredError);cJSON_free(body);cJSON_Delete(event);cJSON_Delete(ignored);
+        if(FoundryHex(w.request,32))Call(std::string(API)+"/install-requests/"+w.request+"/events",body,true,&ignored,&ignoredError,false,"",NULL,1);cJSON_free(body);cJSON_Delete(event);cJSON_Delete(ignored);
         Finish(ok,error);
     }
     return 0;
@@ -577,17 +695,12 @@ static DWORD WINAPI Worker(LPVOID)
 
 bool StartFoundry(const char *gamesRoot,const char *contentRoot)
 {
-    if(g_started)return true;InitializeCriticalSection(&g_lock);LoadDevice();g_wake=CreateEvent(NULL,FALSE,FALSE,NULL);
-    if(!g_wake)return false;
-    g_thread=CreateThread(NULL,512*1024,Worker,NULL,CREATE_SUSPENDED,NULL);if(!g_thread){CloseHandle(g_wake);return false;}
+    if(g_started)return true;InitializeCriticalSection(&g_lock);LoadDevice();InterlockedExchange(&g_stop,0);InterlockedExchange(&g_cancel,0);
+    std::string recoveryError;if(!Recover(&recoveryError))dprintf("[foundry] recovery required: %s\n",recoveryError.c_str());
+    g_wake=CreateEvent(NULL,FALSE,FALSE,NULL);if(!g_wake){DeleteCriticalSection(&g_lock);return false;}
+    g_thread=CreateThread(NULL,512*1024,Worker,NULL,CREATE_SUSPENDED,NULL);if(!g_thread){CloseHandle(g_wake);DeleteCriticalSection(&g_lock);return false;}
     g_started=true;ResumeThread(g_thread);
-    cJSON *job=ReadJson(JOB,4096);
-    if(job)
-    {
-        Work w;w.request=Text(job,"request");w.name=Text(job,"name");w.games=Text(job,"games");w.content=Text(job,"content");cJSON_Delete(job);
-        if(FoundryHex(w.request,32)&&RootValid(w.games)&&RootValid(w.content))
-        {EnterCriticalSection(&g_lock);g_work=w;InitSnap(w);InterlockedExchange(&g_cancel,0);g_pending=true;LeaveCriticalSection(&g_lock);SetEvent(g_wake);}
-    }
+    Work w;if(LoadWork(&w)){EnterCriticalSection(&g_lock);g_work=w;InitSnap(w);g_pending=true;LeaveCriticalSection(&g_lock);SetEvent(g_wake);}
     return true;
 }
 void StopFoundry(DWORD timeoutMs)
@@ -611,16 +724,25 @@ static void PairUI()
     std::string detail=url+"  Code: "+code;
     if(!ShowConfirmUI("Pair Foundry","Open the website on your phone or computer and approve this code.",detail.c_str(),"I approved it"))return;
     cJSON *body=cJSON_CreateObject();cJSON_AddStringToObject(body,"device_code",secret.c_str());char *raw=cJSON_PrintUnformatted(body);
-    if(UiCall(std::string(API)+"/pairings/token",raw,false,&reply))
+    DWORD started=GetTickCount();
+    while(GetTickCount()-started<600000)
     {
+        if(!UiCall(std::string(API)+"/pairings/token",raw,false,&reply))break;
         std::string token=Text(reply,"access_token"),id=Text(reply,"device_id");
         if(Text(reply,"status")=="approved"&&token.size()>=40&&token.size()<100&&FoundryHex(id,32))
         {
             EnterCriticalSection(&g_lock);g_device.token=token;g_device.id=id;g_device.sequence=0;bool saved=SaveDevice();LeaveCriticalSection(&g_lock);
             ShowMessageUI("Foundry",saved?"Console paired":"Could not save the device token",NULL);
+            cJSON_Delete(reply);break;
         }
-        else ShowMessageUI("Not approved yet","Approve the code on the website and start pairing again.",NULL);
         cJSON_Delete(reply);
+        DWORD wait=GetTickCount();bool cancel=false;
+        while(GetTickCount()-wait<5000)
+        {
+            RenderProgressFrame("Pair Foundry","Waiting for website approval",detail.c_str(),-1,"Pairing");
+            if(PollUiInput().pressed&XINPUT_GAMEPAD_B){cancel=true;break;}Sleep(16);
+        }
+        if(cancel)break;
     }
     cJSON_free(raw);cJSON_Delete(body);
 }
@@ -660,38 +782,12 @@ static void QueueRelease(const std::string &release,const std::string &name,cons
         }
         cJSON_Delete(info);
     }
-    EnterCriticalSection(&g_lock);++g_device.sequence;bool saved=SaveDevice();std::string idem=g_device.id+"_"+Decimal(g_device.sequence);LeaveCriticalSection(&g_lock);
-    if(!saved){cJSON_Delete(body);ShowMessageUI("Not queued","Could not save the request counter",NULL);return;}
-    // Install requests require an idempotency header in addition to bearer auth.
-    Device d=DeviceCopy();std::string headers="Authorization: Bearer "+d.token+"\r\nIdempotency-Key: "+idem+"\r\n";
-    // The UI task below uses the same bounded background transport, with this
-    // request's extra header supplied through a JSON field-free helper.
     char *raw=cJSON_PrintUnformatted(body);
-    // Queue creation is performed by UiCallWithKey (defined below).
-    extern bool FoundryUiCreate(const std::string &,const std::string &,cJSON **);
-    bool ok=FoundryUiCreate(raw,idem,&reply);cJSON_free(raw);cJSON_Delete(body);
-    if(!ok)return;
-    Work w;w.request=Text(reply,"id");w.name=name;w.games=games;w.content=content;cJSON_Delete(reply);
-    if(!FoundryHex(w.request,32)||!RootValid(w.games)||!RootValid(w.content)||!SaveWork(w)){ShowMessageUI("Not queued","Could not save the installation request",NULL);return;}
-    EnterCriticalSection(&g_lock);g_work=w;InitSnap(w);InterlockedExchange(&g_cancel,0);g_pending=true;LeaveCriticalSection(&g_lock);SetEvent(g_wake);
+    bool ok=QueuePayload(raw,name,games,content,&error);cJSON_free(raw);cJSON_Delete(body);
+    if(!ok){ShowMessageUI("Not queued",error.c_str(),NULL);return;}
     ShowMessageUI("Queued in Foundry","Installation continues in the background","Open Queue for progress. B returns to the original store.");
 }
 
-// The idempotency key belongs to the request, not to a global credential.
-struct CreateTask{std::string body,key,error;bool ok;cJSON *reply;CreateTask():ok(false),reply(NULL){}};
-static DWORD WINAPI CreateEntry(LPVOID p)
-{
-    CreateTask *t=(CreateTask*)p;Device d=DeviceCopy();std::string headers="Authorization: Bearer "+d.token+"\r\nIdempotency-Key: "+t->key+"\r\n";
-    HttpResponsePolicy policy;policy.json=true;std::vector<char> buffer(65537);unsigned long long n=65536;
-    int status=httpRequestHTTPS(d.origin+API+"/install-requests",HTTP_POST,t->body.c_str(),headers.c_str(),"",&buffer[0],&n,false,NULL,0,dprintf,0,UiProgress,false,&policy);
-    if(n>65536)n=65536;buffer[(size_t)n]=0;t->reply=cJSON_Parse(&buffer[0]);t->ok=status==200&&cJSON_IsObject(t->reply);t->error=Text(t->reply,"error");return 0;
-}
-bool FoundryUiCreate(const std::string &body,const std::string &key,cJSON **reply)
-{
-    CreateTask t;t.body=body;t.key=key;InterlockedExchange(&g_uiCancel,0);HANDLE thread=CreateThread(NULL,256*1024,CreateEntry,&t,0,NULL);if(!thread)return false;
-    while(WaitForSingleObject(thread,0)!=WAIT_OBJECT_0){RenderProgressFrame("Foundry","Creating installation request",NULL,-1,"Preparing");if(PollUiInput().pressed&XINPUT_GAMEPAD_B)InterlockedExchange(&g_uiCancel,1);Sleep(16);}
-    CloseHandle(thread);ResyncUiInput();if(!t.ok){ShowMessageUI("Not queued",t.error.empty()?"Server request failed":t.error.c_str(),NULL);cJSON_Delete(t.reply);return false;}*reply=t.reply;return true;
-}
 static void BrowseUI(const char *games,const char *content,bool digital)
 {
     std::string query;OpenKeyboardToString(0,&query,L"Search Foundry",L"Game or add-on name",L"");std::string cursor;
@@ -739,12 +835,9 @@ static void OnlineUpdatesUI(const char *games,const char *content)
     int pick=ShowChoiceUI("Title updates","Find the latest exact match on XboxUnity through Foundry",&names[0],NULL,(int)names.size(),L"Find and install");if(pick<0)return;
     cJSON *o=cJSON_CreateObject(),*identity=cJSON_AddObjectToObject(o,"game_identity");cJSON_AddStringToObject(o,"kind","title_update");
     cJSON_AddStringToObject(identity,"title_id",ids[pick].title.c_str());cJSON_AddStringToObject(identity,"media_id",ids[pick].media.c_str());cJSON_AddStringToObject(identity,"base_version",ids[pick].base.c_str());
-    EnterCriticalSection(&g_lock);++g_device.sequence;bool saved=SaveDevice();std::string key=g_device.id+"_"+Decimal(g_device.sequence);LeaveCriticalSection(&g_lock);
-    if(!saved){cJSON_Delete(o);ShowMessageUI("Not queued","Could not save the request counter",NULL);return;}
-    char *raw=cJSON_PrintUnformatted(o);cJSON *reply=NULL;bool ok=FoundryUiCreate(raw,key,&reply);cJSON_free(raw);cJSON_Delete(o);if(!ok)return;
-    Work w;w.request=Text(reply,"id");w.name=labels[pick]+" - title update";w.games=games;w.content=content;cJSON_Delete(reply);
-    if(!FoundryHex(w.request,32)||!SaveWork(w)){ShowMessageUI("Not queued","Could not save the update request",NULL);return;}
-    EnterCriticalSection(&g_lock);g_work=w;InitSnap(w);InterlockedExchange(&g_cancel,0);g_pending=true;LeaveCriticalSection(&g_lock);SetEvent(g_wake);
+    char *raw=cJSON_PrintUnformatted(o);std::string error;
+    bool ok=QueuePayload(raw,labels[pick]+" - title update",games,content,&error);cJSON_free(raw);cJSON_Delete(o);
+    if(!ok){ShowMessageUI("Not queued",error.c_str(),NULL);return;}
     ShowMessageUI("Title update queued","Foundry will download and check the exact matching update","Enable it in Aurora after installation. No approximate update will be installed.");
 }
 void OpenFoundryUI(const char *games,const char *content)
@@ -755,6 +848,9 @@ void OpenFoundryUI(const char *games,const char *content)
         Device d=DeviceCopy();const char *names[]={"Search games","Search XBLA / DLC","Pair this console","Server address","Resume interrupted installation","Forget console token","Title updates for installed games"};
         const char *subs[]={"Server or Xbox conversion","Install prepared digital content",d.token.empty()?"Not paired":"Paired",d.origin.c_str(),"Checked files are reused","The website can also revoke access","Exact execution ID match, including Xbox-converted games"};
         int choice=ShowChoiceUI("GOD Foundry","Your server library on the Xbox",names,subs,7,L"Open");if(choice<0)return;
+        QueueJobSnapshot activeJob;
+        if((choice==2||choice==3||choice==5)&&SnapshotFoundryJobs(&activeJob,1)&&activeJob.state!=QUEUE_FINISHED)
+        {ShowMessageUI("Foundry","Pause the installation before changing servers or pairing",NULL);continue;}
         if(choice==2){PairUI();continue;}
         if(choice==3)
         {

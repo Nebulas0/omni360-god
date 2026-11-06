@@ -37,6 +37,7 @@ bool FoundryHex(const std::string &value, unsigned count);
 bool FoundryDecimal(const char *value, unsigned long long *out);
 bool FoundrySafePath(const std::string &value);
 bool FoundryOrigin(const std::string &value);
+bool FoundryRetryableStatus(int status);
 bool FoundryParseManifest(const char *json, FoundryManifest *out, std::string *error);
 
 #endif

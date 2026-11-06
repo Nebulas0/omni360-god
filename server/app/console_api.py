@@ -247,6 +247,11 @@ class ConsoleService:
             # unrelated add-ons merely because they share a Title ID.
             produced = item.get("_produced_paths", set())
             result = [c for c in result if str(c["_path"].resolve()) in produced]
+        elif item.get("source_kind") == "disc":
+            produced = item.get("_produced_paths", set())
+            # Base games belong to this source/disc. Other editions or discs
+            # sharing the title folder must not be selected automatically.
+            result = [c for c in result if c["kind"] != "god" or str(c["_path"].resolve()) in produced]
         return result
 
     def components_for_title(self, title_id):
@@ -324,6 +329,11 @@ class ConsoleService:
             c.execute("BEGIN IMMEDIATE")
             old = c.execute("SELECT * FROM console_requests WHERE device_id=? AND idem=?", (device, idem)).fetchone()
             if old:
+                if "unlock_packages" not in payload and not identity:
+                    # A retry with omitted defaults means the original request,
+                    # even if the browser changed the global toggle meanwhile.
+                    normalized["unlock_packages"] = json.loads(old["payload"])["unlock_packages"]
+                    encoded = json_bytes(normalized).decode()
                 if old["payload"] != encoded:
                     raise ConsoleError("IDEMPOTENCY_CONFLICT", "Request key was already used with different options", 409)
                 return dict(old)
@@ -349,9 +359,14 @@ class ConsoleService:
     def request_view(self, row):
         result = {k: row[k] for k in ("id", "state", "message", "artifact_id", "error_code", "created_at", "updated_at")}
         result["conversion"] = json.loads(row["payload"])["conversion"]
+        result["selection"] = json.loads(row["payload"])
         result["progress"] = 0
         with self.connect() as c:
             event = c.execute("SELECT payload FROM console_events WHERE request_id=? ORDER BY created_at DESC LIMIT 1", (row["id"],)).fetchone()
+            if row["state"] == "ready":
+                artifact = c.execute("SELECT expires FROM console_artifacts WHERE id=?", (row["artifact_id"],)).fetchone()
+                if artifact is None or artifact[0] < time.time():
+                    result.update(state="expired", message="Prepared download expired; prepare this selection again")
         result["installation_status"] = json.loads(event[0]).get("outcome") if event else None
         if row["job_id"]:
             job = self.database.get_job(row["job_id"])
@@ -565,6 +580,7 @@ class ConsoleService:
         rid = secrets.token_hex(16)
         staging = self.root / (rid + ".partial")
         staging.mkdir()
+        incoming = None
         try:
             size = int(item["remote_size"])
             if not size or size > 32 * 1024**3:
@@ -575,14 +591,18 @@ class ConsoleService:
             if source.is_file() and source.stat().st_size == size:
                 length, sha = self.copy_hash(source, destination)
             else:
+                self.check_quota(size * 2)
+                fingerprint = digest(f"{item['source_path']}:{item.get('remote_modified')}:{size}")[:16]
+                incoming_dir = self.root / "incoming"
+                incoming_dir.mkdir(exist_ok=True)
+                incoming = incoming_dir / f"{row['id']}-{fingerprint}.zip"
                 r = self.remote
                 remote = RemoteClient(r.base_url, r.api_key, r.timeout, r.retries,
                                       basic_user=r.basic_user, basic_password=r.basic_password, auth_mode=r.auth_mode)
-                remote.download_file(item["source_path"], destination, expected_size=size)
-                # Hash via the same bounded copy path; leave no mutable source inode.
-                length, sha = self.copy_hash(destination, staging / "source.checked")
-                destination.unlink()
-                (staging / "source.checked").replace(destination)
+                # Keep this request/version's source and .part across worker
+                # restarts; only the published snapshot gets a fresh identity.
+                remote.download_file(item["source_path"], incoming, expected_size=size)
+                length, sha = self.copy_hash(incoming, destination)
             with zipfile.ZipFile(destination) as archive:
                 members = archive.infolist()
                 images = [m for m in members if m.filename.lower().endswith(".iso") and not m.is_dir()]
@@ -610,6 +630,8 @@ class ConsoleService:
                             "etag": sha, "name": item["name"], "title_id": item.get("title_id"),
                             "download_path": f"{PREFIX}/source-artifacts/{rid}/file"}}
             self.finish_artifact(row, rid, staging, manifest, "source")
+            if incoming:
+                incoming.unlink(missing_ok=True)
         except Exception:
             shutil.rmtree(staging, ignore_errors=True)
             raise
@@ -664,9 +686,12 @@ class ConsoleService:
         total = sum(p.stat().st_size for p in staging.rglob("*") if p.is_file())
         staging.rename(self.root / rid)
         with self.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
             c.execute("INSERT INTO console_artifacts VALUES(?,?,?,?,?,?,?)",
                       (rid, manifest["release_id"], kind, raw.decode(), hashlib.sha256(raw).hexdigest(), total, time.time() + self.retention))
-        self.update(row["id"], state="ready", artifact_id=rid, error_code=None, message="Ready to download and install")
+            c.execute("UPDATE console_requests SET state='ready',artifact_id=?,error_code=NULL,message=?,updated_at=? WHERE id=?",
+                      (rid, "Ready to download and install", utc_now(), row["id"]))
+            c.commit()
 
     def artifact(self, aid):
         if not re.fullmatch(r"[0-9a-f]{32}", aid):
@@ -685,6 +710,7 @@ class ConsoleService:
 
     def cleanup(self):
         with self.connect() as c:
+            c.execute("BEGIN IMMEDIATE")
             expired = c.execute("SELECT id FROM console_artifacts WHERE expires < ?", (time.time(),)).fetchall()
             for row in expired:
                 aid = row[0]
@@ -692,6 +718,23 @@ class ConsoleService:
                     shutil.rmtree(self.root / aid, ignore_errors=True)
                     c.execute("DELETE FROM console_artifacts WHERE id=?", (aid,))
                     c.execute("UPDATE console_requests SET state='expired' WHERE artifact_id=?", (aid,))
+            c.commit()
+        # Interrupted publication may leave unregistered directories. They are
+        # never downloadable, and are removed only after the retention period.
+        cutoff = time.time() - self.retention
+        with self.connect() as c:
+            registered = {r[0] for r in c.execute("SELECT id FROM console_artifacts")}
+        for path in self.root.iterdir():
+            if path.is_symlink() or not path.is_dir() or path.stat().st_mtime >= cutoff:
+                continue
+            if (re.fullmatch(r"[0-9a-f]{32}\.partial", path.name) or
+                    (re.fullmatch(r"[0-9a-f]{32}", path.name) and path.name not in registered)):
+                shutil.rmtree(path)
+        incoming = self.root / "incoming"
+        if incoming.is_dir() and not incoming.is_symlink():
+            for path in incoming.iterdir():
+                if path.is_file() and not path.is_symlink() and path.stat().st_mtime < cutoff:
+                    path.unlink()
 
 
 def register_console_api(app, config, database, runner, remote, start_background):

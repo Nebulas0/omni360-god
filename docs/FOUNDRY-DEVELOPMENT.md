@@ -25,6 +25,16 @@ Archive.org keys are needed for Foundry. The paired token lives in
 the file moves needed to restore a prior installation. Do not delete a recovery
 journal while a transaction needs its original storage attached.
 
+In 1.0.0-alpha.3 the complete install selection, idempotency key and server/device
+identity are saved before the first POST. A lost response or restart replays
+that same request. Transient failures retry with backoff while retaining received
+bytes, including inside a 32 MB ISO piece. Complete files are SHA-256 checked;
+a damaged saved prefix gets one clean retry. Resume progress includes the saved
+prefix. An expired artifact can be prepared again from the saved selection.
+Changing the server/pairing is blocked during active installs; a resumed job is
+bound to its original server. Pairing waits for approval without discarding the
+code if browser approval and the console check cross in flight.
+
 Mode A uses an immutable manifest and individual package files. Mode B reads a
 ZIP64 stored/deflate ISO from verified 32 MB pieces using the existing
 InflateSource/GodConvert engine. RAR, original Xbox games and ambiguous archives
@@ -101,9 +111,15 @@ python -m pytest -q server/app/tests
 python tools/test_foundry/run.py
 ```
 
-The parser test compiles actual client protocol code as C++03 and consumes
+The tests require clang/clang++ as well as a C/C++ compiler. The parser test
+compiles actual client protocol code as C++03 and consumes
 synthetic manifests exported from real Flask test responses. It checks path
 traversal, collisions, provider/version/origin validation, and 64-bit sizes.
+The runtime test includes the actual Foundry.cpp with a host filesystem adapter
+and fault-injected transport. It exercises mid-file/in-piece resume, cancelled
+transfers, corrupted prefixes, lost POST responses across restart, server
+binding, and power loss after each package move. Its Win32 adapter is only for
+testing; it is not an SDK replacement or proof of hardware compatibility.
 This does not replace a full XDK compile or on-console install/power-loss tests.
 
 ## Producing an XEX

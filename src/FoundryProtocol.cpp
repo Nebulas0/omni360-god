@@ -57,6 +57,11 @@ static std::string Text(const cJSON *object, const char *key)
     return cJSON_IsString(v) && v->valuestring ? v->valuestring : "";
 }
 
+bool FoundryRetryableStatus(int status)
+{
+    return status==0 || status==-1 || status==408 || status==425 || status==429 || (status>=500 && status<=599);
+}
+
 static bool Number(const cJSON *o, const char *key, unsigned long long *out)
 {
     std::string v=Text(o,key); return FoundryDecimal(v.c_str(),out);
@@ -78,7 +83,7 @@ bool FoundryParseManifest(const char *json, FoundryManifest *out, std::string *e
     ok=ok && cJSON_IsNumber(version) && version->valuedouble==1;
     m.id=Text(root,"artifact_id"); m.releaseId=Text(root,"release_id"); m.conversion=Text(root,"conversion");
     ok=ok && FoundryHex(m.id,32) && Text(root,"provider_id")=="foundry";
-    std::set<std::string> paths, ids;
+    std::set<std::string> paths, ids, componentIds, discs;
     if (ok && m.conversion=="server")
     {
         const cJSON *components=cJSON_GetObjectItemCaseSensitive(root,"components");
@@ -95,6 +100,8 @@ bool FoundryParseManifest(const char *json, FoundryManifest *out, std::string *e
                 && FoundryHex(comp.contentType,8) && FoundryHex(comp.contentId,40) && FoundryHex(comp.baseVersion,8);
             const char *expected=comp.kind=="god"?"00007000":comp.kind=="xbla"?"000D0000":comp.kind=="dlc"?"00000002":comp.kind=="title_update"?"000B0000":"";
             ok=ok && comp.contentType==expected;
+            ok=ok && componentIds.insert(comp.id).second;
+            if(comp.kind=="god") ok=ok && discs.insert(Fold(comp.titleId+"/"+comp.mediaId)).second;
             const cJSON *files=cJSON_GetObjectItemCaseSensitive(c,"files");
             ok=ok && cJSON_IsArray(files) && cJSON_GetArraySize(files)>0;
             int headers=0; std::string header;
@@ -115,7 +122,8 @@ bool FoundryParseManifest(const char *json, FoundryManifest *out, std::string *e
                     ok=ok && (file.role=="header" || file.role=="data") && file.root=="content";
                     if(file.role=="header") { ++headers; header=file.path; ok=ok && file.path.find('/',18)==std::string::npos; }
                 }
-                else ok=ok && file.role=="package" && cJSON_GetArraySize(files)==1;
+                else ok=ok && file.role=="package" && cJSON_GetArraySize(files)==1
+                    && (file.root=="cache" || file.path.find('/',18)==std::string::npos);
                 m.totalBytes+=file.bytes; comp.files.push_back(file);
             }
             if(comp.kind=="god")

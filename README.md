@@ -6,7 +6,7 @@ packages or download an ISO archive for on-console conversion.
 
 Based on upstream **Omni360 0.13.2-beta** (`830ca4a`), with the Foundry service
 integration and the fork's own signed updater preserved. Fork version:
-**1.0.0-alpha.2**.
+**1.0.0-alpha.3**.
 
 **Alpha source: the full Xbox XDK build and real-console acceptance tests are
 still required. No compiled Foundry XEX is available yet.**

@@ -3,7 +3,7 @@
 #ifndef SETTINGS_H
 #define SETTINGS_H
 
-#define CURRENT_VERSION "1.0.0-alpha.2"
+#define CURRENT_VERSION "1.0.0-alpha.3"
 #define UPSTREAM_VERSION "0.13.2-beta"
 
 // Should be large enough (I hope)
