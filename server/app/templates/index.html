@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#102b2b">
+  <title>GOD Foundry | Xbox 360 library</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+</head>
+<body>
+  <div class="grain"></div>
+  <div class="shell">
+    <header class="masthead">
+      <a class="brand" href="/" aria-label="GOD Foundry home">
+        <span class="brand-mark">GF</span>
+        <span>
+          <strong>GOD Foundry</strong>
+          <small>Your Xbox 360 library</small>
+        </span>
+      </a>
+      <div class="masthead-meta">
+        <span class="status-dot" id="service-dot"></span>
+        <span id="service-status">Connecting to the forge...</span>
+        <button class="quiet-button header-button" id="install-help-button" type="button">How to install</button>
+        <button class="quiet-button header-button" id="settings-button" type="button">Settings</button>
+        <button class="icon-button" id="refresh-button" type="button" title="Refresh remote catalog">↻</button>
+      </div>
+    </header>
+
+    <p><a href="/consoles">Consoles · Pair and manage Omni360 GoD</a></p>
+    <section class="hero">
+      <div class="hero-copy">
+        <p class="eyebrow">THE LIBRARY WORKSPACE</p>
+        <h1>Your library,<br><em>ready to install.</em></h1>
+        <p class="hero-text">Convert disc images, organize add-ons, and download one checked bundle. Jobs keep running while you browse.</p>
+      </div>
+      <div class="workflow-card">
+        <p class="eyebrow">FROM SOURCE TO CONSOLE</p>
+        <ol>
+          <li><span>01</span><div><strong>Choose your source</strong><small>A disc image, XBLA title, or add-on.</small></div></li>
+          <li><span>02</span><div><strong>Convert & check</strong><small>See file checks and compatible updates.</small></div></li>
+          <li><span>03</span><div><strong>Download & install</strong><small>One bundle, with an Xbox installation guide.</small></div></li>
+        </ol>
+      </div>
+    </section>
+
+    <section class="settings-panel" id="settings-panel" hidden>
+      <div class="conversion-settings">
+        <p class="eyebrow">CONVERSION</p>
+        <label class="unlock-setting" for="unlock-packages-input">
+          <input id="unlock-packages-input" type="checkbox" role="switch" aria-describedby="unlock-packages-help" disabled>
+          <span>Unlock XBLA / DLC</span>
+        </label>
+        <p id="unlock-packages-help" class="settings-copy">Applies to new jobs and saves automatically. GoD games always keep the converter's license metadata. Turning this off does not restore licenses in existing downloads.</p>
+        <small id="unlock-settings-status" class="settings-status" role="status" aria-live="polite"></small>
+      </div>
+      <div>
+        <p class="eyebrow">REMOTE CONNECTION</p>
+        <h2>Update credentials</h2>
+        <p class="settings-copy">Choose how to connect to your source library. Credentials are saved privately; existing passwords and tokens are never displayed. Saving refreshes the catalog.</p>
+      </div>
+      <form id="settings-form" class="settings-form">
+        <div class="settings-tabs" role="tablist" aria-label="Auth method">
+          <button class="settings-tab active" data-auth="api-key" role="tab" aria-selected="true" type="button">X-API-Key</button>
+          <button class="settings-tab" data-auth="basic" role="tab" aria-selected="false" type="button">Basic Auth</button>
+        </div>
+        <div id="settings-api-key">
+          <label>
+            <span>New X-API-Key</span>
+            <input id="api-key-input" type="password" autocomplete="new-password" placeholder="Paste token to replace the current one">
+          </label>
+        </div>
+        <div id="settings-basic" hidden>
+          <label>
+            <span>Basic Auth username</span>
+            <input id="basic-user-input" type="text" autocomplete="username" placeholder="Username">
+          </label>
+          <label>
+            <span>Basic Auth password</span>
+            <input id="basic-password-input" type="password" autocomplete="new-password" placeholder="Password">
+          </label>
+        </div>
+        <div class="settings-actions">
+          <button class="quiet-button" id="settings-cancel" type="button">Cancel</button>
+          <button class="quiet-button" id="settings-test" type="button">Test connection</button>
+          <button class="primary-button" type="submit">Save & restart sync <span>→</span></button>
+        </div>
+        <small id="settings-status" class="settings-status"></small>
+      </form>
+    </section>
+
+    <section class="stats-strip" aria-label="Library status">
+      <div class="stat"><span id="disc-count">—</span><small>disc archives</small></div>
+      <div class="stat"><span id="digital-count">—</span><small>digital items</small></div>
+      <div class="stat"><span id="complete-count">—</span><small>sources prepared</small></div>
+      <div class="stat stat-note"><span id="storage-note">Saved between visits</span><small>Your queue and downloads stay here</small></div>
+    </section>
+
+    <nav class="workspace-nav" aria-label="Workspace sections">
+      <a href="#catalog-panel">Browse library <span>↓</span></a>
+      <a href="#downloads-panel">Jobs & downloads <span>↓</span></a>
+      <span class="workspace-note">GoD licenses preserved · title updates matched to each game</span>
+    </nav>
+
+    <main class="workspace">
+      <section class="browser-card" id="catalog-panel">
+        <div class="section-heading">
+          <div>
+            <p class="eyebrow">REMOTE CATALOG</p>
+              <h2>Browse your sources</h2>
+          </div>
+          <div class="selection-chip"><span id="selected-count">0</span> selected</div>
+        </div>
+
+        <div class="catalog-tabs" role="tablist" aria-label="Catalog type">
+          <button class="catalog-tab active" data-kind="disc" role="tab" aria-selected="true" type="button">
+            <span class="tab-number">01</span>
+            <span><strong>Disc images</strong><small>ISO in ZIP archives → GOD</small></span>
+          </button>
+          <button class="catalog-tab" data-kind="digital" role="tab" aria-selected="false" type="button">
+            <span class="tab-number">02</span>
+            <span><strong>Digital content</strong><small>GOD · XBLA · DLC · title updates</small></span>
+          </button>
+        </div>
+
+        <div class="catalog-toolbar">
+          <label class="search-box">
+            <span class="search-icon">⌕</span>
+            <input id="search-input" type="search" placeholder="Search this collection" autocomplete="off">
+          </label>
+          <button class="quiet-button" id="select-page-button" type="button">Select page</button>
+          <button class="quiet-button" id="targets-button" type="button">Destinations</button>
+          <button class="primary-button" id="queue-button" type="button" disabled>Queue selected <span>→</span></button>
+        </div>
+
+        <div class="target-panel" id="target-panel" hidden>
+          <div>
+            <p class="eyebrow">AMBIGUOUS CONTENT</p>
+            <strong>Optional destinations</strong>
+            <p>Choose one or more existing title bundles only when package metadata is missing or unclear. Normal STFS title IDs still decide placement automatically.</p>
+          </div>
+          <div id="target-options" class="target-options"><span class="target-empty">No existing title bundles yet.</span></div>
+        </div>
+
+        <div class="catalog-message" id="catalog-message" role="status"></div>
+        <div class="catalog-list" id="catalog-list" aria-live="polite"></div>
+        <div class="pagination">
+          <button class="quiet-button" id="previous-page" type="button" disabled>← Previous</button>
+          <span id="page-label">Page 1</span>
+          <button class="quiet-button" id="next-page" type="button" disabled>Next →</button>
+        </div>
+      </section>
+
+      <aside class="sidebar">
+        <section class="queue-card" id="downloads-panel">
+          <div class="section-heading compact">
+            <div>
+              <p class="eyebrow">BACKGROUND WORKER</p>
+              <h2>Jobs & downloads</h2>
+            </div>
+            <div class="queue-tools">
+              <select id="queue-filter" class="queue-sort" aria-label="Filter queue">
+                <option value="active">Not downloaded</option>
+                <option value="downloaded">Downloaded</option>
+                <option value="all">All</option>
+              </select>
+              <select id="queue-sort" class="queue-sort" aria-label="Sort queue">
+                <option value="newest">Newest</option>
+                <option value="oldest">Oldest</option>
+                <option value="updated">Recently updated</option>
+                <option value="name">Name</option>
+              </select>
+              <span class="live-pill">LIVE</span>
+            </div>
+          </div>
+          <p class="queue-intro">Download the latest bundle for installation. Job history keeps earlier files for comparison.</p>
+          <p id="job-notice" class="job-notice" role="status" aria-live="polite"></p>
+          <div id="job-list" class="job-list">
+            <div class="empty-state">No work queued yet.<br><span>Selected jobs will appear here.</span></div>
+          </div>
+        </section>
+
+        <section class="storage-card">
+          <div class="section-heading compact">
+            <div>
+              <p class="eyebrow">HOST STORAGE</p>
+              <h3>Server capacity</h3>
+            </div>
+            <span class="storage-free" id="storage-free">— free</span>
+          </div>
+          <div class="storage-bar"><span id="storage-bar-fill"></span></div>
+          <div class="storage-line"><span id="storage-used">Used —</span><span id="storage-total">of —</span></div>
+          <p class="storage-detail" id="storage-detail">Calculating GOD Foundry data...</p>
+          <button class="storage-clean" id="clean-deleted-work" type="button">Clean deleted job work</button>
+        </section>
+
+        <section class="guide-card">
+          <p class="eyebrow">INSTALL ON YOUR XBOX</p>
+          <h3>Two folders. Clear destinations.</h3>
+          <div class="path-map">
+            <div><span class="path-key base"></span><code>Content → Hdd1:/Content/</code><small>Games, DLC, XBLA, and content title updates. Keep the GoD header and its .data folder together.</small></div>
+            <div><span class="path-key cache"></span><code>Cache → Hdd1:/Cache/</code><small>Only when included. Uppercase TU_* files go here, outside the Content folder.</small></div>
+          </div>
+          <p class="guide-note">Every latest bundle includes INSTALL-ON-XBOX.txt. In Aurora, scan the content path and enable the matching update. File checks do not confirm a launch on your console.</p>
+        </section>
+
+        <section class="notice-card">
+          <span class="notice-icon">!</span>
+          <div>
+            <strong>Backup use only</strong>
+            <p>Use this with content you are authorized to download and use. Settings controls license unlocking for generated DLC, XBLA, and avatar packages. GoD games keep their converter license metadata. Title updates are never modified.</p>
+          </div>
+        </section>
+      </aside>
+    </main>
+
+    <footer class="footer">
+      <span>GOD Foundry · {{ public_host }}</span>
+      <span><code>iso2god-next</code> · GoD licenses preserved · ZIP64 bundles</span>
+    </footer>
+  </div>
+  <dialog id="install-dialog" class="install-dialog" aria-labelledby="install-dialog-title">
+    <div class="dialog-heading"><p class="eyebrow">FROM BUNDLE TO CONSOLE</p><button id="install-dialog-close" class="quiet-button" type="button" aria-label="Close installation guide">Close ✕</button></div>
+    <h2 id="install-dialog-title">Install your latest bundle</h2>
+    <ol class="install-steps">
+      <li><strong>Download the latest game bundle.</strong><p>Extract it on your computer. Saved files in job history can be partial or older; use the main download for installation.</p></li>
+      <li><strong>Copy Content to Hdd1:/.</strong><p>Merge the folders. A GoD game lives under <code>Content/0000000000000000/&lt;TITLEID&gt;/00007000/</code>. Keep its header and matching <code>.data</code> folder beside each other.</p></li>
+      <li><strong>Copy Cache separately, if included.</strong><p>Uppercase <code>TU_*</code> files belong in <code>Hdd1:/Cache/</code>. Lowercase <code>tu...</code> updates stay inside the title's <code>000B0000</code> folder.</p></li>
+      <li><strong>Scan and test in Aurora.</strong><p>Scan your content path and enable the matching title update. If a game exits while applying an update, disable that update and test again.</p></li>
+    </ol>
+    <p class="install-note">A “passed” file check verifies the package, not playback on a physical Xbox. Each bundle includes the same instructions and its own check report.</p>
+  </dialog>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

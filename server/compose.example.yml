@@ -1,0 +1,26 @@
+services:
+  xbox360-iso2god:
+    build: .
+    image: local/xbox360-iso2god:foundry
+    restart: unless-stopped
+    environment:
+      START_BACKGROUND: 'true'
+      PUBLIC_HOST: iso2god.example.com
+      REMOTE_BASE_URL: https://your-existing-library.example.com
+      CONSOLE_ARTIFACT_QUOTA_GIB: '256'
+      CONSOLE_RETENTION_DAYS: '14'
+    volumes:
+      - ./games-GoD:/data/games-GoD
+      - ./downloaded-worked-on:/data/downloaded-worked-on
+    ports:
+      - '127.0.0.1:8080:8080'
+    # Retain your existing Saltbox network/browser-auth labels. Add ONLY the
+    # console machine router below, using the same application service.
+    labels:
+      traefik.http.routers.foundry-console.rule: Host(`iso2god.example.com`) && PathPrefix(`/api/console/v1/`)
+      traefik.http.routers.foundry-console.entrypoints: websecure
+      traefik.http.routers.foundry-console.priority: '100'
+      traefik.http.routers.foundry-console.tls: 'true'
+      traefik.http.routers.foundry-console.service: xbox360-iso2god
+      # Deliberately no interactive Authelia middleware on this one route.
+      # Flask enforces bearer/device authorization; browser routes retain SSO.

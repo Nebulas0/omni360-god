@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<!-- imagexex build options for Omni360.xex (ImageXex/ConfigurationFile in
+     XboxTLS2.vcxproj). The title ID and the embedded sections are passed on
+     the command line from the project instead; this file holds only what has
+     no command-line switch.
+
+     Privilege 0 (XEX_PRIVILEGE_NO_FORCE_REBOOT): without it the console
+     sends the running title back to the dashboard whenever the disc tray
+     opens. Omni360 runs from the hard drive while its disc install reads the
+     tray, so taking a disc out - or changing it for the next disc of a set -
+     must not close the app.
+
+     It isn't in this XDK's privilege documentation. It was found by
+     comparing headers (imagexex /DUMP) with XeXMenu, which stays open when
+     the tray is opened on the same console. The documented Multidisc Swap
+     and Multidisc Insecure Media privileges (15, 16) were tried first and
+     made no difference on hardware. -->
+<xex>
+  <privilege id="0"/>
+</xex>

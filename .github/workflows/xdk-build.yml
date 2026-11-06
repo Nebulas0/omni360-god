@@ -1,0 +1,25 @@
+name: Signed Xbox XDK build (configured runner required)
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    # Never run untrusted pull requests on an SDK/signing machine.
+    runs-on: [self-hosted, windows, xdk]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Build and sign with the runner's private toolchain
+        shell: powershell
+        run: .\tools\build_foundry.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Omni360-GoD-XEX
+          path: |
+            Release/Omni360.xex
+            Release/Omni360.xex.sig
+            Release/Media/**
+          if-no-files-found: error

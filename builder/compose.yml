@@ -1,0 +1,29 @@
+# Optional Windows VM managed by Docker. It does not include the Xbox XDK.
+# Supply a private .env and SDK/VS installers before starting it.
+services:
+  windows:
+    image: ${OMNI360_BUILDER_IMAGE:-dockurr/windows:latest}
+    container_name: omni360-xdk-builder
+    profiles: [builder]
+    environment:
+      VERSION: '11'
+      RAM_SIZE: '4G'
+      CPU_CORES: '4'
+      DISK_SIZE: '64G'
+      USERNAME: builder
+      PASSWORD: ${BUILDER_PASSWORD:?Set a private temporary Windows password}
+    devices:
+      - /dev/kvm
+      - /dev/net/tun
+    cap_add: [NET_ADMIN]
+    ports:
+      - '127.0.0.1:8006:8006'
+      - '127.0.0.1:3389:3389/tcp'
+      - '127.0.0.1:3389:3389/udp'
+    volumes:
+      - ${OMNI360_BUILD_ROOT:-/opt/omni360-builder}/storage:/storage
+      - ${OMNI360_BUILD_ROOT:-/opt/omni360-builder}/share:/shared
+    labels:
+      traefik.enable: 'false'
+    restart: 'no'
+    stop_grace_period: 2m
