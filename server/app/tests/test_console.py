@@ -470,6 +470,9 @@ def test_source_ingestion_resumes_the_same_partial_after_server_restart(setup, t
     with pytest.raises(RuntimeError, match="simulated server exit"):
         s.prepare(row)
     restarted = ConsoleService(s.config, s.database, s.runner, s.remote)
+    # Merely constructing a read-only API must not reset a live worker.
+    assert restarted.get_request(row["id"])["state"] == "preparing"
+    restarted.recover_requests()
     recovered = restarted.get_request(row["id"])
     assert recovered["state"] == "queued"
     restarted.prepare(recovered)
@@ -496,3 +499,64 @@ def test_failed_publication_is_not_registered_and_old_orphans_are_cleaned(setup)
     os.utime(orphans[0], (old, old))
     s.cleanup()
     assert not orphans[0].exists()
+
+
+@pytest.mark.parametrize('source_kind', ['disc', 'digital'])
+@pytest.mark.parametrize('target', ['415607E1', '12345678'])
+def test_addon_source_is_scoped_to_actual_game_and_never_reinstalls_god(setup, source_kind, target):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    _, god = seed_game(s)
+    dlc = god.parent.parent / '00000002' / 'standalone-addon'
+    raw = bytearray(write_tu(dlc)); raw[0x344:0x348] = (2).to_bytes(4, 'big')
+    raw[0x32C:0x340] = hashlib.sha1(raw[0x344:0xB000]).digest(); dlc.write_bytes(raw)
+    s.database.upsert_catalog(source_kind, [{'name': 'Synthetic game - Bonus (World) (Addon).zip', 'source_path': 'addon.zip', 'size': 1}])
+    job = s.database.enqueue_items([2])[0]
+    with s.connect() as c:
+        c.execute("UPDATE catalog_items SET status='complete' WHERE id=2")
+        c.execute("UPDATE jobs SET status='complete',artifact_paths=? WHERE id=?", (json.dumps([str(dlc)]), job['job_id']))
+    release = client.get(PREFIX + '/releases/catalog-2', headers=h).json
+    assert release['kind'] == 'digital' and [c['kind'] for c in release['components']] == ['dlc']
+    assert [r['release_id'] for r in client.get(PREFIX + '/catalog?kind=digital', headers=h).json['items']] == ['catalog-2']
+    assert [r['release_id'] for r in client.get(PREFIX + '/catalog?kind=game', headers=h).json['items']] == ['catalog-1']
+    r = client.post(PREFIX + '/install-requests', json={'release_id': 'catalog-2', 'conversion': 'console'}, headers={**h, 'Idempotency-Key': 'no-addon-conversion'})
+    assert r.status_code == 400
+    if target != '415607E1':
+        with pytest.raises(ConsoleError, match='does not belong'):
+            prepare(client, s, h, 'catalog-2', for_title_id=target)
+    else:
+        row = prepare(client, s, h, 'catalog-2', for_title_id=target, unlock_packages=False)
+        manifest = client.get(f"{PREFIX}/artifacts/{row['artifact_id']}/manifest", headers=h).json
+        assert [c['kind'] for c in manifest['components']] == ['dlc']
+        assert client.get(manifest['components'][0]['files'][0]['download_path'], headers=h).data == raw
+        assert god.exists()
+
+
+def test_leave_licenses_unchanged_keeps_already_unlocked_dlc(setup):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    release, god = seed_game(s)
+    dlc = god.parent.parent / '00000002' / 'already-unlocked'
+    raw = bytearray(write_tu(dlc)); raw[0x344:0x348] = (2).to_bytes(4, 'big'); raw[0x22C:0x32C] = bytes(256)
+    raw[0x32C:0x340] = hashlib.sha1(raw[0x344:0xB000]).digest(); dlc.write_bytes(raw)
+    components = client.get(PREFIX + '/releases/' + release, headers=h).json['components']
+    selected = next(c for c in components if c['kind'] == 'dlc')
+    row = prepare(client, s, h, release, component_ids=[selected['component_id']], unlock_packages=False)
+    manifest = client.get(f"{PREFIX}/artifacts/{row['artifact_id']}/manifest", headers=h).json
+    component = manifest['components'][0]
+    assert not component['unlock_applied'] and component['license_state'] == 'unlocked'
+    assert client.get(component['files'][0]['download_path'], headers=h).data == raw
+
+
+def test_store_api_requires_device_and_validates_filters(setup):
+    app, client, s = setup
+    assert client.get(PREFIX + '/store/home').status_code == 401
+    h, _ = pair(app, client, s)
+    seed_game(s)
+    assert client.get(PREFIX + '/store/home', headers=h).status_code == 200
+    result = client.get(PREFIX + '/store/titles', headers=h).json
+    assert result['total'] == 1 and result['items'][0]['release_count'] == 1
+    gid = result['items'][0]['group_id']
+    assert client.get(PREFIX + '/store/titles/' + gid, headers=h).json['releases'][0]['release_id'] == 'catalog-1'
+    for query in ['kind=unknown', 'letter=AB', 'cursor=-1', 'title_id=not-hex']:
+        assert client.get(PREFIX + '/store/titles?' + query, headers=h).status_code == 400

@@ -29,6 +29,7 @@ from remote import RemoteClient
 from validation import validate_god, validate_title_update
 from unlock import is_unlocked, unlock_package
 from xboxunity import XboxUnityClient, XboxUnityError
+from store_browser import StoreBrowser, is_addon_source
 
 PREFIX = "/api/console/v1"
 SCOPES = {"catalog:read", "install:create", "artifact:read", "install:report"}
@@ -102,7 +103,6 @@ class ConsoleService:
                     payload TEXT NOT NULL, created_at TEXT NOT NULL,
                     PRIMARY KEY(device_id,event_id));
             """)
-            c.execute("UPDATE console_requests SET state='queued' WHERE state='preparing'")
 
     @contextmanager
     def connect(self):
@@ -239,7 +239,7 @@ class ConsoleService:
     def summary(self, item):
         ids = self.title_ids(item)
         return {"release_id": f"catalog-{item['id']}", "name": item["name"],
-                "kind": "game" if item["source_kind"] == "disc" else "digital",
+                "kind": "digital" if is_addon_source(item["name"]) else "game" if item["source_kind"] == "disc" else "digital",
                 "title_id": ids[0] if len(ids) == 1 else None, "title_ids": ids,
                 "source_bytes": str(item["remote_size"]),
                 "availability": "prepared" if item["status"] == "complete" else item["status"],
@@ -249,7 +249,7 @@ class ConsoleService:
         result = []
         for title_id in self.title_ids(item):
             result.extend(self.components_for_title(title_id))
-        if item.get("source_kind") == "digital":
+        if item.get("source_kind") == "digital" or is_addon_source(item["name"]):
             # A DLC source must not silently offer its entire base game or
             # unrelated add-ons merely because they share a Title ID.
             produced = item.get("_produced_paths", set())
@@ -298,7 +298,7 @@ class ConsoleService:
         return {k: v for k, v in component.items() if not k.startswith("_")}
 
     def create_request(self, payload, idem):
-        if set(payload) - {"release_id", "conversion", "component_ids", "unlock_packages", "kind", "game_identity"}:
+        if set(payload) - {"release_id", "conversion", "component_ids", "unlock_packages", "kind", "game_identity", "for_title_id"}:
             raise ConsoleError("INVALID_REQUEST", "Unknown installation option")
         identity = None
         if payload.get("kind") == "title_update":
@@ -316,7 +316,7 @@ class ConsoleService:
             item = self.item(payload.get("release_id"))
             release = payload["release_id"]
         mode = payload.get("conversion", "server")
-        if mode not in {"server", "console"} or (mode == "console" and item["source_kind"] != "disc"):
+        if mode not in {"server", "console"} or (mode == "console" and (item["source_kind"] != "disc" or is_addon_source(item.get("name", "")))):
             raise ConsoleError("UNSUPPORTED_SOURCE", "Xbox conversion is only available for disc archives")
         ids = payload.get("component_ids", [])
         if not isinstance(ids, list) or len(ids) > 100 or any(not isinstance(x, str) or not re.fullmatch(r"[0-9a-f]{32}", x) for x in ids):
@@ -326,6 +326,11 @@ class ConsoleService:
             raise ConsoleError("INVALID_REQUEST", "unlock_packages must be boolean")
         normalized = {"release_id": release, "conversion": mode,
                       "component_ids": sorted(set(ids)), "unlock_packages": unlock}
+        title_id = payload.get("for_title_id")
+        if title_id is not None:
+            if identity or mode != "server" or not isinstance(title_id, str) or not re.fullmatch(r"[0-9A-Fa-f]{8}", title_id) or title_id == "00000000":
+                raise ConsoleError("INVALID_REQUEST", "DLC requires a valid target game Title ID and server preparation")
+            normalized["for_title_id"] = title_id.upper()
         if identity:
             if mode != "server" or ids:
                 raise ConsoleError("INVALID_REQUEST", "Title updates are prepared on the server")
@@ -386,7 +391,14 @@ class ConsoleService:
         with self.connect() as c:
             c.execute("UPDATE console_requests SET " + ",".join(k + "=?" for k in values) + " WHERE id=?", (*values.values(), rid))
 
+    def recover_requests(self):
+        # Only the preparation worker owns crash recovery. A browsing-only
+        # API instance must never reset another process's active request.
+        with self.connect() as c:
+            c.execute("UPDATE console_requests SET state='queued' WHERE state='preparing'")
+
     def start(self):
+        self.recover_requests()
         self.thread = threading.Thread(target=self.run, name="console-artifact-worker", daemon=True)
         self.thread.start()
 
@@ -452,11 +464,13 @@ class ConsoleService:
             components = [c for c in components if c["component_id"] in selected]
         else:
             # No implicit DLC or title-update installation.
-            allowed = {"god"} if item["source_kind"] == "disc" else {"xbla", "dlc"}
+            allowed = {"dlc"} if is_addon_source(item["name"]) or payload.get("for_title_id") else {"god"} if item["source_kind"] == "disc" else {"xbla", "dlc"}
             produced = {str(Path(p).resolve()) for p in Database.decode_output_paths(job.get("artifact_paths"))}
             components = [c for c in components if c["kind"] in allowed and str(c["_path"].resolve()) in produced]
         if not components:
             raise ConsoleError("METADATA_UNKNOWN", "No supported, identified components are ready for this release", 409)
+        if payload.get("for_title_id") and any(c["kind"] != "dlc" or c["title_id"].upper() != payload["for_title_id"] for c in components):
+            raise ConsoleError("INCOMPATIBLE_DLC", "The actual DLC package does not belong to the selected game; nothing was installed", 409)
         self.publish_packages(row, payload, components)
 
     def check_quota(self, size):
@@ -528,8 +542,7 @@ class ConsoleService:
                                 while block := package.read(1024**2):
                                     checksum.update(block)
                                 sha = checksum.hexdigest()
-                        elif is_unlocked(staging / key):
-                            raise ConsoleError("POLICY_MISMATCH", "This source was already unlocked. Reprocess its original archive with unlocking disabled; no synthetic relock is performed", 409)
+                        entry["license_state"] = "unlocked" if is_unlocked(staging / key) else "preserved"
                     entry["files"].append({"file_id": file_id, "root": root, "relative_path": relative,
                         "role": "header" if component["kind"] == "god" and p == component["_path"] else "data" if component["kind"] == "god" else "package",
                         "bytes": size, "sha256": sha, "etag": sha,
@@ -746,6 +759,7 @@ class ConsoleService:
 
 def register_console_api(app, config, database, runner, remote, start_background):
     service = ConsoleService(config, database, runner, remote)
+    browser = StoreBrowser(database)
     app.config["CONSOLE_SERVICE"] = service
     api = Blueprint("console", __name__, url_prefix=PREFIX)
 
@@ -782,7 +796,7 @@ def register_console_api(app, config, database, runner, remote, start_background
                        modes=["server", "console"], source_formats=["zip-stored", "zip-deflate"],
                        manifest_limit_bytes="1048576", max_page_size=50, max_components=100,
                        max_file_bytes=str(MAX_FILE), checksums=["sha256"], pairing=True,
-                       online_title_updates=config.xboxunity_tu_downloads)
+                       online_title_updates=config.xboxunity_tu_downloads, store_browsing=True)
 
     @api.post("/pairings")
     def pair():
@@ -798,6 +812,41 @@ def register_console_api(app, config, database, runner, remote, start_background
             raise ConsoleError("INVALID_REQUEST", "Invalid device code")
         return jsonify(service.poll_pair(secret))
 
+    def browse_page():
+        try:
+            offset = int(request.args.get("cursor", "0"))
+            if not 0 <= offset <= 100000: raise ValueError()
+        except ValueError:
+            raise ConsoleError("INVALID_REQUEST", "Invalid browsing cursor")
+        return offset
+
+    @api.get("/store/home")
+    def store_home():
+        service.scope("catalog:read")
+        return jsonify(browser.home())
+
+    @api.get("/store/titles")
+    def store_titles():
+        service.scope("catalog:read")
+        kind = request.args.get("kind", "game")
+        letter = request.args.get("letter", "*").upper()
+        if kind not in {"game", "digital", "dlc"} or len(letter) != 1 or letter not in "*#ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            raise ConsoleError("INVALID_REQUEST", "Invalid browsing category or letter")
+        title_id = request.args.get("title_id")
+        if title_id is not None and not re.fullmatch(r"[0-9A-Fa-f]{8}", title_id):
+            raise ConsoleError("INVALID_REQUEST", "Invalid game Title ID")
+        return jsonify(browser.browse(kind, letter, request.args.get("q", "")[:120], browse_page(),
+            title_id=title_id.upper() if title_id else None, parent_name=request.args.get("parent", "")[:512]))
+
+    @api.get("/store/titles/<gid>")
+    def store_releases(gid):
+        service.scope("catalog:read")
+        if not re.fullmatch(r"[0-9a-f]{32}", gid):
+            raise ConsoleError("NOT_FOUND", "Title not found", 404)
+        result = browser.releases(gid, browse_page())
+        if result is None: raise ConsoleError("NOT_FOUND", "Title not found", 404)
+        return jsonify(result)
+
     @api.get("/catalog")
     def catalog():
         service.scope("catalog:read")
@@ -810,9 +859,11 @@ def register_console_api(app, config, database, runner, remote, start_background
         except ValueError:
             raise ConsoleError("INVALID_REQUEST", "Invalid catalog cursor or page size")
         q = normalize_search_text(request.args.get("q", "")[:120])
+        addon = "(lower(name) LIKE '%(addon)%' OR lower(name) LIKE '%(dlc)%')"
+        category = "(source_kind='digital' OR " + addon + ")" if kind == "digital" else "(source_kind='disc' AND NOT " + addon + ")"
         with service.connect() as c:
-            rows = c.execute("SELECT * FROM catalog_items WHERE id>? AND source_kind=? AND search_text LIKE ? ORDER BY id LIMIT ?",
-                             (cursor, "disc" if kind == "game" else "digital", "%" + q + "%", limit + 1)).fetchall()
+            rows = c.execute("SELECT * FROM catalog_items WHERE id>? AND " + category + " AND search_text LIKE ? ORDER BY id LIMIT ?",
+                             (cursor, "%" + q + "%", limit + 1)).fetchall()
         return jsonify(items=[service.summary(dict(r)) for r in rows[:limit]],
                        next_cursor=str(rows[limit-1]["id"]) if len(rows) > limit else None)
 

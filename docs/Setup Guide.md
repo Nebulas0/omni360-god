@@ -125,3 +125,48 @@ Because DLC matching is deliberately loose — it has to cope with release-group
 - **Garbled game names** — STFS display-name encoding. `StfsParser.cpp` detects UTF-8 versus UTF-16BE per file and re-encodes both to UTF-8. If a name still looks wrong, that is worth reporting rather than expected.
 
 A game download picks up where it stopped after a stall, but not across a restart: quitting the app mid-download removes what was downloaded, and it has to be started again. DLC and title update downloads that fail have to be retried by hand.
+
+
+## Foundry Store and download progress (fork)
+
+**Settings > General > Store source > Choose source** selects **Foundry / my website**
+(the fork default) or **Archive.org**. Foundry uses the same featured, cover-grid,
+A–Z and game detail renderers. Pair the Xbox in **Foundry connection** once; Archive.org
+credentials are only required for the Archive.org provider. Existing `games-path:`,
+`content-path:` and other settings stay in effect for both providers. The saved selector is:
+
+```text
+store-source: foundry
+```
+
+Use `store-source: archive` for the original provider. **Y** searches, **LB/RB** pages
+through results and source versions, and **Versions / discs** selects the exact source.
+Region and disc labels remain visible. Artwork/ratings use existing catalog hints and
+Xbox Live metadata when available; missing artwork gets a plain tile. Artwork never
+sets a package's installation Title ID.
+
+The queue reports the current file, total files, files remaining, total download bytes,
+speed and estimated download time. A GoD commonly has many similarly sized ~163 MiB
+`DataNNNN` parts: the file number advances rather than restarting the whole game.
+A retry is labelled explicitly. Xbox conversion shows whole-archive download progress,
+then separate ISO verification/indexing and conversion progress with measured estimates.
+Estimates appear after a speed sample; they can change with network/disk/CPU speed.
+They do not predict server preparation time or conversion time before it starts.
+Existing interrupted jobs retain their resume state and recheck downloaded bytes.
+
+With Foundry selected, **DLC / add-ons** in the Store and an installed game's Library
+page uses Foundry, not Archive.org. Catalog archives tagged **(Addon)** or **(DLC)** are
+add-ons even in a disc source listing. Name/artwork matches are browsing hints; an
+installation requested for a specific game is rejected if any actual DLC package has
+a different Title ID. DLC installs under the content folder alongside an existing GoD;
+a DLC-only install does not redownload or replace the game. Some DLC also needs a
+specific compatible title update; enable the correct update in Aurora when required.
+The Library's Foundry title-update action reads the installed GoD's actual Title ID,
+Media ID and base version for an exact server-side match.
+
+When installing XBLA/DLC, choose **Unlock XBLA / DLC** or **Leave licenses unchanged**.
+Foundry performs unlocking on a private installation copy with a backup; the client
+itself does not patch licenses. Leaving licenses unchanged also preserves content
+that arrived already unlocked; it cannot restore licenses that an earlier tool erased.
+GoD and title updates are never unlocked by this option. The original Archive.org
+installer downloads/extracts the supplied DLC packages and does not unlock them.

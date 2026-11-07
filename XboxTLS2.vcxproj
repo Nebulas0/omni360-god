@@ -472,6 +472,7 @@
     <ClCompile Include="src\ReadAhead.cpp" />
     <ClCompile Include="src\DiscWorker.cpp" />
     <ClCompile Include="src\Foundry.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
+    <ClCompile Include="src\FoundryStore.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
     <ClCompile Include="src\FoundryProtocol.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
     <ClCompile Include="src\GameInstaller.cpp" />
     <ClCompile Include="src\HttpPlain.cpp" />

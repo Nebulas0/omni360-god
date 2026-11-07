@@ -158,6 +158,7 @@
       <Filter>Source Files\Installs</Filter>
     </ClCompile>
     <ClCompile Include="src\Foundry.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\FoundryStore.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\FoundryProtocol.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\GameInstaller.cpp">
       <Filter>Source Files\Installs</Filter>

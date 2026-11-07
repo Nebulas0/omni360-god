@@ -101,6 +101,7 @@ static void Case(const char *name)
     hostRoot=std::string(getenv("FOUNDRY_TEST_ROOT"))+"/"+name;assert(mkdir(hostRoot.c_str(),0700)==0);
     assert(mkdir((hostRoot+"/game").c_str(),0700)==0);assert(mkdir((hostRoot+"/Hdd1").c_str(),0700)==0);
     g_stop=g_cancel=0;g_started=true;g_used=g_pending=false;crashAfterMove=-1;
+    g_transferBase=g_transferTotal=g_transferJobDone=g_transferJobTotal=0;g_transferFile=g_transferFiles=0;
     diskAvailable=100ULL*1024*1024*1024;diskQueries=0;
     g_device=Device();g_device.id=std::string(32,'a');g_device.token="fg_"+std::string(43,'b');g_device.sequence=0;
 }
@@ -236,8 +237,23 @@ static void CacheAndSpace()
     assert(diskQueries==1);diskQueries=0;w.games="Usb0:\\Games";
     assert(CheckRequiredSpace(w,m,&error)&&diskQueries==2);
 }
+static void AggregateProgress()
+{
+    Case("aggregate-progress");
+    BeginTransferFile(12,47,11000,47000,"Data0010");
+    g_transferBase=200;DownloadProgress(300,800,100,5);
+    assert(g_snap.bytesDone==11500&&g_snap.bytesTotal==47000&&g_snap.secondsLeft==355);
+    assert(std::string(g_snap.phase).find("12/47 (35 left)")!=std::string::npos);
+    TransferFilePhase(true);assert(std::string(g_snap.phase).find("Retry file")!=std::string::npos);
+    BeginTransferFile(3,4,64ULL*1024*1024,100ULL*1024*1024,"Archive part 3");
+    g_transferBase=1024;DownloadProgress(1024,32ULL*1024*1024,1024,1);
+    assert(g_snap.bytesDone==64ULL*1024*1024+2048&&g_snap.secondsLeft==36862);
+    DWORD start=GetTickCount();for(int i=0;i<10;++i)GetTickCount();
+    TimedProgress("Converting on Xbox",1000,5000,start);
+    assert(g_snap.bytesDone==1000&&g_snap.bytesTotal==5000&&g_snap.bytesPerSec>0&&g_snap.secondsLeft>0);
+}
 int main()
 {
-    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();
+    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();AggregateProgress();
     std::cout<<"Real client runtime: interrupted transfers, in-piece resume, lost POST/reboot idempotency, cross-server guard, GoD/Cache TU power cuts and shared-volume space checks passed\n";
 }

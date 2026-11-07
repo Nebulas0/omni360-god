@@ -67,6 +67,7 @@ extern "C" NTSTATUS XexGetModuleHandle(PSZ moduleName, PHANDLE outHandle);
 #define SETTINGS_FILE "game:\\settings.txt"
 #define SETTINGS_TEMP_FILE "game:\\settings.tmp"
 #define GAMES_PATH_KEY "games-path: "
+#define STORE_SOURCE_KEY "store-source: "
 #define UPDATE_CHECK_KEY "check-updates: " // "off" stops the check at start
 #define SOUNDS_KEY "nav-sounds: "         // "off" silences the interface
 #define DISC_SPEED_KEY "disc-speed: "       // 1 to 4, DiscWorker's spindle speed for installs
@@ -274,6 +275,11 @@ static char g_contentBase[MAX_TEXT_LENGTH] = CONTENT_BASE_PATH_DEFAULT;
 static void GetGamesPath(char *outPath, size_t outPathSize)
 {
     GetSettingsPath(GAMES_PATH_KEY, GAMES_PATH_DEFAULT, outPath, outPathSize);
+}
+static bool UseFoundryStore()
+{
+    char value[32];GetSettingsPath(STORE_SOURCE_KEY,"foundry",value,sizeof(value));
+    return _stricmp(value,"archive")!=0&&_stricmp(value,"archive.org")!=0;
 }
 
 // More library folders: every "games-path:" line after the first. The first
@@ -1568,6 +1574,8 @@ enum SettingsRow
     SETTINGS_ROW_LIBRARY_FOLDER, // one of g_folderRows: A adds or removes it
     SETTINGS_ROW_ADD_FOLDER,   // another library folder, typed
     SETTINGS_ROW_SOUNDS,       // the interface's sounds, on or off
+    SETTINGS_ROW_STORE_SOURCE,
+    SETTINGS_ROW_FOUNDRY,
     SETTINGS_ROW_SPEED_TEST    // where a download's speed goes - SpeedTest.h
 };
 
@@ -2127,6 +2135,11 @@ static void BuildSettingsPage(SettingsPage &page, const Library &lib, const char
 
     // --- One line a setting ---
     AddSettingsRow(page, SETTINGS_VIEW_HEADING, "General");
+    AddSettingsRow(page, SETTINGS_VIEW_LINE, "Store source").status = UseFoundryStore()?"Foundry / your website":"archive.org";
+    AddSettingsControl(page, SETTINGS_CONTROL_BUTTON, "Choose source", SETTINGS_ROW_STORE_SOURCE,
+                       "Choose your Foundry server or the original archive.org Store. Active downloads continue.");
+    AddSettingsControl(page, SETTINGS_CONTROL_BUTTON, "Foundry connection", SETTINGS_ROW_FOUNDRY,
+                       "Pair this console, change the server or resume an interrupted installation.");
 
     // Only the start of the access key is shown - enough to tell which keys
     // are saved. The secret key is never shown anywhere.
@@ -2251,6 +2264,15 @@ static SettingsOutcome RunSettingsRow(SettingsRow row, int arg, Library &lib, ch
 
     switch (row)
     {
+    case SETTINGS_ROW_STORE_SOURCE:
+    {
+        const char *names[]={"Foundry / my website","archive.org"};
+        const char *details[]={"Browse your server with covers, categories and game pages","Use the original Omni360 catalog and archive.org credentials"};
+        int pick=ShowChoiceUI("Store source","This changes browsing; existing downloads keep their saved source",names,details,2,L"Choose");
+        if(pick>=0&&!SetSettingsValue(STORE_SOURCE_KEY,pick==0?"foundry":"archive"))ShowMessageUI("Not saved","settings.txt could not be written",NULL);
+        break;
+    }
+    case SETTINGS_ROW_FOUNDRY: OpenFoundryUI(gamesPath,g_contentBase); break;
     case SETTINGS_ROW_GAMES_FOLDER: ChangeGamesFolder(lib, gamesPath, gamesPathSize, outcome); break;
     case SETTINGS_ROW_KEYS:         ChangeKeys(outcome); break;
     case SETTINGS_ROW_REMOVE_KEYS:  RemoveKeys(outcome); break;
@@ -5927,7 +5949,10 @@ static void FormatTransferNumbers(const QueueJobSnapshot &job, char *out, size_t
             _snprintf(left, sizeof(left), "%d:%02d", minutesLeft, secsLeft);
         left[sizeof(left) - 1] = '\0';
 
-        _snprintf(out, outSize, "%s of %s   %s/s   %s left", done, total, speed, left);
+        if (job.bytesPerSec == 0 && job.bytesDone < job.bytesTotal)
+            _snprintf(out, outSize, "%s of %s   Estimating time...", done, total);
+        else
+            _snprintf(out, outSize, "%s of %s   %s/s   %s left", done, total, speed, left);
     }
     else
     {
@@ -7061,6 +7086,14 @@ int main()
 
         PublishSidebar(shell, lib);
 
+        if(shell.page==SHELL_PAGE_STORE&&!shell.sidebarFocused&&UseFoundryStore())
+        {
+            bool queue=OpenFoundryStoreUI(gamesPath,g_contentBase);
+            EnterPage(shell,queue?SHELL_PAGE_QUEUE:SHELL_PAGE_HOME,false);
+            ResyncUiInput();
+            continue;
+        }
+
         UiInput input = PollUiInput();
         const WORD pressed = input.pressed;
 
@@ -7362,9 +7395,19 @@ int main()
                 else if ((f == STORE_GAME_FOCUS_BUTTONS + 1 || f == STORE_GAME_FOCUS_BUTTONS + 2) && !StoreGameIsIndie() &&
                          !StoreGameIsXbox())
                 {
-                    // The library's pickers, open over this page.
-                    OpenPicker(shell.picker, f == STORE_GAME_FOCUS_BUTTONS + 1 ? PICKER_DLC : PICKER_TITLE_UPDATE,
-                               g_storeGame.name, g_storeGame.titleId, shell.page);
+                    if (UseFoundryStore())
+                    {
+                        if (f == STORE_GAME_FOCUS_BUTTONS + 1)
+                        {
+                            if (OpenFoundryDlcUI(gamesPath, g_contentBase, g_storeGame.name, g_storeGame.titleId))
+                                EnterPage(shell, SHELL_PAGE_QUEUE, false);
+                        }
+                        else OpenFoundryUpdatesUI(gamesPath, g_contentBase, g_storeGame.titleId);
+                        ResyncUiInput();
+                        acted = true;
+                    }
+                    else OpenPicker(shell.picker, f == STORE_GAME_FOCUS_BUTTONS + 1 ? PICKER_DLC : PICKER_TITLE_UPDATE,
+                                    g_storeGame.name, g_storeGame.titleId, shell.page);
                 }
                 else if (f == STORE_GAME_FOCUS_BUTTONS + 3 && CanUninstallStoreVersion(lib, shell))
                 {

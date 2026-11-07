@@ -12,8 +12,9 @@ The Xbox application remains at the repository root. `server/app` is the
 matching Flask application. Private configuration, source archives, databases,
 game files and signing keys do not belong in this repository.
 
-From the original Store front page, press **X: Foundry**. Pair through the
-website's `/consoles` page, search the Foundry catalog, and choose server or
+The main **Store** defaults to Foundry cover browsing. Select Foundry or Archive.org
+in **Settings > General > Store source**. Pair through the website's `/consoles`
+page, browse/search your catalog, and choose server or
 Xbox conversion for a disc game. Digital sources use server processing.
 Prepared releases offer explicit component selection. Title updates must match
 an actual staged/installed game's Title ID, Media ID and XEX base version;
@@ -152,3 +153,33 @@ for the modified Foundry application.
 - Online TU lookup for a fresh console-mode game, followed by an in-game launch.
 - Check the longer `FOUNDRY-INTEGRATION-PLAN.txt` against the delivered behavior;
   no untested or incomplete feature is a stable-release promise.
+
+
+## Foundry browsing API (alpha.6)
+
+Device-authenticated `GET /api/console/v1/store/home` returns featured tiles and
+bounded category rows; `/store/titles` accepts `kind=game|digital|dlc`, `letter`,
+`q` and offset `cursor` with 48 items/page. `/store/titles/<group_id>` pages the
+original source editions/discs (50/page), preserving their existing `catalog-N`
+release IDs. DLC browsing optionally takes `title_id` and `parent` (base-game
+name). Archives tagged `(Addon)` / `(DLC)` are digital DLC in both browsing
+and the older search API, regardless of their physical source catalog.
+
+`for_title_id` in an install request limits it to actual DLC packages with that
+Title ID, checked after preparation and before publication. A name/artwork match
+never overrides STFS identity. `unlock_packages` is captured with each request;
+false copies existing licenses unchanged, including already unlocked sources.
+GoD/TU licenses are unaffected. DLC sources offer only their own produced files.
+
+`server/app/store_metadata.json` contains 2,249 artwork/ratings hints from the
+existing compiled upstream tables. Regenerate with:
+
+```sh
+c++ -std=c++03 tools/export_foundry_metadata.cpp -o /tmp/export_foundry_metadata
+/tmp/export_foundry_metadata > server/app/store_metadata.json
+```
+
+Unknown or ambiguous artwork IDs get plain tiles. Prepared package identities
+remain authoritative. Source groups do not add IDs to the production catalog.
+Read-only API initialization never recovers another worker's preparing requests;
+crash recovery belongs to the preparation worker's startup.

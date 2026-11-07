@@ -57,6 +57,10 @@ static volatile LONG g_stop=0, g_cancel=0, g_uiCancel=0;
 static bool g_started=false,g_pending=false,g_used=false,g_delivered=false;
 static QueueJobSnapshot g_snap;
 static unsigned long long g_transferBase=0,g_transferTotal=0;
+static unsigned long long g_transferJobDone=0,g_transferJobTotal=0;
+static DWORD g_conversionStarted=0;
+static unsigned g_transferFile=0,g_transferFiles=0;
+static std::string g_transferName;
 
 static std::string Text(const cJSON *o,const char *k)
 {
@@ -143,14 +147,27 @@ static void Phase(const char *name,float fraction=-1.0f,unsigned long long done=
     EnterCriticalSection(&g_lock);
     _snprintf(g_snap.phase,sizeof(g_snap.phase),"%s",name); g_snap.phase[sizeof(g_snap.phase)-1]=0;
     g_snap.fraction=fraction;g_snap.bytesDone=done;g_snap.bytesTotal=total;
+    g_snap.bytesPerSec=0;g_snap.secondsLeft=0;
     LeaveCriticalSection(&g_lock);
 }
 static bool Cancelled() { return InterlockedCompareExchange(&g_cancel,0,0)||InterlockedCompareExchange(&g_stop,0,0); }
 static bool DownloadProgress(unsigned long long done,unsigned long long total,unsigned long long speed,unsigned long long left)
 {
     done+=g_transferBase;if(g_transferTotal)total=g_transferTotal;
+    if(g_transferJobTotal){done+=g_transferJobDone;total=g_transferJobTotal;left=speed&&total>done?(total-done)/speed+((total-done)%speed!=0):0;}
     EnterCriticalSection(&g_lock);g_snap.bytesDone=done;g_snap.bytesTotal=total;g_snap.bytesPerSec=speed;g_snap.secondsLeft=left;
     g_snap.fraction=total?(float)((double)done/total):-1.0f;LeaveCriticalSection(&g_lock);return !Cancelled();
+}
+static void TransferFilePhase(bool retry)
+{
+    if(!g_transferFiles)return;
+    char phase[64];_snprintf(phase,sizeof(phase),"%s %u/%u (%u left): %.22s",retry?"Retry file":"File",g_transferFile,g_transferFiles,g_transferFiles-g_transferFile,g_transferName.c_str());phase[sizeof(phase)-1]=0;
+    EnterCriticalSection(&g_lock);strcpy(g_snap.phase,phase);LeaveCriticalSection(&g_lock);
+}
+static void BeginTransferFile(unsigned index,unsigned count,unsigned long long done,unsigned long long total,const std::string &name)
+{
+    g_transferFile=index;g_transferFiles=count;g_transferJobDone=done;g_transferJobTotal=total;g_transferName=name;
+    g_transferBase=0;g_transferTotal=0;TransferFilePhase(false);DownloadProgress(0,0,0,0);
 }
 static bool UiProgress(unsigned long long,unsigned long long,unsigned long long,unsigned long long)
 { return !InterlockedCompareExchange(&g_uiCancel,0,0); }
@@ -268,6 +285,7 @@ static bool RangeDownload(const std::string &url,const std::string &partial,unsi
         std::string range="bytes "+Decimal(start+before)+"-"+Decimal(start+size-1)+"/"+Decimal(fullSize);
         HttpResponsePolicy policy;policy.status=206;policy.etag=etag.c_str();policy.contentRange=range.c_str();
         g_transferBase=before;g_transferTotal=size;
+        TransferFilePhase(attempt!=0);
         int status=httpRequestHTTPS(d.origin+url,HTTP_GET,NULL,headers.c_str(),partial,NULL,NULL,true,NULL,0,dprintf,size-before,DownloadProgress,before!=0,&policy);
         unsigned long long after=Length(partial);
         if(after<before||after>size){*error="Download length changed unexpectedly";return false;}
@@ -499,24 +517,27 @@ static bool CheckRequiredSpace(const Work &w,const FoundryManifest &m,std::strin
 static bool Prepared(const Work &w,const FoundryManifest &m,std::string *error)
 {
     if(!CheckRequiredSpace(w,m,error))return false;
+    unsigned files=0,index=0;unsigned long long completed=0;
+    for(size_t i=0;i<m.components.size();++i)files+=(unsigned)m.components[i].files.size();
     for(size_t i=0;i<m.components.size();++i)
     {
         const FoundryComponent &c=m.components[i];std::string root=Root(w,c.kind=="god"?"games":c.files[0].root=="cache"?"cache":"content");
         for(size_t j=0;j<c.files.size();++j)
         {
             if(Cancelled()){*error="Cancelled; checked files are kept for resume";return false;}
-            const FoundryFile &f=c.files[j];Phase("Downloading checked package");
+            const FoundryFile &f=c.files[j];BeginTransferFile(++index,files,completed,m.totalBytes,f.path.substr(f.path.find_last_of('/')+1));
             if(!Fetch(std::string(API)+"/artifacts/"+m.id+"/files/"+f.id,Stage(root,m.id)+"\\files\\"+Native(f.path),f.bytes,f.sha256,error))return false;
+            g_transferBase=0;DownloadProgress(f.bytes,f.bytes,0,0);completed+=f.bytes;
         }
         const FoundryFile *package=&c.files[0];for(size_t j=0;j<c.files.size();++j)if(c.files[j].role=="header")package=&c.files[j];
-        Phase("Checking package metadata");if(!CheckPackage(Stage(root,m.id)+"\\files\\"+Native(package->path),c,error))return false;
+        Phase("Checking package metadata",m.totalBytes?(float)((double)completed/m.totalBytes):-1,completed,m.totalBytes);if(!CheckPackage(Stage(root,m.id)+"\\files\\"+Native(package->path),c,error))return false;
     }
     // Validate TUs after every selected base game has arrived, independent of
     // manifest component ordering.
     for(size_t i=0;i<m.components.size();++i)
         if(m.components[i].kind=="title_update"&&!MatchingInstalledGame(w,m,m.components[i])){*error="Title update does not match the installed game's actual Media ID and base version";return false;}
     if(Cancelled()){*error="Cancelled before installation; checked files are kept";return false;}
-    Phase("Installing; recovery journal saved");return Commit(w,m,error);
+    Phase("Installing; recovery journal saved",1,completed,m.totalBytes);return Commit(w,m,error);
 }
 class StoredImage : public GodSource
 {
@@ -526,8 +547,16 @@ public:
     bool ReadAt(unsigned long long o,void *b,unsigned long n){return o<=length&&n<=length-o&&pieces->Read(start+o,b,n);}
     unsigned long long Size(){return length;}
 };
+static bool TimedProgress(const char *phase,unsigned long long done,unsigned long long total,DWORD started)
+{
+    Phase(phase,total?(float)((double)done/total):-1,done,total);
+    DWORD elapsed=GetTickCount()-started;
+    unsigned long long speed=elapsed>=1000?done*1000/elapsed:0,remaining=total>done?total-done:0;
+    EnterCriticalSection(&g_lock);g_snap.bytesPerSec=speed;g_snap.secondsLeft=speed?remaining/speed+(remaining%speed!=0):0;LeaveCriticalSection(&g_lock);
+    return !Cancelled();
+}
 static bool ConvertProgress(unsigned long long done,unsigned long long total,void *)
-{Phase("Converting on Xbox",total?(float)((double)done/total):-1,done,total);return !Cancelled();}
+{return TimedProgress("Converting on Xbox",done,total,g_conversionStarted);}
 static bool ConsoleConvert(const Work &w,const FoundryManifest &m,std::string *error)
 {
     const FoundrySource &s=m.source;std::string dir=Stage(w.games,m.id)+"\\source";
@@ -547,19 +576,22 @@ static bool ConsoleConvert(const Work &w,const FoundryManifest &m,std::string *e
     {
         if(Cancelled()){*error="Cancelled; source pieces are kept";return false;}
         unsigned long long size=std::min(PIECE,s.bytes-at);char path[512];pieces.PiecePath((unsigned long)(at/PIECE),path,sizeof(path));
+        char piece[32];_snprintf(piece,sizeof(piece),"Archive part %lu",(unsigned long)(at/PIECE)+1);piece[sizeof(piece)-1]=0;
+        BeginTransferFile((unsigned)(at/PIECE)+1,(unsigned)((s.bytes+PIECE-1)/PIECE),at,s.bytes,piece);
         if(Length(path)!=size)
         {
-            Phase("Downloading ISO archive in pieces");
             std::string partial=std::string(path)+".partial";
             if(!RangeDownload(std::string(API)+"/source-artifacts/"+m.id+"/file",partial,s.bytes,at,size,s.sha256,error))return false;
             DeleteFileA(path);if(!MoveFileA(partial.c_str(),path)){*error="Could not save source piece";return false;}
         }
+        g_transferBase=0;DownloadProgress(size,size,0,0);
         for(unsigned long long n=0;n<size;n+=buffer.size())
         {unsigned long count=(unsigned long)std::min((unsigned long long)buffer.size(),size-n);if(!pieces.Read(at+n,&buffer[0],count)){*error="Source piece read failed";return false;}br_sha256_update(&sha,&buffer[0],count);}
     }
     unsigned char sum[32];char hex[65];br_sha256_out(&sha,sum);for(int i=0;i<32;++i)sprintf(hex+i*2,"%02x",sum[i]);hex[64]=0;
     if(s.sha256!=hex){FILE *flag=fopen((dir+"\\corrupt.flag").c_str(),"wb");if(flag)fclose(flag);*error="Source checksum failed; retry will fetch clean source pieces";return false;}
     Phase("Checking ISO and building conversion index");
+    DWORD indexStarted=GetTickCount();
     InflateIndexer index(s.unpacked);unsigned long crc=crc32(0L,Z_NULL,0);
     for(unsigned long long at=0;at<s.packed;at+=buffer.size())
     {
@@ -568,6 +600,7 @@ static bool ConsoleConvert(const Work &w,const FoundryManifest &m,std::string *e
         if(!pieces.Read(s.offset+at,&buffer[0],n)){*error="ISO read failed";return false;}
         if(s.method==8){if(!index.Ok()||!index.Feed(&buffer[0],n)){*error="Invalid compressed ISO";return false;}}
         else crc=crc32(crc,&buffer[0],n);
+        TimedProgress("Checking ISO and building conversion index",at+n,s.packed,indexStarted);
     }
     if((s.method==8&&(!index.Finished()||index.Crc()!=s.crc||index.Out()!=s.unpacked))||(s.method==0&&crc!=s.crc)){*error="ISO CRC or length check failed";return false;}
     int count=0;InflatePoint *points=s.method==8?index.TakePoints(&count):NULL;
@@ -580,6 +613,7 @@ static bool ConsoleConvert(const Work &w,const FoundryManifest &m,std::string *e
     RemoveTree(output); // Only this artifact's unpublished conversion, after journal recovery.
     if(!FreeSpace(w.games,info.outputSize)){free(points);*error="Source is saved. Free space for the converted game, then resume";return false;}
     Dirs(output);char package[600];
+    g_conversionStarted=GetTickCount();
     {ReadAheadSource ahead(image,1024*1024,8);result=GodConvert(&ahead,info,output.c_str(),s.name.c_str(),NULL,0,ConvertProgress,NULL,package,sizeof(package));}
     free(points);if(result!=GOD_OK){*error=GodResultText(result);return false;}
     FoundryManifest generated;generated.id=m.id;FoundryComponent c;c.kind="god";c.titleId=Hex32(info.title.titleId);c.mediaId=Hex32(info.title.mediaId);c.contentType="00007000";
@@ -668,7 +702,8 @@ static DWORD WINAPI Worker(LPVOID)
     {
         WaitForSingleObject(g_wake,INFINITE);if(g_stop)break;
         EnterCriticalSection(&g_lock);bool pending=g_pending;g_pending=false;Work w=g_work;g_snap.state=QUEUE_ACTIVE;LeaveCriticalSection(&g_lock);
-        if(!pending)continue;std::string error;bool ok=Recover(&error)&&CreatePendingRequest(&w,&error);std::string aid;
+        if(!pending)continue;g_transferJobDone=g_transferJobTotal=0;g_transferFiles=g_transferFile=0;
+        std::string error;bool ok=Recover(&error)&&CreatePendingRequest(&w,&error);std::string aid;
         while(ok&&!Cancelled())
         {
             Phase("Waiting for server preparation");cJSON *reply=NULL;
@@ -769,12 +804,14 @@ static void PairUI()
     }
     cJSON_free(raw);cJSON_Delete(body);
 }
-static void QueueRelease(const std::string &release,const std::string &name,const char *games,const char *content,bool digital)
+static void QueueRelease(const std::string &release,const std::string &name,const char *games,const char *content,bool digital,const std::string &forTitle=std::string())
 {
     QueueJobSnapshot snap;if(SnapshotFoundryJobs(&snap,1)&&snap.state!=QUEUE_FINISHED){ShowMessageUI("Foundry","One Foundry installation is already active","Open Queue to see progress.");return;}
     const char *modes[]={"Convert on server","Convert on Xbox"};const char *details[]={"Download prepared and checked GoD files","Download the ISO archive, then convert locally"};
     int mode=digital?0:ShowChoiceUI("Conversion","Choose where this game is prepared",modes,details,2,L"Choose");if(mode<0)return;
     cJSON *body=cJSON_CreateObject();cJSON_AddStringToObject(body,"release_id",release.c_str());cJSON_AddStringToObject(body,"conversion",mode?"console":"server");
+    if(!forTitle.empty())cJSON_AddStringToObject(body,"for_title_id",forTitle.c_str());
+    bool licenseChoice=digital;
     cJSON *reply=NULL;std::string error;
     if(mode==0)
     {
@@ -788,7 +825,7 @@ static void QueueRelease(const std::string &release,const std::string &name,cons
             for(int i=0;i<count;++i)
             {
                 const cJSON *c=cJSON_GetArrayItem(components,i);ids.push_back(Text(c,"component_id"));kinds.push_back(Text(c,"kind"));names.push_back(Text(c,"name"));
-                selected[i]=digital?(kinds[i]=="dlc"||kinds[i]=="xbla"):(kinds[i]=="god"||kinds[i]=="xbla");
+                selected[i]=!forTitle.empty()?kinds[i]=="dlc"&&Text(c,"title_id")==forTitle:digital?(kinds[i]=="dlc"||kinds[i]=="xbla"):(kinds[i]=="god"||kinds[i]=="xbla");
             }
             for(;;)
             {
@@ -800,11 +837,12 @@ static void QueueRelease(const std::string &release,const std::string &name,cons
                 if(pick==0)break;selected[pick-1]=!selected[pick-1];
             }
             cJSON *chosen=cJSON_AddArrayToObject(body,"component_ids");bool any=false;
-            for(int i=0;i<count;++i)if(selected[i]){cJSON_AddItemToArray(chosen,cJSON_CreateString(ids[i].c_str()));any=true;}
+            for(int i=0;i<count;++i)if(selected[i]){cJSON_AddItemToArray(chosen,cJSON_CreateString(ids[i].c_str()));any=true;if(kinds[i]=="dlc"||kinds[i]=="xbla")licenseChoice=true;}
             if(!any){cJSON_Delete(info);cJSON_Delete(body);ShowMessageUI("Nothing selected","Choose at least one component",NULL);return;}
         }
         cJSON_Delete(info);
     }
+    if(licenseChoice){const char *choices[]={"Unlock XBLA / DLC","Leave licenses unchanged"};const char *notes[]={"Server unlocks selected XBLA / DLC with a backup. GoD and updates are unchanged.","Keep supplied licenses, including content that is already unlocked."};int pick=ShowChoiceUI("XBLA / DLC licenses","Choose how Foundry prepares this installation",choices,notes,2,L"Choose");if(pick<0){cJSON_Delete(body);return;}cJSON_AddBoolToObject(body,"unlock_packages",pick==0);}
     char *raw=cJSON_PrintUnformatted(body);
     bool ok=QueuePayload(raw,name,games,content,&error);cJSON_free(raw);cJSON_Delete(body);
     if(!ok){ShowMessageUI("Not queued",error.c_str(),NULL);return;}
@@ -830,7 +868,7 @@ static void BrowseUI(const char *games,const char *content,bool digital)
         QueueRelease(releases[pick],labels[pick],games,content,digital);return;
     }
 }
-static void OnlineUpdatesUI(const char *games,const char *content)
+static void OnlineUpdatesUI(const char *games,const char *content,unsigned long onlyTitle=0)
 {
     cJSON *caps=NULL;if(!UiCall(std::string(API)+"/capabilities","",false,&caps))return;
     bool available=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(caps,"online_title_updates"));cJSON_Delete(caps);
@@ -841,6 +879,7 @@ static void OnlineUpdatesUI(const char *games,const char *content)
     std::vector<InstalledIdentity> ids;std::vector<std::string> labels;
     for(int i=0;i<found&&ids.size()<256;++i)
     {
+        if(onlyTitle&&installed[i].titleId!=onlyTitle)continue;
         std::string dir=std::string(games)+"\\"+Hex32(installed[i].titleId)+"\\00007000";WIN32_FIND_DATAA fd;HANDLE h=FindFirstFileA((dir+"\\*").c_str(),&fd);
         if(h==INVALID_HANDLE_VALUE)continue;
         do {
@@ -894,3 +933,15 @@ void OpenFoundryUI(const char *games,const char *content)
         else BrowseUI(games,content,choice==1);
     }
 }
+
+bool FoundryStoreRequest(const std::string &path,cJSON **reply)
+{
+    if(!g_started)return false;
+    if(DeviceCopy().token.empty())PairUI();
+    if(DeviceCopy().token.empty())return false;
+    return UiCall(std::string(API)+path,"",true,reply);
+}
+void FoundryInstallFromStore(const std::string &release,const std::string &name,const char *games,const char *content,bool digital,const std::string &forTitle)
+{QueueRelease(release,name,games,content,digital,forTitle);}
+void OpenFoundryUpdatesUI(const char *games,const char *content,unsigned long titleId)
+{OnlineUpdatesUI(games,content,titleId);}
