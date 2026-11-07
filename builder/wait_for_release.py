@@ -10,6 +10,7 @@ import tempfile
 import time
 import urllib.request
 from publish import GitHub
+from build import inspect_xex
 
 
 def verify(directory, header):
@@ -17,6 +18,7 @@ def verify(directory, header):
     xex = directory / 'Omni360.xex'
     if xex.read_bytes()[:4] != b'XEX2' or hashlib.sha256(xex.read_bytes()).hexdigest() != report['sha256']:
         raise RuntimeError('Downloaded XEX checksum/format mismatch')
+    inspect_xex(xex.read_bytes())
     body = header.read_text().split('kUpdatePublicKey', 1)[1].split('{', 1)[1].split('}', 1)[0]
     point = bytes(int(v, 16) for v in re.findall(r'0x([0-9a-fA-F]{2})', body))
     if len(point) != 65: raise RuntimeError('Invalid release public key')

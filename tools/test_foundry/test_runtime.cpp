@@ -17,6 +17,8 @@
 #include <algorithm>
 
 static std::string hostRoot;
+static unsigned long long diskAvailable=100ULL*1024*1024*1024;
+static unsigned diskQueries=0;
 static int crashAfterMove=-1;
 struct PowerLoss {};
 static std::string MapPath(std::string p)
@@ -86,7 +88,7 @@ extern "C" BOOL SetEvent(HANDLE){return TRUE;}
 extern "C" DWORD WaitForSingleObject(HANDLE,DWORD){return WAIT_OBJECT_0;}
 extern "C" void Sleep(DWORD){}
 extern "C" DWORD GetTickCount(){static DWORD n=0;return n+=100;}
-extern "C" BOOL GetDiskFreeSpaceExA(const char*,ULARGE_INTEGER *a,ULARGE_INTEGER*,ULARGE_INTEGER*){a->QuadPart=100ULL*1024*1024*1024;return TRUE;}
+extern "C" BOOL GetDiskFreeSpaceExA(const char*,ULARGE_INTEGER *a,ULARGE_INTEGER*,ULARGE_INTEGER*){++diskQueries;a->QuadPart=diskAvailable;return TRUE;}
 extern "C" BOOL GetFileAttributesExA(const char *p,int,WIN32_FILE_ATTRIBUTE_DATA *out)
 {struct stat s;if(stat(MapPath(p).c_str(),&s))return FALSE;out->nFileSizeHigh=(DWORD)((unsigned long long)s.st_size>>32);out->nFileSizeLow=(DWORD)s.st_size;return TRUE;}
 
@@ -99,6 +101,7 @@ static void Case(const char *name)
     hostRoot=std::string(getenv("FOUNDRY_TEST_ROOT"))+"/"+name;assert(mkdir(hostRoot.c_str(),0700)==0);
     assert(mkdir((hostRoot+"/game").c_str(),0700)==0);assert(mkdir((hostRoot+"/Hdd1").c_str(),0700)==0);
     g_stop=g_cancel=0;g_started=true;g_used=g_pending=false;crashAfterMove=-1;
+    diskAvailable=100ULL*1024*1024*1024;diskQueries=0;
     g_device=Device();g_device.id=std::string(32,'a');g_device.token="fg_"+std::string(43,'b');g_device.sequence=0;
 }
 static std::string Header()
@@ -206,8 +209,35 @@ static void Transactions()
     Case("state-generation");cJSON *o=cJSON_CreateObject();cJSON_AddStringToObject(o,"test","saved");assert(WriteJson(JOB,o));cJSON_Delete(o);
     assert(MoveFileA(JOB,(std::string(JOB)+".old").c_str()));o=ReadJson(JOB);assert(Text(o,"test")=="saved");cJSON_Delete(o);
 }
+static void CacheAndSpace()
+{
+    for(int existing=0;existing<=1;++existing)for(int cut=0;cut<=existing+1;++cut)
+    {
+        char label[40];snprintf(label,sizeof(label),"cache-%d-%d",existing,cut);Case(label);
+        Work w;w.games=w.content="Hdd1:\\Content\\0000000000000000";
+        FoundryManifest m;m.id=std::string(32,'d');FoundryComponent c;c.kind="title_update";
+        FoundryFile f;f.root="cache";f.path="TU_"+std::string(32,'A');c.files.push_back(f);m.components.push_back(c);
+        std::string target="Hdd1:\\Cache\\"+f.path,stage=Stage("Hdd1:\\Cache",m.id)+"\\files\\"+f.path;
+        if(existing)Put(target,"OLD TU");Put(stage,"NEW TU");Put("Hdd1:\\Cache\\TU_unrelated","KEEP");
+        crashAfterMove=cut?cut:-1;std::string error;
+        try{assert(Commit(w,m,&error));assert(cut==0);}catch(const PowerLoss&){assert(cut>0);}
+        crashAfterMove=-1;
+        if(cut){assert(Recover(&error));assert(existing?Get(target)=="OLD TU":!Exists(target));assert(Get(stage)=="NEW TU");}
+        else assert(Get(target)=="NEW TU");
+        assert(Get("Hdd1:\\Cache\\TU_unrelated")=="KEEP");
+        assert(!JournalPath("_Foundry/"+std::string(32,'e')+"/files/"+f.path,"cache",m.id));
+        assert(!JournalPath("415607E1/000B0000/file","cache",m.id));
+    }
+    Case("shared-volume-budget");Work w;w.games="Hdd1:\\Games";w.content="HDD1:\\Content\\0000000000000000";
+    FoundryManifest m;m.id=std::string(32,'d');
+    for(int i=0;i<3;++i){FoundryComponent c;c.kind=i==0?"god":i==1?"dlc":"title_update";FoundryFile f;f.root=i==2?"cache":"content";f.path=i==2?"TU_test":"415607E1/00007000/file";f.id=std::string(32,'a'+i);f.bytes=1024ULL*1024*1024;c.files.push_back(f);m.components.push_back(c);}
+    diskAvailable=3ULL*1024*1024*1024;std::string error;
+    assert(!CheckRequiredSpace(w,m,&error)&&error.find("Not enough free space")!=std::string::npos);
+    assert(diskQueries==1);diskQueries=0;w.games="Usb0:\\Games";
+    assert(CheckRequiredSpace(w,m,&error)&&diskQueries==2);
+}
 int main()
 {
-    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();
-    std::cout<<"Real client runtime: interrupted transfers, in-piece resume, lost POST/reboot idempotency, cross-server guard and every package-move power cut passed\n";
+    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();
+    std::cout<<"Real client runtime: interrupted transfers, in-piece resume, lost POST/reboot idempotency, cross-server guard, GoD/Cache TU power cuts and shared-volume space checks passed\n";
 }

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import struct
 import time
 import xml.etree.ElementTree as ET
 
@@ -19,6 +20,49 @@ NS = {'m': 'http://schemas.microsoft.com/developer/msbuild/2003'}
 CONFIG = "'$(Configuration)|$(Platform)'=='Release|Xbox 360'"
 SDK, SOURCE, BUILD = Path('/xdk'), Path('/source'), Path('/build')
 HEADER_HASH = ''
+
+
+def inspect_xex(data):
+    """Validate the actual SDK title format before signing or offering a build."""
+    def require(condition, message):
+        if not condition: raise ValueError('Invalid XEX: ' + message)
+    require(len(data) >= 24, 'truncated header')
+    magic, flags, payload, _, security, count = struct.unpack_from('>6I', data)
+    require(magic == 0x58455832 and flags == 1, 'not an Xbox title module')
+    require(0 < count <= 128 and 24 + count * 8 <= payload < len(data), 'optional-header bounds')
+    require(security >= 24 + count * 8 and security + 8 <= payload, 'security-header bounds')
+    headers = dict(struct.unpack_from('>II', data, 24 + i * 8) for i in range(count))
+    require(len(headers) == count, 'duplicate optional header')
+    require({0x2FF, 0x3FF, 0x10100, 0x10201, 0x20200, 0x40006} <= set(headers), 'missing loader fields')
+    base, entry = headers[0x10201], headers[0x10100]
+    image_size = struct.unpack_from('>I', data, security + 4)[0]
+    require(base == 0x82000000 and 0 < image_size <= 64 * 1024 * 1024, 'image mapping')
+    require(base <= entry < base + image_size and entry % 4 == 0, 'entry point outside image')
+    execution = headers[0x40006]
+    require(execution >= 24 and execution + 24 <= payload, 'execution-ID bounds')
+    title_id = struct.unpack_from('>I', data, execution + 12)[0]
+    require(title_id == 0xFFFF0360, 'wrong title ID')
+    resources = headers[0x2FF]
+    require(resources >= 24 and resources + 4 <= payload, 'resource bounds')
+    length = struct.unpack_from('>I', data, resources)[0]
+    require(length >= 4 and (length - 4) % 16 == 0 and resources + length <= payload, 'resource table length')
+    names = []
+    for at in range(resources + 4, resources + length, 16):
+        name, address, size = struct.unpack_from('>8sII', data, at)
+        require(size > 0 and base <= address < base + image_size and size <= base + image_size - address, 'resource outside image')
+        names.append(name.rstrip(b'\0').decode('ascii'))
+    require({'font', 'selawk', 'ofl'} <= set(names), 'missing embedded fonts or license')
+    fmt = headers[0x3FF]
+    require(fmt >= 24 and fmt + 8 <= payload, 'file-format bounds')
+    length, encryption, compression = struct.unpack_from('>IHH', data, fmt)
+    require(length >= 16 and (length - 8) % 8 == 0 and fmt + length <= payload, 'basic block-table length')
+    require(encryption == 1 and compression == 1, 'unexpected SDK packaging mode')
+    blocks = [struct.unpack_from('>II', data, at) for at in range(fmt + 8, fmt + length, 8)]
+    require(sum(n for n, zeros in blocks) == len(data) - payload, 'truncated or surplus payload')
+    require(sum(n + zeros for n, zeros in blocks) == image_size, 'mapped image size differs')
+    return {'title_id': '%08X' % title_id, 'image_base': hex(base), 'entry_point': hex(entry),
+            'image_bytes': image_size, 'stack_bytes': headers[0x20200], 'resources': sorted(names),
+            'encryption': encryption, 'compression': compression}
 
 
 def win(path): return 'Z:' + str(Path(path).resolve()).replace('/', '\\')
@@ -181,6 +225,7 @@ def main():
     if not xex.is_file() or xex.read_bytes()[:4] != b'XEX2': raise SystemExit('No valid XEX2 output')
     report = {'version': version, 'source_base_version': base_version, 'sha256': hashlib.sha256(xex.read_bytes()).hexdigest(), 'bytes': xex.stat().st_size,
               'built_at': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()), 'sdk_cl_sha256': hashlib.sha256((SDK / 'bin/win32/cl.exe').read_bytes()).hexdigest()}
+    report['xex_loader'] = inspect_xex(xex.read_bytes())
     if marker.is_file():
         imported = json.loads(marker.read_text())
         report['sdk_version'] = imported['sdk_version']

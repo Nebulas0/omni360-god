@@ -165,9 +165,16 @@ class ConsoleService:
             if not row["device_id"]:
                 c.commit()
                 return {"status": "pending", "interval": 5}
-            token = "fg_" + secrets.token_urlsafe(32)
+            device = c.execute("SELECT revoked FROM console_devices WHERE id=?", (row["device_id"],)).fetchone()
+            if not device or device["revoked"]:
+                raise ConsoleError("PAIRING_EXPIRED", "Start pairing again", 410)
+            # The high-entropy device code is known only to this console.
+            # Derive the same token on a retry after a lost response, without
+            # persisting either the bootstrap secret or bearer token in clear.
+            token = "fg_" + hmac.new(secret.encode(), ("foundry-console-token-v1:" + row["device_id"]).encode(), hashlib.sha256).hexdigest()
             c.execute("UPDATE console_devices SET token_hash=? WHERE id=?", (digest(token), row["device_id"]))
-            c.execute("DELETE FROM console_pairings WHERE secret_hash=?", (digest(secret),))
+            # Website approval remains single-use. Polling may replay that
+            # approval only until its original expiry, and never after revoke.
             c.commit()
         return {"status": "approved", "access_token": token, "token_type": "Bearer", "device_id": row["device_id"]}
 

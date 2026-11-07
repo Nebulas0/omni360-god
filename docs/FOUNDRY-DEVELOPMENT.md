@@ -1,9 +1,10 @@
 # Omni360 GoD / Foundry integration
 
-This is a source integration under development, based on upstream **0.13.2-beta**, commit
-`830ca4a419f368bb2bb600c28449488cbf0ba5a5`. It is **not yet verified by an
-Xbox XDK build or a physical Xbox test**. Do not label a release stable until
-those checks pass. The ordinary Linux CI job does not produce an XEX.
+This alpha integration is based on upstream **0.13.4-beta**, commit
+`6d9c323`, with the fork's service, updater and signing key preserved. The full
+Xbox XDK Release build passes under Docker/Wine. Physical console acceptance
+is still required before calling a release stable. GitHub checks the source,
+then independently verifies the signed XEX published by ZenServer.
 
 ## Source layout and behavior
 
@@ -72,7 +73,9 @@ If-Range. Byte counts and offsets are decimal strings.
 
 Only capabilities and pairing start/poll are exempt from bearer authentication.
 Browser administration remains behind the existing SSO/Basic auth and CSRF
-header. Pairing is single-use, expires in ten minutes and is rate-limited.
+header. Browser pairing approval is single-use, expires in ten minutes and is rate-limited.
+Token polling can safely retry the same approval until its original expiry;
+it never reactivates a revoked device.
 Only token hashes are stored server-side. Revoke access at `/consoles`.
 
 Install request example (also set `Idempotency-Key: <unique 16-96 characters>`):
@@ -120,7 +123,9 @@ and fault-injected transport. It exercises mid-file/in-piece resume, cancelled
 transfers, corrupted prefixes, lost POST responses across restart, server
 binding, and power loss after each package move. Its Win32 adapter is only for
 testing; it is not an SDK replacement or proof of hardware compatibility.
-This does not replace a full XDK compile or on-console install/power-loss tests.
+Cache title-update replacement and first-install power cuts, and shared-drive
+space budgeting, are also exercised. This does not replace physical-console
+install/power-loss tests.
 
 ## Producing an XEX
 

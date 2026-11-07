@@ -63,6 +63,41 @@ def seed_game(service):
     return f"catalog-{item['id']}", header
 
 
+def test_approved_pairing_can_retry_a_lost_token_response(setup):
+    app, client, service = setup
+    start = client.post(PREFIX + "/pairings", json={"name": "Retry Xbox"}).json
+    assert client.post("/api/consoles/pair", json={"code": start["user_code"]}, headers=CSRF).status_code == 200
+    first = client.post(PREFIX + "/pairings/token", json={"device_code": start["device_code"]})
+    assert first.status_code == 200
+    # Its response is lost on the wire. Retry after the advertised poll interval.
+    with service.connect() as c:
+        c.execute("UPDATE console_pairings SET last_poll=0")
+    retry = client.post(PREFIX + "/pairings/token", json={"device_code": start["device_code"]})
+    assert retry.status_code == 200 and retry.json == first.json
+    assert client.get(PREFIX + "/catalog", headers={"Authorization": "Bearer " + first.json["access_token"]}).status_code == 200
+    assert client.post("/api/consoles/pair", json={"code": start["user_code"]}, headers=CSRF).status_code == 409
+    with service.connect() as c:
+        devices = c.execute("SELECT * FROM console_devices").fetchall()
+        assert len(devices) == 1 and devices[0]["token_hash"] == digest(first.json["access_token"])
+        assert first.json["access_token"] not in json.dumps(dict(devices[0]))
+        assert c.execute("SELECT secret_hash FROM console_pairings").fetchone()[0] == digest(start["device_code"])
+
+
+def test_pairing_retry_cannot_reactivate_revoked_or_expired_device(setup):
+    app, client, service = setup
+    start = client.post(PREFIX + "/pairings", json={"name": "Revoked Xbox"}).json
+    assert client.post("/api/consoles/pair", json={"code": start["user_code"]}, headers=CSRF).status_code == 200
+    token = client.post(PREFIX + "/pairings/token", json={"device_code": start["device_code"]}).json
+    assert client.post("/api/consoles/" + token["device_id"] + "/revoke", json={}, headers=CSRF).status_code == 200
+    with service.connect() as c:
+        c.execute("UPDATE console_pairings SET last_poll=0")
+    assert client.post(PREFIX + "/pairings/token", json={"device_code": start["device_code"]}).status_code == 410
+    assert client.get(PREFIX + "/catalog", headers={"Authorization": "Bearer " + token["access_token"]}).status_code == 401
+    with service.connect() as c:
+        c.execute("UPDATE console_pairings SET expires=0")
+    assert client.post(PREFIX + "/pairings/token", json={"device_code": start["device_code"]}).status_code == 410
+
+
 def prepare(client, s, headers, release, **extra):
     result = client.post(PREFIX + "/install-requests", json={"release_id": release, **extra},
                          headers={**headers, "Idempotency-Key": "test-request-key-12345"})

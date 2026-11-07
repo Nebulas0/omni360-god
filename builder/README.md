@@ -20,7 +20,7 @@ and publishes a new GitHub prerelease. PRs and other branches never execute on
 the server. A newer main commit supersedes an older one waiting for checks.
 
 Each build gets a distinct version, such as
-`1.0.0-alpha.4.build.185`: the source base version plus the main commit count.
+`1.0.0-alpha.5.build.190`: the source base version plus the main commit count.
 The generated version is compiled through a forced header and recorded with
 the exact source SHA and compiler/container identities in `build.json`.
 This ordering is tested against the actual Xbox updater's comparison code.
@@ -31,7 +31,9 @@ Automatic publication accepts only `alpha.N` and `beta.N` source base versions.
 
 The **Signed XEX release (ZenServer Wine)** GitHub workflow waits for the private
 server build, downloads its public assets, checks the checksum and signature
-against `src/UpdateKey.h`, and exposes them as Actions artifacts too. It uses
+against `src/UpdateKey.h`, and exposes them as Actions artifacts too. Both native packaging and download
+verification check loader fields, image/payload bounds, entry point, title ID
+and embedded font/license resources; damaged containers are rejected. It uses
 only GitHub's automatic read token, not a secret SDK or signing key on GitHub.
 
 Download `Omni360.xex` from this fork's releases and copy it into a dedicated

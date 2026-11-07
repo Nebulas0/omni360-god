@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import struct
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -22,6 +23,28 @@ build, publish, extract = load('build'), load('publish'), load('extract_sdk')
 
 
 class BuilderTests(unittest.TestCase):
+    def test_loader_checks_reject_truncation_bad_entry_and_missing_fonts(self):
+        # Synthetic header exercises bounds; real builds are independently
+        # inspected by the SDK and by both release pipeline stages.
+        data = bytearray(0x210)
+        struct.pack_into('>6I', data, 0, 0x58455832, 1, 0x200, 0, 0x80, 6)
+        headers = [(0x2FF, 0x130), (0x3FF, 0x180), (0x10100, 0x82000100), (0x10201, 0x82000000), (0x20200, 0x40000), (0x40006, 0x110)]
+        for i, entry in enumerate(headers): struct.pack_into('>II', data, 24 + i * 8, *entry)
+        struct.pack_into('>I', data, 0x84, 0x10000)
+        struct.pack_into('>I', data, 0x11C, 0xFFFF0360)
+        struct.pack_into('>I', data, 0x130, 52)
+        for i, name in enumerate((b'font', b'selawk', b'ofl')):
+            struct.pack_into('>8sII', data, 0x134 + i * 16, name, 0x82002000 + i * 16, 16)
+        struct.pack_into('>IHHII', data, 0x180, 16, 1, 1, 16, 0xFFF0)
+        self.assertEqual(build.inspect_xex(data)['title_id'], 'FFFF0360')
+        for kind in ('truncated', 'entry', 'font', 'resource'):
+            bad = bytearray(data)
+            if kind == 'truncated': bad = bad[:-1]
+            elif kind == 'entry': struct.pack_into('>I', bad, 44, 0x90000000)
+            elif kind == 'font': bad[0x134:0x13C] = b'missing\0'
+            else: struct.pack_into('>I', bad, 0x13C, 0x90000000)
+            with self.subTest(kind=kind), self.assertRaises(ValueError): build.inspect_xex(bad)
+
     def test_actual_release_project_and_file_options(self):
         files, link = build.project(ROOT / 'XboxTLS2.vcxproj')
         atg, _ = build.project(ROOT / 'Common/AtgFramework2010.vcxproj')

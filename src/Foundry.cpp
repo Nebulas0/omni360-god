@@ -383,6 +383,14 @@ static bool SaveJournal(const Work &w,const std::string &aid,const std::vector<M
 }
 static bool RootValid(const std::string &s)
 {return s.size()>5&&s.size()<170&&s.find(":\\")!=std::string::npos&&s.find("..") == std::string::npos&&s[s.size()-1]!='\\';}
+static bool JournalPath(const std::string &path,const std::string &root,const std::string &aid)
+{
+    if(!FoundrySafePath(path))return false;
+    const std::string staging="_Foundry/"+aid+"/";
+    if(path.compare(0,staging.size(),staging)==0)return true;
+    if(root=="cache")return path.compare(0,3,"TU_")==0&&path.find('/')==std::string::npos;
+    return path.size()>9&&path[8]=='/'&&FoundryHex(path.substr(0,8),8);
+}
 static bool Recover(std::string *error)
 {
     ContentWriteLock lock;if(!lock.Ok()){*error="Could not lock content storage";return false;}
@@ -392,10 +400,8 @@ static bool Recover(std::string *error)
     bool committed=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o,"committed"));
     for(int i=cJSON_GetArraySize(a)-1;ok&&!committed&&i>=0;--i)
     {
-        const cJSON *m=cJSON_GetArrayItem(a,i);std::string root=Root(w,Text(m,"root")),from=Text(m,"from"),to=Text(m,"to");
-        ok=!root.empty()&&FoundrySafePath(from)&&FoundrySafePath(to)
-            && (from.compare(0,9,"_Foundry/")==0||FoundryHex(from.substr(0,8),8))
-            && (to.compare(0,9,"_Foundry/")==0||FoundryHex(to.substr(0,8),8));
+        const cJSON *m=cJSON_GetArrayItem(a,i);std::string kind=Text(m,"root"),root=Root(w,kind),from=Text(m,"from"),to=Text(m,"to");
+        ok=!root.empty()&&JournalPath(from,kind,aid)&&JournalPath(to,kind,aid);
         if(!ok)break;
         from=root+"\\"+Native(from);to=root+"\\"+Native(to);
         if(!Exists(from)&&Exists(to)){ok=Parents(from)&&MoveFileA(to.c_str(),from.c_str());}
@@ -465,7 +471,13 @@ static bool Commit(const Work &w,const FoundryManifest &m,std::string *error)
     if(!SaveJournal(w,m.id,moves,true)){*error="Could not finish the installation journal";return false;}
     return Recover(error);
 }
-static bool Prepared(const Work &w,const FoundryManifest &m,std::string *error)
+static std::string Volume(std::string root)
+{
+    root=root.substr(0,root.find('\\'));
+    for(size_t i=0;i<root.size();++i)if(root[i]>='A'&&root[i]<='Z')root[i]+='a'-'A';
+    return root;
+}
+static bool CheckRequiredSpace(const Work &w,const FoundryManifest &m,std::string *error)
 {
     std::map<std::string,unsigned long long> required;
     for(size_t i=0;i<m.components.size();++i)
@@ -477,11 +489,16 @@ static bool Prepared(const Work &w,const FoundryManifest &m,std::string *error)
             const FoundryFile &f=c.files[j];unsigned long long staged=Length(Stage(root,m.id)+"\\files\\"+Native(f.path));
             unsigned long long partial=Length(Stage(root,m.id)+"\\parts\\"+f.id+".part");
             unsigned long long available=staged==f.bytes?staged:partial<=f.bytes?partial:0;
-            required[root]+=f.bytes-available;
+            required[Volume(root)]+=f.bytes-available;
         }
     }
     for(std::map<std::string,unsigned long long>::const_iterator it=required.begin();it!=required.end();++it)
         if(!FreeSpace(it->first,it->second)){*error="Not enough free space on the selected destination for staging and recovery";return false;}
+    return true;
+}
+static bool Prepared(const Work &w,const FoundryManifest &m,std::string *error)
+{
+    if(!CheckRequiredSpace(w,m,error))return false;
     for(size_t i=0;i<m.components.size();++i)
     {
         const FoundryComponent &c=m.components[i];std::string root=Root(w,c.kind=="god"?"games":c.files[0].root=="cache"?"cache":"content");
