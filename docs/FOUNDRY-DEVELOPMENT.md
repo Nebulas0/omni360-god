@@ -124,27 +124,22 @@ This does not replace a full XDK compile or on-console install/power-loss tests.
 
 ## Producing an XEX
 
-Use the prerequisites in `COMPILING.md`: Windows, VS2010, official Xbox 360
-XDK. Set `XEDK` and `OMNI360_SIGNING_KEY_FILE`, then run
-`tools/build_foundry.ps1`. The key must match the fork's `src/UpdateKey.h`.
-The updater now reads **Nebulas0/omni360-god**, preserves signature verification,
-and does not trust the upstream release key.
+The persistent Linux Docker/Wine builder on ZenServer now compiles the actual
+Xbox Release projects with the full XDK, bundles fonts and packages the XEX.
+See [builder instructions](../builder/README.md) for the installed layout,
+private prerequisites and automatic signed GitHub releases. No Windows VM is
+used. The SDK/key stay off GitHub; its workflow independently verifies the
+published signed pair. The first full native build passed on 2026-11-07.
 
-The optional workflow **Signed Xbox XDK build** runs only when manually started,
-on a private Windows runner with labels `self-hosted, windows, xdk`. It never
-executes pull requests. A hosted Ubuntu workflow cannot supply the XDK. No
-proprietary compiler, SDK library, or private signing key is distributed here.
-
-Saltbox can host a disposable builder without any public website. KVM is
-available on the current server, so a Windows VM managed by Docker is an option.
-That still requires a Windows/toolchain setup and the Xbox XDK; an ordinary
-Linux container does not make these tools available. No native builder was
-installed without those prerequisites, and no placeholder/upstream XEX should
-be presented as a compiled Foundry binary.
+The original Windows VS2010 route remains available through
+`tools/build_foundry.ps1` with `XEDK` and `OMNI360_SIGNING_KEY_FILE` set. It is
+an alternative, not a requirement for the Wine build. Both paths retain the
+fork's updater repository and public key. Never substitute an upstream binary
+for the modified Foundry application.
 
 ## Release acceptance still required
 
-- Full Release XDK build, actual SDK/API compatibility, and signed self-update.
+- Full Release XDK compilation now passes; physical launch and signed self-update still need console testing.
 - Physical console pairing/TLS, both conversion modes, launch after reboot.
 - DLC visible in-game and matched TU launch/activation through Aurora.
 - Disk-full, cancellation, disconnected storage and power loss through commit.

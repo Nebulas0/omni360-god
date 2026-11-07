@@ -33,6 +33,11 @@ server/games-GoD/
 server/downloaded-worked-on/
 builder/storage/
 builder/share/
+builder/sdk/
+builder/build/
+builder/releases/
+builder/automation/
+builder/sdk-downloads/
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm

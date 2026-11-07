@@ -14,6 +14,12 @@
 #include "inc\\bearssl.h"
 #include "../zlib/zlib.h"
 #include <xtl.h>
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,7 +67,7 @@ static std::string Decimal(unsigned long long n)
 {
     char s[32]; _snprintf(s,sizeof(s),"%I64u",n); s[sizeof(s)-1]=0; return s;
 }
-static bool Exists(const std::string &p) { return GetFileAttributesA(p.c_str())!=INVALID_FILE_ATTRIBUTES; }
+static bool Exists(const std::string &p) { return GetFileAttributesA(p.c_str())!=(DWORD)-1; }
 static std::string Native(std::string p) { std::replace(p.begin(),p.end(),'/','\\'); return p; }
 static bool Dirs(const std::string &p)
 {

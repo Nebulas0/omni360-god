@@ -16,7 +16,7 @@
 // (tools/sign_release.py). A GitHub account taken over couldn't push a build
 // to anyone through this.
 
-#define UPDATE_RELEASES_PAGE "github.com/JustGillin/omni360/releases"
+#define UPDATE_RELEASES_PAGE "github.com/Nebulas0/omni360-god/releases"
 
 enum UpdateState
 {

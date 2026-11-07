@@ -1,0 +1,10 @@
+[Unit]
+Description=Check for passing Omni360 source changes every two minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=2min
+Unit=omni360-release.service
+
+[Install]
+WantedBy=timers.target

@@ -6,10 +6,11 @@ packages or download an ISO archive for on-console conversion.
 
 Based on upstream **Omni360 0.13.2-beta** (`830ca4a`), with the Foundry service
 integration and the fork's own signed updater preserved. Fork version:
-**1.0.0-alpha.3**.
+**1.0.0-alpha.4**.
 
-**Alpha source: the full Xbox XDK build and real-console acceptance tests are
-still required. No compiled Foundry XEX is available yet.**
+**Alpha builds:** ZenServer builds checked main commits with the real Xbox XDK
+under Wine. Signed test builds appear in this fork's [releases](https://github.com/Nebulas0/omni360-god/releases).
+Physical-console acceptance is still required.
 
 - Press **X: Foundry** from the original Store front page.
 - Pair on your Foundry website at `/consoles`.
@@ -18,7 +19,7 @@ still required. No compiled Foundry XEX is available yet.**
 - [Development, API, build instructions and remaining checks](docs/FOUNDRY-DEVELOPMENT.md)
 - [Complete implementation plan](docs/FOUNDRY-INTEGRATION-PLAN.txt)
 - Matching Flask server source is in `server/`.
-- [Optional disposable Docker/Windows builder](builder/README.md) (requires the XDK).
+- [Persistent Linux Docker/Wine builder and automatic signed releases](builder/README.md).
 
 The fork has its own updater URL and public signing key. Private keys, tokens,
 SDK files, game data and live server configuration are never part of the repo.

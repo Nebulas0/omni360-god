@@ -1,5 +1,9 @@
 # Compiling
 
+For this Foundry fork, [Linux Docker/Wine builds and automatic signed releases](builder/README.md)
+are configured on ZenServer. The full native build passes without a Windows VM.
+The original Windows/VS2010 instructions below remain an alternative.
+
 Sadly, there is extremely little information around creating native Xbox 360 programs. If you are interested in creating or modifying Xbox 360 programs, I would recommend taking a look at [ClementDreptin's ModdingResources](https://github.com/ClementDreptin/ModdingResources/). While it is mainly focussed on developing dashlaunch plugings for modding games, much of the information applies to creating homebrew as well.
 
 ## Requirements

@@ -1,0 +1,22 @@
+[Unit]
+Description=Build and publish checked Omni360 main with the private Wine toolchain
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+User=plexuser
+Group=plexuser
+SupplementaryGroups=docker
+UMask=0077
+WorkingDirectory=/opt/xbox360
+Environment=HOME=/opt/xbox360/xex-builder/automation/home
+Environment=GIT_CONFIG_GLOBAL=/dev/null
+Environment=GIT_CONFIG_NOSYSTEM=1
+ExecStart=/usr/bin/python3 /opt/xbox360/builder/publish.py --config /opt/xbox360/xex-builder/automation/config.json
+TimeoutStartSec=100min
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+

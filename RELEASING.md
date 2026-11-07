@@ -1,5 +1,11 @@
 # Releasing
 
+This fork automatically builds passing main commits on ZenServer under Wine
+and publishes signed prereleases with unique `.build.N` versions. See
+[the builder documentation](builder/README.md). The key matches the fork's
+`UpdateKey.h`; the upstream signing key is not used. The original manual
+release process below remains useful for deliberate stable releases.
+
 How to publish a new version of Omni360 so that people's consoles can update to it from **Settings → Updates**.
 
 The app checks GitHub's releases for this repository, and will only install a release whose XEX carries a valid signature from the project's key. So every release is the XEX **and** its signature, `Omni360.xex.sig`, made by `tools/sign_release.py`.

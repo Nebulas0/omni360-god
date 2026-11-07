@@ -1,29 +1,41 @@
-# Optional Windows VM managed by Docker. It does not include the Xbox XDK.
-# Supply a private .env and SDK/VS installers before starting it.
+# Linux/Wine only; no Windows VM, privileged mode, ports or Docker socket.
 services:
-  windows:
-    image: ${OMNI360_BUILDER_IMAGE:-dockurr/windows:latest}
-    container_name: omni360-xdk-builder
-    profiles: [builder]
+  xbox360-xex-builder:
+    container_name: xbox360-xex-builder
+    image: local/omni360-wine-builder:1
+    build:
+      context: .
+      dockerfile: Dockerfile.wine
+    init: true
+    restart: unless-stopped
+    network_mode: none
+    user: '1000:1000'
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 512
+    mem_limit: 8g
+    cpus: 4
+    tmpfs:
+      - /tmp:mode=1777,size=512m
     environment:
-      VERSION: '11'
-      RAM_SIZE: '4G'
-      CPU_CORES: '4'
-      DISK_SIZE: '64G'
-      USERNAME: builder
-      PASSWORD: ${BUILDER_PASSWORD:?Set a private temporary Windows password}
-    devices:
-      - /dev/kvm
-      - /dev/net/tun
-    cap_add: [NET_ADMIN]
-    ports:
-      - '127.0.0.1:8006:8006'
-      - '127.0.0.1:3389:3389/tcp'
-      - '127.0.0.1:3389:3389/udp'
+      HOME: /build/home
+      WINEPREFIX: /build/wine
+      WINEARCH: win32
+      WINEDEBUG: '-all'
+      XEDK: 'Z:\xdk'
+      OMNI360_BUILD_JOBS: '4'
     volumes:
-      - ${OMNI360_BUILD_ROOT:-/opt/omni360-builder}/storage:/storage
-      - ${OMNI360_BUILD_ROOT:-/opt/omni360-builder}/share:/shared
+      - ${OMNI360_XDK_DIR:-/opt/xbox360/xex-builder/sdk}:/xdk:ro
+      - ${OMNI360_SOURCE_DIR:-/opt/xbox360/xex-builder/source}:/source:ro
+      - ${OMNI360_BUILD_DIR:-/opt/xbox360/xex-builder/build}:/build
     labels:
       traefik.enable: 'false'
-    restart: 'no'
-    stop_grace_period: 2m
+      diun.enable: 'false'
+    healthcheck:
+      test: [CMD, python3, /opt/builder/build.py, --check-sdk]
+      interval: 60s
+      timeout: 10s
+      start_period: 20s
+      retries: 2
+    command: [sleep, infinity]

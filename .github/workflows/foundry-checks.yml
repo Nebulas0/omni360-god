@@ -25,5 +25,7 @@ jobs:
         run: python -m pytest -q server/app/tests
       - name: Compile portable client protocol with C++03
         run: python tools/test_foundry/run.py
+      - name: Build translation and release safety tests
+        run: python -m unittest discover -s builder -p "test_*.py" -v
       - name: Validate Visual Studio project files
         run: python -c "import xml.etree.ElementTree as E; E.parse('XboxTLS2.vcxproj'); E.parse('XboxTLS2.vcxproj.filters')"
