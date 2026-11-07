@@ -139,6 +139,7 @@ bool OpenFoundryStoreUI(const char *games,const char *content)
 
 bool OpenFoundryDlcUI(const char *games,const char *content,const char *name,unsigned long titleId)
 {
+    if(!titleId){ShowMessageUI("DLC identity","This catalog game has no Title ID.","Open the installed game's Library page for a checked DLC installation.");return false;}
     char id[9]="";if(titleId)_snprintf(id,sizeof(id),"%08lX",titleId);id[sizeof(id)-1]=0;
     return Browse(games,content,"dlc",'*',"",id,name?name:"");
 }
