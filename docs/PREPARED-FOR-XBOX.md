@@ -8,6 +8,12 @@ pairing and `settings.txt` install paths still apply; no new API key is needed.
 2. Search for a game or add-on and choose its full source/edition name. Matching
    multi-disc editions show a checklist with supported discs selected by default.
    Add the selection, then search/add more games (up to 32 requests).
+   In **XBLA / DLC**, tick multiple sources or **Select this page**, then press
+   **Add selected add-ons**. Checks stay selected across result pages and searches.
+   Each add-on gets its own checked server request; the game/disc selection stays
+   in the list. Duplicate selections are skipped, and the 32-item cart limit is
+   checked before adding the batch. Add-ons always use server processing and
+   capture the unlock choice when added.
 3. Choose **Convert on server** for checked GoD/package files, or **Convert on
    Xbox** for supported single-disc ISO archives. Disc sets, install/content discs
    and digital packages use server processing. Unsupported custom merges remain
@@ -22,6 +28,13 @@ pairing and `settings.txt` install paths still apply; no new API key is needed.
    cache/hints. Preparing and failed/expired items cannot be downloaded as ready.
    The grid refreshes every 15 seconds, or immediately with X. LB/RB opens the
    existing server/pairing menu. Older connection-menu entries remain available.
+
+The website saves unsent preparation lists and checked add-ons in that browser
+tab's session storage. Reloading the updated page restores the draft, destination,
+license choice and request keys; sent entries leave the saved draft. A tab running
+an older version without draft saving cannot recover its unsent choices after
+reload: keep it open and open the updated page in another tab. If session storage
+is disabled/full, the form still works but the draft lasts only until reload.
 
 The Xbox saves its selected list in `game:\FoundryInbox.json`, separately from
 the active `FoundryJob.json` and move journal `FoundryTxn.json`. Selected items
