@@ -5,6 +5,7 @@
 #include "GameListUI.h"
 #include "Keyboard.h"
 #include "downloadFile.h"
+#include "XboxTLS.h"
 #include "GodConvert.h"
 #include "InflateSource.h"
 #include "ReadAhead.h"
@@ -68,6 +69,13 @@ static unsigned g_storeCacheGeneration=0;
 static HANDLE g_storePrefetch=NULL;
 static std::string g_storePrefetchKey;
 static volatile LONG g_storePrefetchCancel=0;
+// Each lane has exactly one owner. Never share a live TLS context between the
+// foreground UI request and the background preload, or with the installer.
+static HttpsSession *g_storeSession=NULL,*g_storePrefetchSession=NULL;
+static std::string g_storeSessionOwner,g_storePrefetchOwner;
+static std::string g_storePrefetchAttemptKey;
+static DWORD g_storePrefetchAttemptTime=0;
+static const DWORD STORE_CACHE_TTL=5*60*1000;
 
 static std::string Text(const cJSON *o,const char *k)
 {
@@ -190,7 +198,7 @@ static bool RetryPause(unsigned attempt,bool ui=false)
     return true;
 }
 
-static bool Call(const std::string &path,const std::string &body,bool auth,cJSON **reply,std::string *error,bool ui=false,const std::string &key="",int *lastStatus=NULL,unsigned attempts=6,const Device *boundDevice=NULL,DownloadProgressFn progress=NULL)
+static bool Call(const std::string &path,const std::string &body,bool auth,cJSON **reply,std::string *error,bool ui=false,const std::string &key="",int *lastStatus=NULL,unsigned attempts=6,const Device *boundDevice=NULL,DownloadProgressFn progress=NULL,HttpsSession **session=NULL,std::string *sessionOwner=NULL)
 {
     Device d=boundDevice?*boundDevice:DeviceCopy();
     if(!FoundryOrigin(d.origin)||path.compare(0,strlen(API),API)!=0||path.find_first_of("\r\n")!=std::string::npos)
@@ -198,12 +206,23 @@ static bool Call(const std::string &path,const std::string &body,bool auth,cJSON
     std::string headers=auth?"Authorization: Bearer "+d.token+"\r\n":"";
     if(!key.empty()) headers+="Idempotency-Key: "+key+"\r\n";
     HttpResponsePolicy policy;policy.json=true;
+    // Only read-only Store metadata uses keep-alive. Durable POSTs, manifests,
+    // ranges and download recovery keep their existing transport and checks.
+    if(session && (!sessionOwner || !body.empty() || path.compare(0,strlen(API)+7,std::string(API)+"/store/")!=0))session=NULL;
+    if(session)
+    {
+        std::string owner=d.origin+"\n"+d.id+"\n"+d.token;
+        if(*sessionOwner!=owner){HttpsSessionClose(*session);*session=NULL;*sessionOwner=owner;}
+        if(!*session)*session=HttpsSessionOpen(dprintf);
+    }
     std::vector<char> buffer(1024*1024+1);unsigned long long len=0;int status=0;
     for(unsigned attempt=0;attempt<attempts;++attempt)
     {
         std::fill(buffer.begin(),buffer.end(),0);len=buffer.size()-1;
-        status=httpRequestHTTPS(d.origin+path,body.empty()?HTTP_GET:HTTP_POST,body.empty()?NULL:body.c_str(),headers.c_str(),"",
-            &buffer[0],&len,false,NULL,0,dprintf,0,progress?progress:ui?UiProgress:NULL,false,&policy);
+        DownloadProgressFn callback=progress?progress:ui?UiProgress:NULL;
+        status=session&&*session?HttpsSessionGet(*session,d.origin+path,headers.c_str(),&buffer[0],&len,true,callback):
+            httpRequestHTTPS(d.origin+path,body.empty()?HTTP_GET:HTTP_POST,body.empty()?NULL:body.c_str(),headers.c_str(),"",
+                &buffer[0],&len,false,NULL,0,dprintf,0,callback,false,&policy);
         if(!FoundryRetryableStatus(status)||attempt+1==attempts||!RetryPause(attempt,ui))break;
     }
     if(lastStatus)*lastStatus=status;
@@ -223,20 +242,27 @@ struct UiTask
     UiTask():auth(true),ok(false),reply(NULL){}
 };
 static DWORD WINAPI UiTaskEntry(LPVOID p)
-{ UiTask *t=(UiTask*)p;t->ok=Call(t->path,t->body,t->auth,&t->reply,&t->error,true);return 0; }
+{
+    UiTask *t=(UiTask*)p;bool catalog=t->body.empty()&&t->path.compare(0,strlen(API)+7,std::string(API)+"/store/")==0;
+    if(catalog)XboxTLS_SetThreadIoTimeout(15000);
+    t->ok=Call(t->path,t->body,t->auth,&t->reply,&t->error,true,"",NULL,catalog?2:6,NULL,NULL,
+        catalog?&g_storeSession:NULL,catalog?&g_storeSessionOwner:NULL);return 0;
+}
 static bool UiCall(const std::string &path,const std::string &body,bool auth,cJSON **reply)
 {
     UiTask task;task.path=path;task.body=body;task.auth=auth;InterlockedExchange(&g_uiCancel,0);
     HANDLE thread=CreateThread(NULL,256*1024,UiTaskEntry,&task,0,NULL);
     if(!thread) { ShowMessageUI("Foundry","Could not start the network request",NULL);return false; }
+    DWORD started=GetTickCount();bool catalog=body.empty()&&path.compare(0,strlen(API)+7,std::string(API)+"/store/")==0;
     while(WaitForSingleObject(thread,0)!=WAIT_OBJECT_0)
     {
-        RenderProgressFrame("Foundry","Contacting your server","B cancels this request",-1,"Connecting");
+        if(GetTickCount()-started>=150)
+            RenderProgressFrame("Foundry",catalog?"Loading catalog page":"Contacting your server","B cancels this request",-1,catalog?"Loading":"Connecting");
         if(PollUiInput().pressed&XINPUT_GAMEPAD_B) InterlockedExchange(&g_uiCancel,1);
         Sleep(16);
     }
     CloseHandle(thread);ResyncUiInput();
-    if(!task.ok) { ShowMessageUI("Foundry",task.error.c_str(),NULL);return false; }
+    if(!task.ok) { if(!InterlockedCompareExchange(&g_uiCancel,0,0))ShowMessageUI("Foundry",task.error.c_str(),NULL);return false; }
     *reply=task.reply;return true;
 }
 
@@ -251,7 +277,7 @@ static bool StoreCacheRead(const std::string &key,cJSON **reply)
     for(size_t i=0;i<g_storeCache.size();)
     {
         StoreCacheEntry &e=g_storeCache[i];
-        if(now-e.fetched>=60000){g_storeCacheBytes-=e.json.size();g_storeCache.erase(g_storeCache.begin()+i);continue;}
+        if(now-e.fetched>=STORE_CACHE_TTL){g_storeCacheBytes-=e.json.size();g_storeCache.erase(g_storeCache.begin()+i);continue;}
         if(e.key==key){e.used=now;if(reply)raw=e.json;found=true;}
         ++i;
     }
@@ -272,14 +298,15 @@ static void StoreCacheSave(const std::string &key,const cJSON *reply,unsigned ge
     StoreCacheEntry e;e.key=key;e.json=raw;e.fetched=e.used=now;g_storeCache.push_back(e);g_storeCacheBytes+=raw.size();LeaveCriticalSection(&g_lock);
 }
 void ClearFoundryStoreCache()
-{EnterCriticalSection(&g_lock);++g_storeCacheGeneration;g_storeCache.clear();g_storeCacheBytes=0;LeaveCriticalSection(&g_lock);InterlockedExchange(&g_storePrefetchCancel,1);}
+{EnterCriticalSection(&g_lock);++g_storeCacheGeneration;g_storeCache.clear();g_storeCacheBytes=0;LeaveCriticalSection(&g_lock);g_storePrefetchAttemptKey.clear();InterlockedExchange(&g_storePrefetchCancel,1);}
 struct StorePrefetchTask { Device device;std::string path,key;unsigned generation; };
 static bool StorePrefetchProgress(unsigned long long,unsigned long long,unsigned long long,unsigned long long)
 {return !InterlockedCompareExchange(&g_storePrefetchCancel,0,0)&&!InterlockedCompareExchange(&g_stop,0,0);}
 static DWORD WINAPI StorePrefetchEntry(LPVOID value)
 {
     StorePrefetchTask *task=(StorePrefetchTask*)value;cJSON *reply=NULL;std::string error;
-    if(StorePrefetchProgress(0,0,0,0)&&Call(std::string(API)+task->path,"",true,&reply,&error,false,"",NULL,1,&task->device,StorePrefetchProgress))
+    XboxTLS_SetThreadIoTimeout(15000);
+    if(StorePrefetchProgress(0,0,0,0)&&Call(std::string(API)+task->path,"",true,&reply,&error,false,"",NULL,1,&task->device,StorePrefetchProgress,&g_storePrefetchSession,&g_storePrefetchOwner))
         StoreCacheSave(task->key,reply,task->generation);
     cJSON_Delete(reply);delete task;return 0;
 }
@@ -290,6 +317,8 @@ void PrefetchFoundryStore(const std::string &path)
     Device d=DeviceCopy();if(d.token.empty())return;std::string key=StoreCacheKey(d,path);
     if(g_storePrefetch){if(WaitForSingleObject(g_storePrefetch,0)!=WAIT_OBJECT_0)return;CloseHandle(g_storePrefetch);g_storePrefetch=NULL;}
     if(StoreCacheRead(key,NULL))return;
+    DWORD now=GetTickCount();if(key==g_storePrefetchAttemptKey&&now-g_storePrefetchAttemptTime<5000)return;
+    g_storePrefetchAttemptKey=key;g_storePrefetchAttemptTime=now;
     StorePrefetchTask *task=new StorePrefetchTask;task->device=d;task->path=path;task->key=key;
     EnterCriticalSection(&g_lock);task->generation=g_storeCacheGeneration;LeaveCriticalSection(&g_lock);
     g_storePrefetchKey=key;InterlockedExchange(&g_storePrefetchCancel,0);
@@ -832,7 +861,8 @@ void StopFoundry(DWORD timeoutMs)
     bool stopped=WaitForSingleObject(g_thread,timeoutMs)==WAIT_OBJECT_0;
     DWORD elapsed=GetTickCount()-started;DWORD left=elapsed<timeoutMs?timeoutMs-elapsed:0;
     bool prefetched=!g_storePrefetch||WaitForSingleObject(g_storePrefetch,left)==WAIT_OBJECT_0;
-    if(stopped&&prefetched){if(g_storePrefetch){CloseHandle(g_storePrefetch);g_storePrefetch=NULL;}CloseHandle(g_thread);CloseHandle(g_wake);ClearFoundryStoreCache();g_started=false;}
+    if(stopped&&prefetched){if(g_storePrefetch){CloseHandle(g_storePrefetch);g_storePrefetch=NULL;}CloseHandle(g_thread);CloseHandle(g_wake);ClearFoundryStoreCache();
+        HttpsSessionClose(g_storeSession);g_storeSession=NULL;HttpsSessionClose(g_storePrefetchSession);g_storePrefetchSession=NULL;g_storeSessionOwner.clear();g_storePrefetchOwner.clear();g_started=false;}
 }
 int SnapshotFoundryJobs(QueueJobSnapshot *out,int maximum)
 {if(!g_started||maximum<1)return 0;EnterCriticalSection(&g_lock);int n=g_used?1:0;if(n)*out=g_snap;LeaveCriticalSection(&g_lock);return n;}
@@ -1015,16 +1045,23 @@ bool FoundryStoreRequest(const std::string &path,cJSON **reply)
     if(DeviceCopy().token.empty())PairUI();
     if(DeviceCopy().token.empty())return false;
     Device d=DeviceCopy();bool catalog=path.compare(0,7,"/store/")==0;std::string key=StoreCacheKey(d,path);
-    if(catalog&&StoreCacheRead(key,reply))return true;
+    if(catalog&&StoreCacheRead(key,reply)){dprintf("[foundry] Store page: cache hit\n");return true;}
+    DWORD started=GetTickCount();
     if(catalog&&g_storePrefetch&&g_storePrefetchKey==key)
     {
+        // A cold or stalled speculative connection must not hold up a click on
+        // the warm foreground connection. Give it a short head start, then
+        // cancel it and use the independent UI lane. Reap its handle only once
+        // the worker has actually exited.
         while(WaitForSingleObject(g_storePrefetch,0)!=WAIT_OBJECT_0)
-        {RenderProgressFrame("Foundry","Loading page","B cancels",-1,"Loading");
+        {if(GetTickCount()-started>=150){InterlockedExchange(&g_storePrefetchCancel,1);break;}
             if(PollUiInput().pressed&XINPUT_GAMEPAD_B){InterlockedExchange(&g_storePrefetchCancel,1);ResyncUiInput();return false;}Sleep(16);}
-        CloseHandle(g_storePrefetch);g_storePrefetch=NULL;ResyncUiInput();if(StoreCacheRead(key,reply))return true;
+        if(WaitForSingleObject(g_storePrefetch,0)==WAIT_OBJECT_0){CloseHandle(g_storePrefetch);g_storePrefetch=NULL;}
+        ResyncUiInput();if(StoreCacheRead(key,reply)){dprintf("[foundry] Store page: preload ready in %lu ms\n",GetTickCount()-started);return true;}
     }
     unsigned generation;EnterCriticalSection(&g_lock);generation=g_storeCacheGeneration;LeaveCriticalSection(&g_lock);
-    bool ok=UiCall(std::string(API)+path,"",true,reply);if(ok&&catalog)StoreCacheSave(key,*reply,generation);return ok;
+    bool ok=UiCall(std::string(API)+path,"",true,reply);if(ok&&catalog)StoreCacheSave(key,*reply,generation);
+    if(catalog)dprintf("[foundry] Store page: network %s in %lu ms\n",ok?"ready":"failed",GetTickCount()-started);return ok;
 }
 void FoundryInstallFromStore(const std::string &release,const std::string &name,const char *games,const char *content,bool digital,const std::string &forTitle)
 {QueueRelease(release,name,games,content,digital,forTitle);}

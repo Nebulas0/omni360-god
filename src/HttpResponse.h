@@ -32,6 +32,7 @@ struct HttpResponseResult
     bool keepAlive;             // the connection is positioned at a clean boundary and may be reused
     bool gotAnyBytes;           // false if the stream ended before a single byte - on a reused
                                 // connection, the sign the server had already closed it
+    bool encoded;              // a Content-Encoding other than identity was supplied
     char location[HTTP_LOCATION_MAX]; // the Location header, if any (redirects)
     char date[64];              // the Date header, if any: "Mon, 05 Oct 2026 15:20:00 GMT"
 };
@@ -67,6 +68,6 @@ void HttpStreamInit(HttpStream *stream, HttpReadFn readFn, void *readContext);
 // closed early, or the framing was malformed. The connection must be dropped
 // then; out->gotAnyBytes says whether anything had arrived at all.
 bool ReadHttpResponse(HttpStream *stream, char *body, unsigned long long bodyCapacity,
-                      HttpResponseResult *out);
+                      HttpResponseResult *out, bool json = false);
 
 #endif

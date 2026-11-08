@@ -336,6 +336,15 @@ static bool ReadHeaders(Stream *s, Headers *h, HttpResponseResult *out)
             if (HasToken(value, "close"))
                 h->connectionClose = true;
         }
+        else if (NameIs(line, nameLen, "content-encoding"))
+        {
+            // Strict catalog requests require the supplied bytes, with no
+            // decompression or redirect interpretation by the transport.
+            const char *end = value + strlen(value);
+            while (end > value && (end[-1] == ' ' || end[-1] == '\t')) --end;
+            if (end != value && !NameIs(value, (int)(end - value), "identity"))
+                out->encoded = true;
+        }
         else if (NameIs(line, nameLen, "date"))
         {
             size_t n = strlen(value);
@@ -372,7 +381,7 @@ static bool ReadHeaders(Stream *s, Headers *h, HttpResponseResult *out)
 // ---------------------------------------------------------------------------
 
 bool ReadHttpResponse(HttpStream *stream, char *body, unsigned long long bodyCapacity,
-                      HttpResponseResult *out)
+                      HttpResponseResult *out, bool json)
 {
     memset(out, 0, sizeof(*out));
 
@@ -397,13 +406,17 @@ bool ReadHttpResponse(HttpStream *stream, char *body, unsigned long long bodyCap
         if (h.status / 100 != 1 || h.status == 101)
             break;
         out->location[0] = '\0';
+        out->encoded = false;
     }
+
+    if (json && (out->encoded || (h.status >= 300 && h.status < 400)))
+        return false; // caller drops the connection; never follow an authenticated redirect
 
     Sink k;
     k.body = body;
     k.cap = bodyCapacity;
     k.len = 0;
-    k.store = (h.status / 100 == 2);
+    k.store = json || (h.status / 100 == 2);
     k.overflow = false;
 
     bool framed = true; // the end of the body was found from the message itself

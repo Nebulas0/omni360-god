@@ -11,6 +11,18 @@ fixtures = root / "tools/test_foundry/fixtures"
 if not (fixtures / "prepared.json").is_file():
     raise SystemExit("Generate the synthetic API contract fixtures first; see docs/FOUNDRY-DEVELOPMENT.md")
 with tempfile.TemporaryDirectory(prefix="foundry-protocol-") as temp:
+    # Exercise the production session implementation, replacing only its Xbox
+    # socket/TLS dependencies. The complete file is also compiled by the XDK.
+    transport = (root / "src/downloadFile.cpp").read_text()
+    session_code = transport[transport.index("struct HttpsSession\n"):]
+    harness = (root / "tools/test_foundry/test_session.cpp").read_text()
+    assert harness.count("// INSERT_ACTUAL_SESSION") == 1
+    session_source = Path(temp) / "test_session.cpp"
+    session_source.write_text(harness.replace("// INSERT_ACTUAL_SESSION", session_code))
+    session_binary = Path(temp) / "test_session"
+    subprocess.run([os.getenv("CXX", "c++"), "-std=c++03", "-Wall", "-Wextra", "-I", str(root / "src"),
+                    str(session_source), str(root / "src/HttpResponse.cpp"), "-o", str(session_binary)], check=True)
+    subprocess.run([str(session_binary)], check=True)
     obj, binary = Path(temp) / "cJSON.o", Path(temp) / "test_protocol"
     subprocess.run([os.getenv("CC", "cc"), "-std=c99", "-c", str(root / "src/cJSON.c"), "-o", str(obj)], check=True)
     subprocess.run([os.getenv("CXX", "c++"), "-std=c++03", "-Wall", "-Wextra", "-I", str(root / "src"),

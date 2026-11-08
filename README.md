@@ -6,7 +6,11 @@ packages or download an ISO archive for on-console conversion.
 
 Based on upstream **Omni360 0.13.4-beta** (`6d9c323`), with the Foundry service
 integration and the fork's own signed updater preserved. Fork version:
-**1.0.0-alpha.7**.
+**1.0.0-alpha.8**.
+
+Foundry browsing reuses verified HTTPS connections and keeps recently visited
+catalog pages in a bounded five-minute memory cache. Refresh reloads the catalog.
+The first connection or an expired server connection can still take longer.
 
 **Alpha builds:** ZenServer builds checked main commits with the real Xbox XDK
 under Wine. Signed test builds appear in this fork's [releases](https://github.com/Nebulas0/omni360-god/releases).

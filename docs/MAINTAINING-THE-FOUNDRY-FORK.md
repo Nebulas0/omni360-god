@@ -58,10 +58,23 @@ credentials must continue to work when merging official UI or installer changes.
   Preserve actual range/ETag/hash validation, bounded retries, retained partials
   and checks before committing files. Do not replace these with a single giant
   download that exceeds FATX limits.
-- Catalog browsing caches at most 16 responses / 2 MiB for 60 seconds, bound to
+- Catalog browsing caches at most 16 responses / 2 MiB for five minutes, bound to
   origin/device/token. Refresh invalidates in-flight prefetch generations. At most
   one background catalog GET runs, without retries or UI calls; active installs
   suppress new preloads. Never cache install POSTs, manifests or download bytes.
+  Foreground catalog GETs and the single preload worker each own a separate
+  verified keep-alive HTTPS session. Never access one TLS context concurrently
+  or hand it to an installer. Device/origin/token changes replace the appropriate
+  session. Strict JSON mode rejects redirects and encoded bodies, retains bounded
+  error JSON, supports cancellation between reads and reconnects after an idle
+  close. The original Archive.org session callers retain their default behavior.
+  Catalog reads use a 15-second socket inactivity timeout and at most two outer
+  attempts; background preloads have one attempt and a five-second same-page
+  backoff. Preserve the existing installer timeouts/retries. A first connection
+  still pays DNS/TLS costs; measure real Xbox latency instead of promising a time.
+  Clicking an in-flight preload waits at most 150 ms before cancelling that
+  speculative request and using the independent foreground session. Keep the
+  old worker handle until it exits; never free its context from another thread.
 - Queue counters and download ETA cover the whole download, not the current
   data part. ISO checking/indexing and on-Xbox conversion show their own progress
   and measured estimates. Unknown time is shown as estimating.

@@ -111,8 +111,12 @@ void HttpsSessionClose(HttpsSession *session);
 /// *dataBufferSize is its length; on a 302 the redirect target is in
 /// dataBuffer instead. dataBuffer needs room for *dataBufferSize + 1 bytes,
 /// as the body is NUL-terminated.
+/// json opts into bounded error bodies, identity encoding and rejection of
+/// redirects. progressFn may cancel between network reads; cancellation drops
+/// the connection. Sessions have one owner and must never be used concurrently.
 int HttpsSessionGet(HttpsSession *session, const std::string &url, const char *extraHeaderLines,
-                    char *dataBuffer, unsigned long long *dataBufferSize);
+                    char *dataBuffer, unsigned long long *dataBufferSize,
+                    bool json = false, DownloadProgressFn progressFn = NULL);
 
 /// The Date header of the session's last response - the server's idea of
 /// today, for when the console's clock can't be trusted. False, with out

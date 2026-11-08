@@ -117,6 +117,16 @@ static std::vector<unsigned long long> offsets;
 static int postLosses=0,posts=0,serverCreates=0;
 static bool cancelTransfer=false,firstPostWasDurable=false;
 static std::map<std::string,std::string> serverRequests;
+static unsigned sessionOpens=0,sessionCloses=0,sessionGets=0;
+HttpsSession *HttpsSessionOpen(void(const char*,...)){++sessionOpens;return (HttpsSession*)1;}
+void HttpsSessionClose(HttpsSession *s){if(s)++sessionCloses;}
+int HttpsSessionGet(HttpsSession*,const std::string &url,const char *headers,char *buffer,unsigned long long *length,bool json,DownloadProgressFn progress)
+{
+    assert(url.find("/api/console/v1/store/")!=std::string::npos&&json&&headers&&strstr(headers,"Authorization: Bearer "));
+    if(progress&&!progress(0,0,0,0))return HTTP_STATUS_CANCELLED;
+    ++sessionGets;const std::string body="{\"items\":[]}";assert(*length>=body.size());memcpy(buffer,body.c_str(),body.size()+1);*length=body.size();return 200;
+}
+extern "C" void XboxTLS_SetThreadIoTimeout(unsigned long){}
 static std::string HeaderValue(const std::string &s,const std::string &key)
 {size_t at=s.find(key+": ");if(at==std::string::npos)return "";at+=key.size()+2;return s.substr(at,s.find("\r\n",at)-at);}
 int httpRequestHTTPS(const std::string,HttpMethod method,const char *body,const char *rawHeaders,const std::string filename,
@@ -262,15 +272,31 @@ static void CatalogCache()
     Device other=d;other.origin="https://other.example.com";assert(!StoreCacheRead(StoreCacheKey(other,"/store/home"),NULL));
     other=d;other.token="another-device-token";assert(!StoreCacheRead(StoreCacheKey(other,"/store/home"),NULL));
     ClearFoundryStoreCache();StoreCacheSave(key,o,generation);assert(!StoreCacheRead(key,NULL));
-    StoreCacheSave(key,o,g_storeCacheGeneration);for(int i=0;i<610;++i)GetTickCount();assert(!StoreCacheRead(key,NULL));
+    StoreCacheSave(key,o,g_storeCacheGeneration);for(int i=0;i<610;++i)GetTickCount();assert(StoreCacheRead(key,NULL));
+    for(int i=0;i<3010;++i)GetTickCount();assert(!StoreCacheRead(key,NULL));
     std::string large(200*1024,'a');cJSON_AddStringToObject(o,"body",large.c_str());
     for(int i=0;i<20;++i){char id[16];snprintf(id,sizeof(id),"page-%d",i);StoreCacheSave(id,o,g_storeCacheGeneration);}
     assert(g_storeCache.size()<=16&&g_storeCacheBytes<=2*1024*1024);
     assert(StoreCacheRead("page-19",NULL)&&!StoreCacheRead("page-0",NULL));
     ClearFoundryStoreCache();assert(g_storeCache.empty()&&g_storeCacheBytes==0);cJSON_Delete(o);
 }
+static void CatalogTransport()
+{
+    Case("catalog-transport");HttpsSession *session=NULL;std::string owner,error;cJSON *reply=NULL;
+    unsigned opened=sessionOpens,closed=sessionCloses,gets=sessionGets;
+    for(int i=0;i<2;++i){assert(Call(std::string(API)+"/store/home","",true,&reply,&error,false,"",NULL,1,NULL,NULL,&session,&owner));cJSON_Delete(reply);}
+    assert(sessionOpens==opened+1&&sessionGets==gets+2);
+    g_device.token="fg_"+std::string(43,'z');
+    assert(Call(std::string(API)+"/store/titles?cursor=0","",true,&reply,&error,false,"",NULL,1,NULL,NULL,&session,&owner));cJSON_Delete(reply);
+    assert(sessionOpens==opened+2&&sessionCloses==closed+1);HttpsSessionClose(session);session=NULL;
+    // Strict session transport never receives a durable POST, even if requested.
+    serverRequests.clear();postLosses=0;Work w;w.games=w.content="Hdd1:\\Content\\0000000000000000";w.name="Test";w.body="{}";
+    assert(NewRequestKey(&w,&error)&&CreatePendingRequest(&w,&error));
+    assert(Call(std::string(API)+"/install-requests",w.body,true,&reply,&error,false,w.key,NULL,1,NULL,NULL,&session,&owner));cJSON_Delete(reply);
+    assert(sessionGets==gets+3&&session==NULL);
+}
 int main()
 {
-    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();AggregateProgress();CatalogCache();
+    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();AggregateProgress();CatalogCache();CatalogTransport();
     std::cout<<"Real client runtime: interrupted transfers, in-piece resume, lost POST/reboot idempotency, cross-server guard, GoD/Cache TU power cuts and shared-volume space checks passed\n";
 }

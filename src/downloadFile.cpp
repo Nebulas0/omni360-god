@@ -1347,11 +1347,21 @@ struct HttpsSession
     int requestsSent;
 
     char lastDate[64]; // the last response's Date header
+    DownloadProgressFn progress;
+    bool cancelled;
 };
 
+static bool SessionContinue(HttpsSession *s)
+{
+    if (s->progress && !s->progress(0, 0, 0, 0)) s->cancelled = true;
+    return !s->cancelled;
+}
 static int SessionRead(void *context, char *buf, int len)
 {
-    return XboxTLS_Read((XboxTLSContext *)context, buf, len);
+    HttpsSession *s = (HttpsSession *)context;
+    if (!SessionContinue(s)) return -1;
+    int n = XboxTLS_Read(&s->ctx, buf, len);
+    return SessionContinue(s) ? n : -1;
 }
 
 static void SessionDisconnect(HttpsSession *s)
@@ -1388,6 +1398,7 @@ static bool SessionConnect(HttpsSession *s, const char *domain)
     char ip[64] = "";
     for (int attempt = 0; attempt < 3 && ip[0] == '\0'; ++attempt)
     {
+        if (!SessionContinue(s)) break;
         if (ResolveDNS(domain, ip, sizeof(ip)))
             break;
         ip[0] = '\0';
@@ -1397,14 +1408,14 @@ static bool SessionConnect(HttpsSession *s, const char *domain)
         Sleep(1000);
     }
 
-    if (ip[0] == '\0')
+    if (ip[0] == '\0' || !SessionContinue(s))
     {
         s->print("[https] could not resolve %s\n", domain);
         XboxTLS_Free(&s->ctx);
         return false;
     }
 
-    if (!XboxTLS_Connect(&s->ctx, ip, domain, 443))
+    if (!XboxTLS_Connect(&s->ctx, ip, domain, 443) || !SessionContinue(s))
     {
         s->print("[https] could not connect to %s\n", domain);
         XboxTLS_Free(&s->ctx);
@@ -1414,7 +1425,7 @@ static bool SessionConnect(HttpsSession *s, const char *domain)
     memcpy(s->host, domain, strlen(domain) + 1);
     s->connected = true;
     s->connectionsOpened++;
-    HttpStreamInit(&s->stream, SessionRead, &s->ctx);
+    HttpStreamInit(&s->stream, SessionRead, s);
     return true;
 }
 
@@ -1477,7 +1488,8 @@ bool HttpsSessionServerDate(HttpsSession *session, char *out, size_t outSize)
 }
 
 int HttpsSessionGet(HttpsSession *session, const std::string &url, const char *extraHeaderLines,
-                    char *dataBuffer, unsigned long long *dataBufferSize)
+                    char *dataBuffer, unsigned long long *dataBufferSize,
+                    bool json, DownloadProgressFn progressFn)
 {
     if (session == NULL || dataBuffer == NULL || dataBufferSize == NULL)
         return 0;
@@ -1499,6 +1511,9 @@ int HttpsSessionGet(HttpsSession *session, const std::string &url, const char *e
     }
 
     const unsigned long long capacity = *dataBufferSize;
+    *dataBufferSize = 0;
+    session->progress = progressFn;
+    session->cancelled = false;
     int status = 0;
 
     // At most two tries, and the second only when the first went over a
@@ -1508,6 +1523,8 @@ int HttpsSessionGet(HttpsSession *session, const std::string &url, const char *e
     // reuse, not an error. These are GETs, so repeating one is harmless.
     for (int attempt = 0; attempt < 2; ++attempt)
     {
+        if (!SessionContinue(session))
+        { SessionDisconnect(session); return HTTP_STATUS_CANCELLED; }
         const bool reusing = session->connected && _stricmp(session->host, domain) == 0;
 
         if (session->connected && !reusing)
@@ -1516,7 +1533,7 @@ int HttpsSessionGet(HttpsSession *session, const std::string &url, const char *e
         if (!session->connected)
         {
             if (!SessionConnect(session, domain))
-                return 0;
+                return session->cancelled ? HTTP_STATUS_CANCELLED : 0;
             session->print("[https]   new connection to %s\n", domain);
         }
         else
@@ -1545,9 +1562,10 @@ int HttpsSessionGet(HttpsSession *session, const std::string &url, const char *e
             return 0;
         }
 
-        if (XboxTLS_Write(&session->ctx, request, requestLen) < 0)
+        if (!SessionContinue(session) || XboxTLS_Write(&session->ctx, request, requestLen) < 0)
         {
             SessionDisconnect(session);
+            if (session->cancelled) return HTTP_STATUS_CANCELLED;
             if (reusing && attempt == 0)
             {
                 session->print("[https]   connection had closed; retrying on a new one\n");
@@ -1559,10 +1577,11 @@ int HttpsSessionGet(HttpsSession *session, const std::string &url, const char *e
         session->requestsSent++;
 
         HttpResponseResult response;
-        if (!ReadHttpResponse(&session->stream, dataBuffer, capacity, &response))
+        if (!ReadHttpResponse(&session->stream, dataBuffer, capacity, &response, json))
         {
             SessionDisconnect(session);
-            if (reusing && attempt == 0)
+            if (session->cancelled) return HTTP_STATUS_CANCELLED;
+            if (reusing && attempt == 0 && (!json || !response.gotAnyBytes))
             {
                 session->print("[https]   no usable response on the reused connection; retrying on a new one\n");
                 continue;
@@ -1591,7 +1610,7 @@ int HttpsSessionGet(HttpsSession *session, const std::string &url, const char *e
             memcpy(dataBuffer, response.location, locLen + 1);
             *dataBufferSize = locLen;
         }
-        else if (status == 200 || status == 206)
+        else if (json || status == 200 || status == 206)
         {
             if (response.bodyOverflow)
             {
