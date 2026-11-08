@@ -155,6 +155,9 @@ for the modified Foundry application.
   no untested or incomplete feature is a stable-release promise.
 
 
+For browser-side request progress, prepared-file cleanup and device management,
+see [Console activity](CONSOLE-ACTIVITY.md).
+
 ## Foundry browsing API (alpha.6)
 
 Device-authenticated `GET /api/console/v1/store/home` returns featured tiles and

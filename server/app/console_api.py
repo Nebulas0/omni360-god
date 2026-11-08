@@ -108,7 +108,13 @@ class ConsoleService:
                     device_id TEXT NOT NULL, event_id TEXT NOT NULL, request_id TEXT NOT NULL,
                     payload TEXT NOT NULL, created_at TEXT NOT NULL,
                     PRIMARY KEY(device_id,event_id));
+                CREATE TABLE IF NOT EXISTS console_transfers(
+                    request_id TEXT PRIMARY KEY REFERENCES console_requests(id) ON DELETE CASCADE,
+                    filename TEXT NOT NULL, file_index INTEGER NOT NULL, file_count INTEGER NOT NULL,
+                    archive INTEGER NOT NULL, requested_at TEXT NOT NULL);
             """)
+            if 'hidden' not in {r['name'] for r in c.execute('PRAGMA table_info(console_devices)')}:
+                c.execute('ALTER TABLE console_devices ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0')
 
     @contextmanager
     def connect(self):
@@ -435,6 +441,88 @@ class ConsoleService:
         values["updated_at"] = utc_now()
         with self.connect() as c:
             c.execute("UPDATE console_requests SET " + ",".join(k + "=?" for k in values) + " WHERE id=?", (*values.values(), rid))
+
+    def admin_request_view(self, row, device):
+        result = self.request_view(row)
+        selection = result['selection']
+        releases = selection.get('release_ids') or [selection.get('release_id')]
+        sources = []
+        for release in releases:
+            if not release: continue
+            try: name = self.item(release)['name']
+            except ConsoleError: name = release
+            sources.append({'release_id': release, 'name': name})
+        result.update(device_id=row['device_id'], console_name=device['name'] if device else 'Removed console', sources=sources)
+        if selection.get('kind') == 'title_update':
+            title_id = selection['game_identity']['title_id']
+            title = self.database.get_title(title_id)
+            result['name'] = 'Title update · ' + (title['title_name'] if title else title_id)
+        else:
+            from store_browser import display_name
+            result['name'] = display_name(sources[0]['name']) if sources else 'Installation request'
+            if len(sources) > 1: result['name'] += f" · {len(sources)} sources"
+        with self.connect() as c:
+            links = c.execute('SELECT release_id,job_id FROM console_request_sources WHERE request_id=?', (row['id'],)).fetchall()
+            artifact = c.execute('SELECT bytes,expires FROM console_artifacts WHERE id=?', (row['artifact_id'],)).fetchone()
+            transfer = c.execute('SELECT * FROM console_transfers WHERE request_id=?', (row['id'],)).fetchone()
+            event = c.execute('SELECT created_at FROM console_events WHERE request_id=? ORDER BY created_at DESC LIMIT 1', (row['id'],)).fetchone()
+        jobs = []
+        for link in links or ([{'release_id': selection.get('release_id'), 'job_id': row['job_id']}] if row['job_id'] else []):
+            job = self.database.get_job(link['job_id'])
+            if job:
+                jobs.append({k: job[k] for k in ('id', 'status', 'stage', 'progress', 'message')})
+        result['jobs'] = jobs
+        if row['state'] in {'queued', 'waiting', 'preparing'} and jobs:
+            total = max(len(releases), len(jobs))
+            result['progress'] = min(99, sum(100 if j['status'] == 'complete' else max(0, min(100, j['progress'] or 0)) for j in jobs) / total)
+        result.update(prepared_bytes=artifact['bytes'] if artifact else 0,
+                      download_available=bool(artifact and artifact['expires'] > time.time()),
+                      can_delete=bool(artifact and row['state'] not in {'queued', 'waiting', 'preparing'}),
+                      transfer=dict(transfer) if transfer else None,
+                      reported_at=event['created_at'] if event else None)
+        return result
+
+    def delete_request_files(self, rid):
+        # Only prepared console snapshots are in scope. Shared library outputs,
+        # original source caches and the Xbox's installed files are untouched.
+        with self.connect() as c:
+            c.execute('BEGIN IMMEDIATE')
+            row = c.execute('SELECT * FROM console_requests WHERE id=?', (rid,)).fetchone()
+            if not row: raise ConsoleError('NOT_FOUND', 'Request not found', 404)
+            if row['state'] in {'queued', 'waiting', 'preparing'}:
+                raise ConsoleError('PREPARATION_ACTIVE', 'Wait for server preparation to finish before deleting its download', 409)
+            aid = row['artifact_id']
+            artifact = c.execute('SELECT bytes FROM console_artifacts WHERE id=?', (aid,)).fetchone()
+            if not artifact:
+                c.commit(); return {'deleted': True, 'released_bytes': 0}
+            if not aid or not re.fullmatch(r'[0-9a-f]{32}', aid):
+                raise ConsoleError('INVALID_PATH', 'Invalid prepared download path', 409)
+            path = self.root / aid
+            if path.is_symlink() or not path.resolve().is_relative_to(self.root.resolve()):
+                raise ConsoleError('INVALID_PATH', 'Prepared download path is unsafe', 409)
+            if path.exists(): shutil.rmtree(path)
+            c.execute('DELETE FROM console_artifacts WHERE id=?', (aid,))
+            c.execute("UPDATE console_requests SET state='cancelled',artifact_id=NULL,error_code='FILES_REMOVED',message='Prepared server download files removed',updated_at=? WHERE artifact_id=?", (utc_now(), aid))
+            c.commit()
+        return {'deleted': True, 'released_bytes': artifact['bytes']}
+
+    def record_transfer(self, aid, entry, files, archive, response):
+        # This is a request-position indicator, NOT proof the Xbox received or
+        # installed the bytes. Only the Xbox's final event confirms installation.
+        if request.method != 'GET' or response.status_code not in {200, 206}: return
+        if archive:
+            count = (int(entry['bytes']) + 32*1024**2 - 1) // (32*1024**2)
+            start = (response.content_range.start or 0) if response.status_code == 206 else 0
+            index = min(count, start // (32*1024**2) + 1)
+            filename = 'ISO archive'
+        else:
+            count = len(files); index = next(i for i, f in enumerate(files, 1) if f['file_id'] == entry['file_id'])
+            filename = entry['relative_path']
+        with self.connect() as c:
+            row = c.execute('SELECT id FROM console_requests WHERE artifact_id=? AND device_id=?', (aid, g.console_device['id'])).fetchone()
+            if row:
+                c.execute('INSERT INTO console_transfers VALUES(?,?,?,?,?,?) ON CONFLICT(request_id) DO UPDATE SET filename=excluded.filename,file_index=excluded.file_index,file_count=excluded.file_count,archive=excluded.archive,requested_at=excluded.requested_at',
+                          (row['id'], filename, index, count, int(archive), utc_now()))
 
     def recover_requests(self):
         # Only the preparation worker owns crash recovery. A browsing-only
@@ -1062,6 +1150,7 @@ def register_console_api(app, config, database, runner, remote, start_background
             raise ConsoleError("ARTIFACT_CHANGED", "Artifact is unavailable; prepare it again", 409)
         response = send_file(path, mimetype="application/octet-stream", conditional=True, etag=entry["sha256"], max_age=0)
         response.headers["Accept-Ranges"] = "bytes"
+        service.record_transfer(aid, entry, [] if file_id is None else files, file_id is None, response)
         return response
 
     @api.get("/artifacts/<aid>/files/<fid>")
@@ -1082,10 +1171,43 @@ def register_console_api(app, config, database, runner, remote, start_background
 
     @app.get("/api/consoles")
     def consoles_list():
+        include_removed = request.args.get('include_removed') == '1'
+        try:
+            offset = int(request.args.get('cursor', '0'))
+            if not 0 <= offset <= 100000: raise ValueError()
+        except ValueError: raise ConsoleError('INVALID_REQUEST', 'Invalid request page')
+        device_id = request.args.get('device', '')
+        if device_id and not re.fullmatch(r'[0-9a-f]{32}', device_id): raise ConsoleError('INVALID_REQUEST', 'Invalid console')
         with service.connect() as c:
-            devices = [dict(r) for r in c.execute("SELECT id,name,scopes,created_at,last_seen,revoked FROM console_devices ORDER BY created_at DESC")]
-            installs = [service.request_view(dict(r)) for r in c.execute("SELECT * FROM console_requests ORDER BY created_at DESC LIMIT 50")]
-        return jsonify(devices=devices, installs=installs)
+            devices = [dict(r) for r in c.execute("SELECT id,name,created_at,last_seen,revoked,hidden FROM console_devices ORDER BY created_at DESC")]
+            visible = {d['id']: d for d in devices if include_removed or not d['hidden']}
+            where, params = [], []
+            if not include_removed: where.append('EXISTS (SELECT 1 FROM console_devices d WHERE d.id=r.device_id AND d.hidden=0)')
+            if device_id: where.append('r.device_id=?'); params.append(device_id)
+            clause = ' WHERE ' + ' AND '.join(where) if where else ''
+            total = c.execute('SELECT count(*) FROM console_requests r'+clause, params).fetchone()[0]
+            rows = c.execute('SELECT r.* FROM console_requests r'+clause+' ORDER BY r.created_at DESC,r.id DESC LIMIT 50 OFFSET ?', (*params, offset)).fetchall()
+            storage = c.execute('SELECT coalesce(sum(bytes),0) FROM console_artifacts').fetchone()[0]
+            preparing = c.execute("SELECT count(*) FROM console_requests WHERE state IN ('queued','waiting','preparing')").fetchone()[0]
+        installs = [service.admin_request_view(dict(r), visible.get(r['device_id'])) for r in rows]
+        response = jsonify(devices=list(visible.values()), installs=installs, storage_bytes=storage, preparing=preparing, total=total,
+                           next_cursor=str(offset+50) if offset+50 < total else None, previous_cursor=str(max(0,offset-50)) if offset else None)
+        response.headers['Cache-Control'] = 'private, no-store'
+        return response
+
+    @app.post('/api/consoles/requests/<rid>/delete-files')
+    def delete_console_files(rid):
+        if payload().get('confirm') is not True: raise ConsoleError('INVALID_REQUEST', 'Confirm deletion of the prepared server download')
+        return jsonify(service.delete_request_files(rid))
+
+    @app.post('/api/consoles/<device>/remove')
+    def remove_console(device):
+        with service.connect() as c:
+            row = c.execute('SELECT revoked FROM console_devices WHERE id=?', (device,)).fetchone()
+            if not row: raise ConsoleError('NOT_FOUND', 'Console not found', 404)
+            if not row['revoked']: raise ConsoleError('DEVICE_ACTIVE', 'Revoke access before removing this console entry', 409)
+            c.execute('UPDATE console_devices SET hidden=1 WHERE id=?', (device,))
+        return jsonify(removed=True)
 
     @app.post("/api/consoles/pair")
     def approve():
