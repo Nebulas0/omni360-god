@@ -113,3 +113,23 @@ Install the supplied service/timer with the correct server user, then enable
 it does not replace itself with code from new commits. The compiler receives
 no Docker socket. No private SDK, key, credentials or game data may be added
 to the repository, image build context, Actions artifact or release.
+
+## Verification downloads
+
+The Actions verifier downloads public assets through GitHub's binary asset API
+first, with a public browser-download fallback and at most four fresh attempts
+for temporary network errors. It logs the asset and attempt, applies a bounded
+socket timeout and the overall verification deadline, and writes completed
+files atomically. Neither route nor redirected CDN requests receive the API
+token or cookies.
+
+Verification requires all four uploaded assets, matching declared sizes and
+available GitHub digests, every SHA256SUMS entry, the native XEX loader fields,
+and the existing fork ECDSA signature. Hash/signature mismatches fail the job;
+retries do not bypass validation. Missing Actions artifacts are errors.
+
+A network timeout in this verification job does not mean the private compiler
+failed. Check the trusted host status and public release, then rerun the failed
+job. Its verification and artifact-upload steps must both pass before calling
+the Actions run complete. Never replace an existing published XEX to retry a
+verification download.

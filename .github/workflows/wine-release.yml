@@ -33,4 +33,4 @@ jobs:
             Release/Omni360.xex.sig
             Release/build.json
             Release/SHA256SUMS
-          if-no-files-found: ignore
+          if-no-files-found: error
