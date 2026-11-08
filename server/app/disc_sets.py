@@ -6,7 +6,7 @@ from compatibility import compatibility_rule
 from db import normalize_search_text
 
 
-_NUMBER = re.compile(r"\((?:Game\s+)?Dis[ck]\s+(\d+)(?:\s*(?:of|/)\s*\d+)?\)", re.I)
+_NUMBER = re.compile(r"\((?:Game\s+)?(?:Dis[ck]|Disque|Disco)\s+(\d+)(?:\s*(?:of|/)\s*\d+)?\)", re.I)
 _ROLE = re.compile(r"\((?:Install(?:ation)?|Play|Game)\s+Dis[ck]\)", re.I)
 
 

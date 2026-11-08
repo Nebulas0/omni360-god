@@ -40,6 +40,12 @@ def test_game_specific_profiles_and_ambiguous_source_are_conservative():
     assert len(disc_plan(rows, 'catalog-1')['items']) == 1
 
 
+def test_localized_disc_numbers_pair_and_apply_the_same_content_rules():
+    rows=[source(1,'Mass Effect 2 (Canada) (Disque 1).zip'),source(2,'Mass Effect 2 (Canada) (Disque 2).zip')]
+    assert [r['disc_number'] for r in disc_plan(rows,'catalog-2')['items']]==[1,2]
+    assert disc_info('Grand Theft Auto V (World) (Disco 1).zip')['disc_role']=='content'
+
+
 def seed_discs(service):
     names = [f'Synthetic game (World) (Disc {i}).zip' for i in (1, 2)]
     service.database.upsert_catalog('disc', [{'name':n, 'source_path':n, 'size':1} for n in names])

@@ -18,6 +18,7 @@ def _normalize(value: str) -> str:
         "ascii", "ignore"
     ).decode("ascii")
     value = value.lower().replace("disk", "disc")
+    value = re.sub(r"\b(?:disque|disco)(?=\s+\d)", "disc", value)
     return re.sub(r"[^a-z0-9]+", " ", value).strip()
 
 
