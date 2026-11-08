@@ -6,6 +6,11 @@ a new signed Xbox build. Use it with the source, not as a replacement for review
 
 ## Baseline and ownership
 
+Alpha.10 adds the device-scoped website preparation inbox, durable sequential
+Xbox list and opt-in automatic downloads. Preserve these alongside the original
+Foundry integration; see [Prepared for Xbox](PREPARED-FOR-XBOX.md) for API, files,
+limits and validation details.
+
 - Official project: <https://github.com/JustGillin/omni360>, default branch `master`.
 - Our fork: <https://github.com/Nebulas0/omni360-god>, deployment branch `main`.
 - Recorded upstream baseline: **0.13.4-beta**, commit

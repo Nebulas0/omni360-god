@@ -1796,6 +1796,7 @@ static void ChangeGamesFolder(Library &lib, char *gamesPath, size_t gamesPathSiz
     // the internal disk, which is the thing they were moving away from.
     GetContentBasePath(gamesPath, g_contentBase, sizeof(g_contentBase));
     SetDownloadQueueContentPath(g_contentBase);
+    SetFoundryInstallPaths(gamesPath, g_contentBase);
     dprintf("Content path now %s\n", g_contentBase);
 
     ScanLibrary(lib, gamesPath);

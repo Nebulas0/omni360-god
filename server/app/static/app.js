@@ -670,6 +670,11 @@ async function refreshCatalog() {
 }
 
 $("queue-button").addEventListener("click", queueSelected);
+$("prepare-xbox-button").addEventListener("click", () => {
+  const releases=[...state.selected].map(id=>`catalog-${id}`);
+  if(releases.length>32){renderCatalogMessage("Select at most 32 sources to review for Xbox preparation.",true);return;}
+  window.location.href="/consoles/prepare"+(releases.length?"?releases="+encodeURIComponent(releases.join(",")):"");
+});
 $("refresh-button").addEventListener("click", refreshCatalog);
 $("clean-deleted-work").addEventListener("click", async () => {
   if (!window.confirm("Delete work directories and orphaned source-cache files for all deleted jobs? This cannot be undone.")) return;

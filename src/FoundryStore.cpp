@@ -159,7 +159,7 @@ bool OpenFoundryStoreUI(const char *games,const char *content)
         std::string focusedId;if(zone==0&&!featured.empty())focusedId=featured[place].id;else if(zone>=3&&zone-3<(int)rows.size())focusedId=rows[zone-3].titles[place].id;
         PrefetchFocusedTitle(focusedId,&dwell);
         Pump();StorePageView view;memset(&view,0,sizeof(view));view.featuredLabel="Your Foundry library";view.featuredCount=(int)featured.size();for(size_t i=0;i<featured.size();++i){view.featured[i].titleId=featured[i].art;view.featured[i].name=featured[i].name.c_str();view.featured[i].detail="Available from your server";}
-        const char *buttons[]={"Games","XBLA / DLC","Download queue","Server / pairing"};for(int i=0;i<4;++i)view.buttons[i].label=buttons[i];view.letters=letters;view.rowCount=(int)rows.size();
+        const char *buttons[]={"Games","XBLA / DLC","Download queue","Prepared for Xbox"};for(int i=0;i<4;++i)view.buttons[i].label=buttons[i];view.letters=letters;view.rowCount=(int)rows.size();
         for(size_t i=0;i<rows.size();++i){view.rows[i].name=rows[i].name.c_str();view.rows[i].tiles=&rows[i].tiles[0];view.rows[i].count=(int)rows[i].tiles.size();view.rows[i].scroll=rows[i].scroll;}
         view.focus=zone==0?STORE_FOCUS_FEATURED+place:zone==1?STORE_FOCUS_BUTTONS+place:zone==2?STORE_FOCUS_LETTERS+place:STORE_FOCUS_ROWS+(zone-3)*STORE_ROW_TILES_MAX+place;view.scroll=scroll;view.focused=true;
         UiHint hints[]={{UI_BUTTON_A,L"Open",NULL},{UI_BUTTON_B,L"Home",NULL},{UI_BUTTON_Y,L"Search",NULL},{UI_BUTTON_X,L"Refresh",NULL}};RenderStoreFrame(view,hints,4);scroll=view.scroll;for(size_t i=0;i<rows.size();++i)rows[i].scroll=view.rows[i].scroll;
@@ -170,7 +170,7 @@ bool OpenFoundryStoreUI(const char *games,const char *content)
         else if(input.pressed&XINPUT_GAMEPAD_A)
         {
             if(zone==0&&!featured.empty()){if(Game(featured[place],games,content))return true;}
-            else if(zone==1){if(place==2)return true;if(place==3){OpenFoundryUI(games,content);reload=true;}else if(Browse(games,content,place==1?"digital":"game",'*',""))return true;}
+            else if(zone==1){if(place==2)return true;if(place==3){if(OpenFoundryPreparedUI(games,content))return true;reload=true;}else if(Browse(games,content,place==1?"digital":"game",'*',""))return true;}
             else if(zone==2){if(Browse(games,content,"game",letters[place],""))return true;}
             else if(zone>=3&&zone-3<(int)rows.size()){if(Game(rows[zone-3].titles[place],games,content))return true;}
             ResyncUiInput();
@@ -236,6 +236,59 @@ bool OpenFoundryDlcUI(const char *games,const char *content,const char *name,uns
         }
         else if(input.nav==XINPUT_GAMEPAD_DPAD_UP&&view.selected>0)--view.selected;
         else if(input.nav==XINPUT_GAMEPAD_DPAD_DOWN&&view.selected+1<view.count)++view.selected;
+        Sleep(16);
+    }
+}
+
+// A fresh, device-scoped view of requests prepared while the console was off.
+// It adopts the existing request IDs; the normal installer owns all file writes.
+bool OpenFoundryPreparedUI(const char *games,const char *content)
+{
+    cJSON *reply=NULL;std::vector<Title> titles;std::vector<StoreTileView> tiles;std::vector<std::string> states,details;
+    bool reload=true;int selected=0,scroll=0;DWORD refreshed=0;
+    for(;;)
+    {
+        if(GetTickCount()-refreshed>=15000)reload=true;
+        if(reload)
+        {
+            cJSON_Delete(reply);reply=NULL;
+            if(!FoundryStoreRequest("/inbox",&reply))return false;
+            const cJSON *items=cJSON_GetObjectItemCaseSensitive(reply,"items");
+            if(!cJSON_IsArray(items)||cJSON_GetArraySize(items)>32){cJSON_Delete(reply);ShowMessageUI("Prepared for Xbox","Invalid prepared list from the server",NULL);return false;}
+            titles.clear();states.clear();details.clear();
+            for(int i=0;i<cJSON_GetArraySize(items);++i)
+            {
+                const cJSON *o=cJSON_GetArrayItem(items,i);Title t;t.id=Text(o,"id");t.name=Text(o,"name");std::string art=Text(o,"art_title_id");t.art=FoundryHex(art,8)?strtoul(art.c_str(),NULL,16):0;t.letter='*';t.addon=false;
+                if(!FoundryHex(t.id,32)||t.name.empty()||t.name.size()>512)continue;
+                unsigned long long bytes=0;FoundryDecimal(Text(o,"bytes").c_str(),&bytes);char size[48];_snprintf(size,sizeof(size),"%.2f GB",bytes/1073741824.0);size[sizeof(size)-1]=0;
+                std::string state=FoundryPreparedCompleted(t.id)?"installed locally":Text(o,"state");
+                std::string detail=state+" - "+size+" - "+(Text(o,"conversion")=="console"?"convert on Xbox":"server prepared");
+                if(state=="expired"||state=="failed")detail+=" - Prepare again on the website";
+                titles.push_back(t);states.push_back(state);details.push_back(detail);
+            }
+            Tiles(titles,&tiles);if(selected>=(int)titles.size())selected=0;reload=false;refreshed=GetTickCount();
+        }
+        Pump();StoreLetterView view;memset(&view,0,sizeof(view));view.letter='*';view.title="Prepared for Xbox";view.section="From your Foundry website";
+        view.filter=titles.empty()?"Nothing waiting. Prepare games on the website, then X to refresh.":details[selected].c_str();view.tiles=tiles.empty()?NULL:&tiles[0];view.count=(int)tiles.size();view.selected=selected;view.scroll=scroll;view.focused=true;
+        UiHint hints[]={{UI_BUTTON_A,L"Choose download",L"Open"},{UI_BUTTON_START,L"Download all ready",L"All ready"},{UI_BUTTON_X,L"Refresh",NULL},{UI_BUTTON_Y,L"Download settings",L"Settings"},{UI_BUTTON_LBRB,L"Server / pairing",L"Connection"},{UI_BUTTON_B,L"Back",NULL}};
+        RenderStoreLetterFrame(view,hints,6);scroll=view.scroll;UiInput input=PollUiInput();int cols=StoreGridColumns();if(cols<1)cols=1;
+        if(input.pressed&XINPUT_GAMEPAD_B){cJSON_Delete(reply);ResyncUiInput();return false;}
+        else if(input.pressed&XINPUT_GAMEPAD_X)reload=true;
+        else if(input.pressed&XINPUT_GAMEPAD_Y){FoundryPreparedOptionsUI();reload=true;ResyncUiInput();}
+        else if(input.pressed&(XINPUT_GAMEPAD_LEFT_SHOULDER|XINPUT_GAMEPAD_RIGHT_SHOULDER)){OpenFoundryUI(games,content);reload=true;ResyncUiInput();}
+        else if(input.pressed&XINPUT_GAMEPAD_START){if(FoundryQueuePrepared(reply,games,content)){cJSON_Delete(reply);return true;}ResyncUiInput();}
+        else if((input.pressed&XINPUT_GAMEPAD_A)&&!titles.empty())
+        {
+            const char *names[]={"Download this item","Download all ready","Show request details"};const char *subs[]={states[selected]=="ready"?"Adds it to the resumable download list":"Wait for ready, or prepare again on the website","Keeps an interrupted installation first",details[selected].c_str()};
+            int pick=ShowChoiceUI("Prepared for Xbox",titles[selected].name.c_str(),names,subs,3,L"Choose");
+            if(pick==2)ShowMessageUI(titles[selected].name.c_str(),details[selected].c_str(),"Server copies expire according to the date on Console activity.");
+            else if((pick==0||pick==1)&&FoundryQueuePrepared(reply,games,content,pick==0?titles[selected].id:std::string())){cJSON_Delete(reply);return true;}
+            ResyncUiInput();
+        }
+        else if(input.nav==XINPUT_GAMEPAD_DPAD_LEFT&&selected>0)--selected;
+        else if(input.nav==XINPUT_GAMEPAD_DPAD_RIGHT&&selected+1<(int)titles.size())++selected;
+        else if(input.nav==XINPUT_GAMEPAD_DPAD_UP)selected=selected>=cols?selected-cols:0;
+        else if(input.nav==XINPUT_GAMEPAD_DPAD_DOWN&&!titles.empty()){selected+=cols;if(selected>=(int)titles.size())selected=(int)titles.size()-1;}
         Sleep(16);
     }
 }

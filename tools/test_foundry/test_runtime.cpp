@@ -100,7 +100,7 @@ static void Case(const char *name)
 {
     hostRoot=std::string(getenv("FOUNDRY_TEST_ROOT"))+"/"+name;assert(mkdir(hostRoot.c_str(),0700)==0);
     assert(mkdir((hostRoot+"/game").c_str(),0700)==0);assert(mkdir((hostRoot+"/Hdd1").c_str(),0700)==0);
-    g_stop=g_cancel=0;g_started=true;g_used=g_pending=false;crashAfterMove=-1;
+    g_stop=g_cancel=0;g_started=true;g_used=g_pending=false;g_delivered=false;g_work=Work();crashAfterMove=-1;
     g_transferBase=g_transferTotal=g_transferJobDone=g_transferJobTotal=0;g_transferFile=g_transferFiles=0;
     diskAvailable=100ULL*1024*1024*1024;diskQueries=0;
     g_device=Device();g_device.id=std::string(32,'a');g_device.token="fg_"+std::string(43,'b');g_device.sequence=0;
@@ -312,8 +312,36 @@ static void MultiDiscReplacement()
         assert(Get(first)==h1&&Get(first+".data\\Data0000")=="KEEP DISC 1");
     }
 }
+static void PreparedInbox()
+{
+    Case("prepared-inbox");std::string error;Work a,b;
+    a.inbox=b.inbox=true;a.request=std::string(32,'c');b.request=std::string(32,'d');a.name="First game";b.name="Second game";
+    a.origin=b.origin=g_device.origin;a.device=b.device=g_device.id;a.games=a.content=b.games=b.content="Hdd1:\\Content\\0000000000000000";
+    a.body=b.body="{\"release_id\":\"catalog-1\",\"conversion\":\"server\"}";
+    std::vector<Work> selected;selected.push_back(a);selected.push_back(b);
+    assert(QueuePrepared(selected,&error));std::vector<Work> restored;assert(LoadInbox(&restored)&&restored.size()==2);
+    assert(QueuePrepared(selected,&error));assert(LoadInbox(&restored)&&restored.size()==2); // repeated clicks never duplicate
+    assert(StartNextPrepared(&error));Work saved;assert(LoadWork(&saved)&&saved.request==a.request&&saved.inbox);
+    assert(LoadInbox(&restored)&&restored.size()==1&&restored[0].request==b.request);
+    g_used=false;assert(!StartNextPrepared(&error));assert(LoadWork(&saved)&&saved.request==a.request); // reboot's active journal wins
+    assert(!QueuePayload("{}","Other",a.games.c_str(),a.content.c_str(),&error));
+    // Crash after saving JOB but before advancing the inbox: duplicate remains
+    // until the completion receipt atomically removes it, preventing reinstall.
+    restored.insert(restored.begin(),a);assert(SaveInbox(restored));
+    restored.erase(restored.begin());assert(SaveInbox(restored,a.request));assert(FoundryPreparedCompleted(a.request));
+    DeleteFileA(JOB);DeleteFileA((std::string(JOB)+".old").c_str());g_used=false;
+    assert(QueuePrepared(selected,&error));assert(LoadInbox(&restored)&&restored.size()==1);
+    g_device.origin="https://other.example.com";assert(!StartNextPrepared(&error));assert(!QueuePrepared(selected,&error));
+    g_device.origin=a.origin;assert(StartNextPrepared(&error));assert(LoadWork(&saved)&&saved.request==b.request);
+    g_device.id=std::string(32,'f');assert(!CreatePendingRequest(&saved,&error)); // never recreate an inbox request under another pairing
+    g_device.id=a.device;
+    cJSON *reply=cJSON_Parse("{\"items\":[{\"id\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"name\":\"Ready game\",\"state\":\"ready\",\"selection\":{\"release_id\":\"catalog-1\"}},{\"id\":\"ffffffffffffffffffffffffffffffff\",\"state\":\"preparing\"}]}");
+    assert(ReadPrepared(reply,a.games.c_str(),a.content.c_str(),&restored)&&restored.size()==1);cJSON_Delete(reply);
+    assert(!g_device.autoInbox);g_device.autoInbox=true;assert(SaveDevice());g_device=Device();LoadDevice();assert(g_device.autoInbox);
+    SetFoundryInstallPaths("Usb0:\\Games","Usb0:\\Content\\0000000000000000");assert(g_defaultGames=="Usb0:\\Games");
+}
 int main()
 {
-    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();AggregateProgress();CatalogCache();CatalogTransport();MultiDiscReplacement();
-    std::cout<<"Real client runtime: interrupted transfers, in-piece resume, lost POST/reboot idempotency, cross-server guard, GoD/Cache TU power cuts and shared-volume space checks passed\n";
+    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();AggregateProgress();CatalogCache();CatalogTransport();MultiDiscReplacement();PreparedInbox();
+    std::cout<<"Real client runtime: interrupted transfers, in-piece resume, lost POST/reboot idempotency, cross-server guard, GoD/Cache TU power cuts, shared-volume space and durable prepared-inbox checks passed\n";
 }

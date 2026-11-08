@@ -1,5 +1,7 @@
 # Foundry console activity
 
+Use [Prepare for Xbox](PREPARED-FOR-XBOX.md) to schedule downloads while the console is off.
+
 Open `/consoles` on the Foundry website to see paired consoles and installation
 requests. The page refreshes every five seconds while visible. Filter by console
 or page through older requests; expand **Sources & preparation** for exact source

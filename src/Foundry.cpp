@@ -2,6 +2,8 @@
 #include "Foundry.h"
 #include "FoundryProtocol.h"
 #include "ContentWriteLock.h"
+#include "GameInstaller.h"
+#include "DiscWorker.h"
 #include "GameListUI.h"
 #include "Keyboard.h"
 #include "downloadFile.h"
@@ -32,6 +34,7 @@ static const char *API="/api/console/v1";
 static const char *DEVICE="game:\\FoundryDevice.json";
 static const char *JOB="game:\\FoundryJob.json";
 static const char *TXN="game:\\FoundryTxn.json";
+static const char *INBOX="game:\\FoundryInbox.json";
 static const unsigned long long PIECE=32ULL*1024*1024;
 static const int JOB_ID=3000000;
 
@@ -39,11 +42,14 @@ struct Device
 {
     std::string origin, token, id, mode;
     unsigned long long sequence;
-    Device():origin("https://iso2god.mediahub.stream"),mode("server"),sequence(0){}
+    bool autoInbox;
+    Device():origin("https://iso2god.mediahub.stream"),mode("server"),sequence(0),autoInbox(false){}
 };
 struct Work
 {
     std::string request, name, games, content, body, key, origin, device;
+    bool inbox;
+    Work():inbox(false){}
 };
 struct Move
 {
@@ -62,6 +68,7 @@ static unsigned long long g_transferJobDone=0,g_transferJobTotal=0;
 static DWORD g_conversionStarted=0;
 static unsigned g_transferFile=0,g_transferFiles=0;
 static std::string g_transferName;
+static std::string g_defaultGames,g_defaultContent;
 struct StoreCacheEntry { std::string key,json;DWORD fetched,used; };
 static std::vector<StoreCacheEntry> g_storeCache;
 static size_t g_storeCacheBytes=0;
@@ -144,6 +151,7 @@ static bool SaveDevice()
     cJSON_AddStringToObject(o,"origin",g_device.origin.c_str()); cJSON_AddStringToObject(o,"token",g_device.token.c_str());
     cJSON_AddStringToObject(o,"id",g_device.id.c_str()); cJSON_AddStringToObject(o,"mode",g_device.mode.c_str());
     cJSON_AddStringToObject(o,"sequence",Decimal(g_device.sequence).c_str());
+    cJSON_AddBoolToObject(o,"auto_inbox",g_device.autoInbox);
     bool ok=WriteJson(DEVICE,o); cJSON_Delete(o); return ok;
 }
 static void LoadDevice()
@@ -154,7 +162,7 @@ static void LoadDevice()
     if(token.size()>=40 && token.size()<100 && token.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")==std::string::npos && FoundryHex(id,32))
     { g_device.token=token;g_device.id=id; }
     if(mode=="console"||mode=="server") g_device.mode=mode;
-    FoundryDecimal(Text(o,"sequence").c_str(),&g_device.sequence); cJSON_Delete(o);
+    FoundryDecimal(Text(o,"sequence").c_str(),&g_device.sequence);g_device.autoInbox=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o,"auto_inbox")); cJSON_Delete(o);
 }
 static Device DeviceCopy() { EnterCriticalSection(&g_lock);Device d=g_device;LeaveCriticalSection(&g_lock);return d; }
 static void Phase(const char *name,float fraction=-1.0f,unsigned long long done=0,unsigned long long total=0)
@@ -725,7 +733,7 @@ static bool SaveWork(const Work &w)
     cJSON *o=cJSON_CreateObject();cJSON_AddStringToObject(o,"request",w.request.c_str());cJSON_AddStringToObject(o,"name",w.name.c_str());
     cJSON_AddStringToObject(o,"games",w.games.c_str());cJSON_AddStringToObject(o,"content",w.content.c_str());
     cJSON_AddStringToObject(o,"body",w.body.c_str());cJSON_AddStringToObject(o,"key",w.key.c_str());
-    cJSON_AddStringToObject(o,"origin",w.origin.c_str());cJSON_AddStringToObject(o,"device",w.device.c_str());
+    cJSON_AddStringToObject(o,"origin",w.origin.c_str());cJSON_AddStringToObject(o,"device",w.device.c_str());cJSON_AddBoolToObject(o,"inbox",w.inbox);
     bool ok=WriteJson(JOB,o);cJSON_Delete(o);return ok;
 }
 static bool RememberWork(const Work &w,std::string *error)
@@ -744,7 +752,7 @@ static bool LoadWork(Work *w)
 {
     cJSON *o=ReadJson(JOB,256*1024);if(!o)return false;
     w->request=Text(o,"request");w->name=Text(o,"name");w->games=Text(o,"games");w->content=Text(o,"content");
-    w->body=Text(o,"body");w->key=Text(o,"key");w->origin=Text(o,"origin");w->device=Text(o,"device");cJSON_Delete(o);
+    w->body=Text(o,"body");w->key=Text(o,"key");w->origin=Text(o,"origin");w->device=Text(o,"device");w->inbox=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o,"inbox"));cJSON_Delete(o);
     bool pending=w->request.empty()&&!w->body.empty()&&w->body.size()<=65536&&!w->key.empty();
     if(!w->key.empty()&&(w->key.size()<16||w->key.size()>96||w->key.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")!=std::string::npos))return false;
     return (pending||FoundryHex(w->request,32))&&RootValid(w->games)&&RootValid(w->content)
@@ -757,7 +765,7 @@ static bool CreatePendingRequest(Work *w,std::string *error)
     if(!w->origin.empty()&&w->origin!=d.origin){*error="Select the original Foundry server before resuming this job";return false;}
     if(!w->device.empty()&&w->device!=d.id)
     {
-        if(w->body.empty()){*error="This legacy job belongs to the old pairing; choose the game again";return false;}
+        if(w->inbox||w->body.empty()){*error="This saved job belongs to the original pairing; discard it before choosing a new request";return false;}
         w->request.clear();w->key.clear();
     }
     if(w->origin.empty()||w->device.empty()){w->origin=d.origin;w->device=d.id;if(!RememberWork(*w,error))return false;}
@@ -786,21 +794,115 @@ static void InitSnap(const Work &w)
 }
 static bool QueuePayload(const char *body,const std::string &name,const char *games,const char *content,std::string *error)
 {
-    EnterCriticalSection(&g_lock);bool active=g_used&&g_snap.state!=QUEUE_FINISHED;LeaveCriticalSection(&g_lock);
-    if(active){*error="A Foundry installation is already active";return false;}
+    EnterCriticalSection(&g_lock);bool active=g_used&&g_snap.state!=QUEUE_FINISHED;
+    if(active||Exists(JOB)){*error=active?"A Foundry installation is already active":"Resume or discard the interrupted Foundry job first";LeaveCriticalSection(&g_lock);return false;}
     Work w;w.body=body?body:"";w.name=name;w.games=games;w.content=content;
-    if(w.body.empty()||w.body.size()>65536||!RootValid(w.games)||!RootValid(w.content)){*error="Invalid install selection or destination";return false;}
-    Device d=DeviceCopy();if(d.token.empty()||!FoundryHex(d.id,32)){*error="Pair this console first";return false;}
-    if(!NewRequestKey(&w,error))return false; // Persist body/key before any network request.
-    InterlockedExchange(&g_storePrefetchCancel,1);
-    EnterCriticalSection(&g_lock);InitSnap(w);InterlockedExchange(&g_cancel,0);g_pending=true;LeaveCriticalSection(&g_lock);SetEvent(g_wake);return true;
+    if(w.body.empty()||w.body.size()>65536||!RootValid(w.games)||!RootValid(w.content)){*error="Invalid install selection or destination";LeaveCriticalSection(&g_lock);return false;}
+    Device d=g_device;if(d.token.empty()||!FoundryHex(d.id,32)){*error="Pair this console first";LeaveCriticalSection(&g_lock);return false;}
+    if(!NewRequestKey(&w,error)){LeaveCriticalSection(&g_lock);return false;}
+    InterlockedExchange(&g_storePrefetchCancel,1);InitSnap(w);InterlockedExchange(&g_cancel,0);g_pending=true;
+    LeaveCriticalSection(&g_lock);SetEvent(g_wake);return true;
 }
+
+// The inbox list is separate from FoundryJob.json. Persist the active job before
+// removing its list entry, so power loss cannot lose a selected download.
+static bool SaveInbox(const std::vector<Work> &queue,const std::string &completed=std::string())
+{
+    cJSON *previous=ReadJson(INBOX,3*1024*1024);const cJSON *oldDone=cJSON_GetObjectItemCaseSensitive(previous,"completed");
+    cJSON *done=cJSON_IsArray(oldDone)?cJSON_Duplicate(oldDone,1):cJSON_CreateArray();cJSON_Delete(previous);
+    if(!completed.empty()){bool found=false;for(int i=0;i<cJSON_GetArraySize(done);++i){const cJSON *v=cJSON_GetArrayItem(done,i);found|=cJSON_IsString(v)&&completed==v->valuestring;}if(!found)cJSON_AddItemToArray(done,cJSON_CreateString(completed.c_str()));}
+    while(cJSON_GetArraySize(done)>256)cJSON_DeleteItemFromArray(done,0);
+    cJSON *o=cJSON_CreateObject(),*rows=cJSON_AddArrayToObject(o,"items");
+    for(size_t i=0;i<queue.size();++i){const Work &w=queue[i];cJSON *v=cJSON_CreateObject();
+        cJSON_AddStringToObject(v,"request",w.request.c_str());cJSON_AddStringToObject(v,"name",w.name.c_str());
+        cJSON_AddStringToObject(v,"games",w.games.c_str());cJSON_AddStringToObject(v,"content",w.content.c_str());
+        cJSON_AddStringToObject(v,"body",w.body.c_str());cJSON_AddStringToObject(v,"origin",w.origin.c_str());cJSON_AddStringToObject(v,"device",w.device.c_str());cJSON_AddItemToArray(rows,v);}
+    cJSON_AddItemToObject(o,"completed",done);bool ok=WriteJson(INBOX,o);cJSON_Delete(o);return ok;
+}
+static bool LoadInbox(std::vector<Work> *queue)
+{
+    queue->clear();if(!Exists(INBOX)&&!Exists((std::string(INBOX)+".old")))return true;
+    cJSON *o=ReadJson(INBOX,3*1024*1024);if(!o)return false;
+    const cJSON *rows=cJSON_GetObjectItemCaseSensitive(o,"items");bool ok=cJSON_IsArray(rows)&&cJSON_GetArraySize(rows)<=32;
+    for(int i=0;ok&&i<cJSON_GetArraySize(rows);++i){const cJSON *v=cJSON_GetArrayItem(rows,i);Work w;w.inbox=true;
+        w.request=Text(v,"request");w.name=Text(v,"name");w.games=Text(v,"games");w.content=Text(v,"content");w.body=Text(v,"body");w.origin=Text(v,"origin");w.device=Text(v,"device");
+        ok=FoundryHex(w.request,32)&&FoundryHex(w.device,32)&&FoundryOrigin(w.origin)&&RootValid(w.games)&&RootValid(w.content)&&w.name.size()<=512&&w.body.size()<=65536;
+        for(size_t j=0;ok&&j<queue->size();++j)ok=(*queue)[j].request!=w.request;
+        if(ok)queue->push_back(w);}
+    cJSON_Delete(o);if(!ok)queue->clear();return ok;
+}
+bool FoundryPreparedCompleted(const std::string &id)
+{
+    EnterCriticalSection(&g_lock);cJSON *o=ReadJson(INBOX,3*1024*1024);const cJSON *a=cJSON_GetObjectItemCaseSensitive(o,"completed");bool found=false;
+    for(int i=0;cJSON_IsArray(a)&&i<cJSON_GetArraySize(a)&&i<256;++i){const cJSON *v=cJSON_GetArrayItem(a,i);found|=cJSON_IsString(v)&&id==v->valuestring;}
+    cJSON_Delete(o);LeaveCriticalSection(&g_lock);return found;
+}
+static bool QueuePrepared(const std::vector<Work> &incoming,std::string *error)
+{
+    Device d=DeviceCopy();EnterCriticalSection(&g_lock);std::vector<Work> queue;bool ok=LoadInbox(&queue);
+    if(!ok)*error="Saved prepared list needs review; clear it in Prepared for Xbox";
+    for(size_t i=0;ok&&i<incoming.size();++i){const Work &w=incoming[i];
+        if(!FoundryHex(w.request,32)||w.origin!=d.origin||w.device!=d.id||!RootValid(w.games)||!RootValid(w.content)||w.body.size()>65536){*error="Prepared request or destination is invalid";ok=false;break;}
+        bool duplicate=FoundryPreparedCompleted(w.request)||(Exists(JOB)&&g_work.request==w.request);
+        for(size_t j=0;j<queue.size();++j){if(queue[j].origin!=d.origin||queue[j].device!=d.id){*error="The saved list belongs to another server/pairing; clear it first";ok=false;break;}duplicate|=queue[j].request==w.request;}
+        if(ok&&!duplicate){if(queue.size()>=32){*error="The saved prepared list is full (32 items)";ok=false;}else queue.push_back(w);}}
+    if(ok&&!SaveInbox(queue)){*error="Could not save the prepared download list";ok=false;}
+    LeaveCriticalSection(&g_lock);if(ok)SetEvent(g_wake);return ok;
+}
+static bool StartNextPrepared(std::string *error)
+{
+    EnterCriticalSection(&g_lock);
+    if(Exists(JOB)||(g_used&&(g_snap.state!=QUEUE_FINISHED||!g_delivered))){LeaveCriticalSection(&g_lock);return false;}
+    std::vector<Work> queue;bool ok=LoadInbox(&queue);if(!ok||queue.empty()){LeaveCriticalSection(&g_lock);return false;}
+    Work w=queue[0];Device d=g_device;
+    if(w.origin!=d.origin||w.device!=d.id||d.token.empty()){*error="Prepared list belongs to another server/pairing";LeaveCriticalSection(&g_lock);return false;}
+    ok=RememberWork(w,error);
+    if(ok){queue.erase(queue.begin());SaveInbox(queue); /* JOB is already durable; completion also removes any duplicate entry. */}
+    if(ok){InitSnap(w);g_pending=true;InterlockedExchange(&g_cancel,0);}
+    LeaveCriticalSection(&g_lock);return ok;
+}
+static bool ReadPrepared(const cJSON *reply,const char *games,const char *content,std::vector<Work> *ready,const Device *owner=NULL)
+{
+    ready->clear();Device d=owner?*owner:DeviceCopy();const cJSON *rows=cJSON_GetObjectItemCaseSensitive(reply,"items");
+    if(!cJSON_IsArray(rows)||cJSON_GetArraySize(rows)>32)return false;
+    for(int i=0;i<cJSON_GetArraySize(rows);++i){const cJSON *v=cJSON_GetArrayItem(rows,i);if(Text(v,"state")!="ready"||FoundryPreparedCompleted(Text(v,"id")))continue;
+        Work w;w.inbox=true;w.request=Text(v,"id");w.name=Text(v,"name");w.games=games;w.content=content;w.origin=d.origin;w.device=d.id;
+        const cJSON *selection=cJSON_GetObjectItemCaseSensitive(v,"selection");if(!FoundryHex(w.request,32)||w.name.empty()||w.name.size()>512||!cJSON_IsObject(selection))return false;
+        char *raw=cJSON_PrintUnformatted(selection);if(!raw)return false;w.body=raw;cJSON_free(raw);if(w.body.size()>65536)return false;ready->push_back(w);}
+    return true;
+}
+
 static DWORD WINAPI Worker(LPVOID)
 {
+    DWORD lastInbox=GetTickCount()-60000;
     while(!InterlockedCompareExchange(&g_stop,0,0))
     {
-        WaitForSingleObject(g_wake,INFINITE);if(g_stop)break;
-        EnterCriticalSection(&g_lock);bool pending=g_pending;g_pending=false;Work w=g_work;g_snap.state=QUEUE_ACTIVE;LeaveCriticalSection(&g_lock);
+        WaitForSingleObject(g_wake,1000);if(g_stop)break;
+        std::string inboxError;
+        StartNextPrepared(&inboxError);
+        Device device=DeviceCopy();
+        EnterCriticalSection(&g_lock);bool idle=!g_pending&&(!g_used||g_snap.state==QUEUE_FINISHED);LeaveCriticalSection(&g_lock);
+        if(idle&&!Exists(JOB)&&!device.token.empty()&&GetTickCount()-lastInbox>=60000)
+        {
+            lastInbox=GetTickCount();cJSON *reply=NULL;
+            if(Call(std::string(API)+"/inbox","",true,&reply,&inboxError,false,"",NULL,1,&device))
+            {
+                // Retry missing success reports from durable local receipts. A
+                // lost report never causes an automatic duplicate installation.
+                const cJSON *rows=cJSON_GetObjectItemCaseSensitive(reply,"items");unsigned retried=0;
+                for(int i=0;cJSON_IsArray(rows)&&i<cJSON_GetArraySize(rows)&&i<32&&retried<8&&!Cancelled();++i){std::string id=Text(cJSON_GetArrayItem(rows,i),"id");
+                    if(FoundryHex(id,32)&&FoundryPreparedCompleted(id)){++retried;cJSON *ack=NULL;std::string ignored,body="{\"event_id\":\""+id+"_installed\",\"outcome\":\"installed\"}";
+                        Call(std::string(API)+"/install-requests/"+id+"/events",body,true,&ack,&ignored,false,"",NULL,1,&device);cJSON_Delete(ack);}}
+                QueueJobSnapshot other[MAX_QUEUE_JOBS];bool busy=false;int count=SnapshotDownloadQueue(other,MAX_QUEUE_JOBS);
+                for(int j=0;j<count;++j)busy|=other[j].state!=QUEUE_FINISHED;
+                count=SnapshotGameJobs(other,MAX_QUEUE_JOBS);for(int j=0;j<count;++j)busy|=other[j].state!=QUEUE_FINISHED;
+                count=SnapshotDiscJobs(other,MAX_QUEUE_JOBS);for(int j=0;j<count;++j)busy|=other[j].state!=QUEUE_FINISHED;
+                EnterCriticalSection(&g_lock);std::string games=g_defaultGames,content=g_defaultContent;bool automatic=g_device.autoInbox;LeaveCriticalSection(&g_lock);
+                std::vector<Work> ready;if(device.autoInbox&&automatic&&!busy&&ReadPrepared(reply,games.c_str(),content.c_str(),&ready,&device)&&!ready.empty())QueuePrepared(ready,&inboxError);
+            }
+            cJSON_Delete(reply);StartNextPrepared(&inboxError);
+        }
+        EnterCriticalSection(&g_lock);bool pending=g_pending;g_pending=false;Work w=g_work;if(pending)g_snap.state=QUEUE_ACTIVE;LeaveCriticalSection(&g_lock);
         if(!pending)continue;g_transferJobDone=g_transferJobTotal=0;g_transferFiles=g_transferFile=0;
         std::string error;bool ok=Recover(&error)&&CreatePendingRequest(&w,&error);std::string aid;
         while(ok&&!Cancelled())
@@ -814,14 +916,21 @@ static DWORD WINAPI Worker(LPVOID)
                 if(cJSON_IsObject(selection)){char *raw=cJSON_PrintUnformatted(selection);if(raw){w.body=raw;cJSON_free(raw);ok=RememberWork(w,&error);}}
             }
             cJSON_Delete(reply);if(!ok)break;
-            if(state=="expired"&&!w.body.empty())
+            if(state=="expired"&&!w.inbox&&!w.body.empty())
             {
                 w.request.clear();w.key.clear();
                 ok=NewRequestKey(&w,&error)&&CreatePendingRequest(&w,&error);
                 continue;
             }
-            if(state=="ready")break;
-            if(state=="failed"||state=="expired"||state=="cancelled"){error=message;ok=false;break;}
+            if(state=="ready"){
+                if(w.inbox){cJSON *ack=NULL;std::string ignored;Call(std::string(API)+"/inbox/"+w.request+"/accept","{}",true,&ack,&ignored,false,"",NULL,1);cJSON_Delete(ack);}
+                break;}
+            if(state=="failed"||state=="expired"||state=="cancelled"){
+                // An expired/deleted immutable snapshot cannot resume. Recovery
+                // has already completed; release only its saved request so a
+                // fresh website preparation can proceed without blocking others.
+                if(w.inbox&&(state=="expired"||state=="cancelled")){DeleteFileA(JOB);DeleteFileA((std::string(JOB)+".old").c_str());}
+                error=message;ok=false;break;}
             Phase(message.c_str());for(int i=0;i<30&&!Cancelled();++i)Sleep(100);
         }
         if(Cancelled()){error="Paused; choose Resume in Foundry";ok=false;}
@@ -837,7 +946,12 @@ static DWORD WINAPI Worker(LPVOID)
         }
         if(ok)
         {
-            DeleteFileA(JOB);DeleteFileA((std::string(JOB)+".old").c_str());
+            bool receipt=true;
+            if(w.inbox){EnterCriticalSection(&g_lock);std::vector<Work> queue;receipt=LoadInbox(&queue);
+                for(size_t i=0;receipt&&i<queue.size();)if(queue[i].request==w.request)queue.erase(queue.begin()+i);else ++i;
+                if(receipt)receipt=SaveInbox(queue,w.request);LeaveCriticalSection(&g_lock);}
+            if(receipt){DeleteFileA(JOB);DeleteFileA((std::string(JOB)+".old").c_str());}
+            else dprintf("[foundry] completed install receipt could not be saved; job retained for recovery\n");
             RemoveTree(Stage(w.games,aid));if(w.content!=w.games)RemoveTree(Stage(w.content,aid));RemoveTree(Stage(Root(w,"cache"),aid));
         }
         // Reports are best effort and never turn a successful local commit into
@@ -852,13 +966,15 @@ static DWORD WINAPI Worker(LPVOID)
 
 bool StartFoundry(const char *gamesRoot,const char *contentRoot)
 {
-    if(g_started)return true;InitializeCriticalSection(&g_lock);LoadDevice();InterlockedExchange(&g_stop,0);InterlockedExchange(&g_cancel,0);
+    if(g_started)return true;g_defaultGames=gamesRoot;g_defaultContent=contentRoot;InitializeCriticalSection(&g_lock);LoadDevice();InterlockedExchange(&g_stop,0);InterlockedExchange(&g_cancel,0);
     std::string recoveryError;if(!Recover(&recoveryError))dprintf("[foundry] recovery required: %s\n",recoveryError.c_str());
     g_wake=CreateEvent(NULL,FALSE,FALSE,NULL);if(!g_wake){DeleteCriticalSection(&g_lock);return false;}
     g_thread=CreateThread(NULL,512*1024,Worker,NULL,CREATE_SUSPENDED,NULL);if(!g_thread){CloseHandle(g_wake);DeleteCriticalSection(&g_lock);return false;}
-    g_started=true;ResumeThread(g_thread);
-    Work w;if(LoadWork(&w)){EnterCriticalSection(&g_lock);g_work=w;InitSnap(w);g_pending=true;LeaveCriticalSection(&g_lock);SetEvent(g_wake);}
-    return true;
+    g_started=true;
+    Work w;if(LoadWork(&w)){
+        if(w.inbox&&recoveryError.empty()&&FoundryPreparedCompleted(w.request)){DeleteFileA(JOB);DeleteFileA((std::string(JOB)+".old").c_str());}
+        else{EnterCriticalSection(&g_lock);g_work=w;InitSnap(w);g_pending=true;LeaveCriticalSection(&g_lock);SetEvent(g_wake);}}
+    ResumeThread(g_thread);return true;
 }
 void StopFoundry(DWORD timeoutMs)
 {
@@ -869,6 +985,11 @@ void StopFoundry(DWORD timeoutMs)
     bool prefetched=!g_storePrefetch||WaitForSingleObject(g_storePrefetch,left)==WAIT_OBJECT_0;
     if(stopped&&prefetched){if(g_storePrefetch){CloseHandle(g_storePrefetch);g_storePrefetch=NULL;}CloseHandle(g_thread);CloseHandle(g_wake);ClearFoundryStoreCache();
         HttpsSessionClose(g_storeSession);g_storeSession=NULL;HttpsSessionClose(g_storePrefetchSession);g_storePrefetchSession=NULL;g_storeSessionOwner.clear();g_storePrefetchOwner.clear();g_started=false;}
+}
+void SetFoundryInstallPaths(const char *games,const char *content)
+{
+    if(!g_started||!games||!content||!RootValid(games)||!RootValid(content))return;
+    EnterCriticalSection(&g_lock);g_defaultGames=games;g_defaultContent=content;LeaveCriticalSection(&g_lock);
 }
 int SnapshotFoundryJobs(QueueJobSnapshot *out,int maximum)
 {if(!g_started||maximum<1)return 0;EnterCriticalSection(&g_lock);int n=g_used?1:0;if(n)*out=g_snap;LeaveCriticalSection(&g_lock);return n;}
@@ -1018,9 +1139,9 @@ void OpenFoundryUI(const char *games,const char *content)
     if(!g_started&&!StartFoundry(games,content)){ShowMessageUI("Foundry","Worker could not start",NULL);return;}
     for(;;)
     {
-        Device d=DeviceCopy();const char *names[]={"Search games","Search XBLA / DLC","Pair this console","Server address","Resume interrupted installation","Forget console token","Title updates for installed games"};
-        const char *subs[]={"Server or Xbox conversion","Install prepared digital content",d.token.empty()?"Not paired":"Paired",d.origin.c_str(),"Checked files are reused","The website can also revoke access","Exact execution ID match, including Xbox-converted games"};
-        int choice=ShowChoiceUI("GOD Foundry","Your server library on the Xbox",names,subs,7,L"Open");if(choice<0)return;
+        Device d=DeviceCopy();const char *names[]={"Search games","Search XBLA / DLC","Pair this console","Server address","Resume interrupted installation","Forget console token","Title updates for installed games","Prepared for Xbox","Discard interrupted job"};
+        const char *subs[]={"Server or Xbox conversion","Install prepared digital content",d.token.empty()?"Not paired":"Paired",d.origin.c_str(),"Checked files are reused","The website can also revoke access","Exact execution ID match, including Xbox-converted games","Downloads chosen on the website","Only when paused; keeps installed games and the prepared list"};
+        int choice=ShowChoiceUI("GOD Foundry","Your server library on the Xbox",names,subs,9,L"Open");if(choice<0)return;
         QueueJobSnapshot activeJob;
         if((choice==2||choice==3||choice==5)&&SnapshotFoundryJobs(&activeJob,1)&&activeJob.state!=QUEUE_FINISHED)
         {ShowMessageUI("Foundry","Pause the installation before changing servers or pairing",NULL);continue;}
@@ -1034,6 +1155,9 @@ void OpenFoundryUI(const char *games,const char *content)
         }
         if(choice==5){if(ShowConfirmUI("Forget Foundry access","This removes the token from this Xbox","Revoke the device on the website to invalidate any copies.","Forget")){EnterCriticalSection(&g_lock);g_device.token.clear();g_device.id.clear();SaveDevice();LeaveCriticalSection(&g_lock);}continue;}
         if(d.token.empty()){PairUI();continue;}
+        if(choice==7){if(OpenFoundryPreparedUI(games,content))return;continue;}
+        if(choice==8){QueueJobSnapshot snap;if(SnapshotFoundryJobs(&snap,1)&&snap.state!=QUEUE_FINISHED){ShowMessageUI("Foundry","Pause the active installation first",NULL);continue;}
+            if(ShowConfirmUI("Discard interrupted job","Stop resuming the saved installation?","Installed games stay. Existing partial downloads are retained.","Discard")){std::string error;if(!Recover(&error)){ShowMessageUI("Recovery required",error.c_str(),NULL);continue;}DeleteFileA(JOB);DeleteFileA((std::string(JOB)+".old").c_str());SetEvent(g_wake);}continue;}
         if(choice==6){OnlineUpdatesUI(games,content);continue;}
         if(choice==4)
         {
@@ -1043,6 +1167,26 @@ void OpenFoundryUI(const char *games,const char *content)
         }
         else BrowseUI(games,content,choice==1);
     }
+}
+
+
+bool FoundryQueuePrepared(const cJSON *reply,const char *games,const char *content,const std::string &only)
+{
+    std::vector<Work> ready;std::string error;
+    if(!ReadPrepared(reply,games,content,&ready)){ShowMessageUI("Prepared for Xbox","The server returned an invalid prepared list",NULL);return false;}
+    if(!only.empty()){for(size_t i=0;i<ready.size();){if(ready[i].request!=only)ready.erase(ready.begin()+i);else ++i;}}
+    if(ready.empty()){ShowMessageUI("Prepared for Xbox","No new ready downloads in this selection",NULL);return false;}
+    if(!QueuePrepared(ready,&error)){ShowMessageUI("Not queued",error.c_str(),NULL);return false;}
+    ShowMessageUI("Saved to download list",Exists(JOB)?"The current installation resumes first; selected items follow":"Selected items will install one at a time","Open Queue for the current download. The saved list survives a restart.");return true;
+}
+void FoundryPreparedOptionsUI()
+{
+    const char *names[]={DeviceCopy().autoInbox?"Automatic downloads: ON":"Automatic downloads: OFF","Clear pending download list"};
+    const char *subs[]={"Download ready website requests when Omni360 is open and idle","Keeps the active/interrupted installation and server copies"};
+    int pick=ShowChoiceUI("Prepared download settings","Manual download is the default",names,subs,2,L"Choose");
+    if(pick==0){EnterCriticalSection(&g_lock);g_device.autoInbox=!g_device.autoInbox;if(!SaveDevice()){g_device.autoInbox=!g_device.autoInbox;ShowMessageUI("Settings","Could not save automatic-download preference",NULL);}LeaveCriticalSection(&g_lock);SetEvent(g_wake);}
+    else if(pick==1&&ShowConfirmUI("Clear pending list","Remove selections waiting on this Xbox?","Active jobs and server-prepared files stay. Automatic downloads can add ready items again.","Clear"))
+    {EnterCriticalSection(&g_lock);std::vector<Work> empty;bool ok=SaveInbox(empty);LeaveCriticalSection(&g_lock);if(!ok)ShowMessageUI("Prepared for Xbox","Could not clear the saved list",NULL);}
 }
 
 bool FoundryStoreRequest(const std::string &path,cJSON **reply)

@@ -21,7 +21,7 @@ import zipfile
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
-from flask import Blueprint, Response, g, jsonify, request, send_file
+from flask import Blueprint, Response, g, jsonify, request, send_file, render_template
 
 from db import Database, normalize_search_text, utc_now
 from formats import CONTENT_ARCADE, CONTENT_DLC, CONTENT_GOD, CONTENT_TITLE_UPDATE, is_cache_title_update, parse_stfs_header
@@ -112,6 +112,9 @@ class ConsoleService:
                     request_id TEXT PRIMARY KEY REFERENCES console_requests(id) ON DELETE CASCADE,
                     filename TEXT NOT NULL, file_index INTEGER NOT NULL, file_count INTEGER NOT NULL,
                     archive INTEGER NOT NULL, requested_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS console_inbox(
+                    request_id TEXT PRIMARY KEY REFERENCES console_requests(id) ON DELETE CASCADE,
+                    accepted_at TEXT);
             """)
             if 'hidden' not in {r['name'] for r in c.execute('PRAGMA table_info(console_devices)')}:
                 c.execute('ALTER TABLE console_devices ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0')
@@ -310,7 +313,9 @@ class ConsoleService:
     def public_component(component):
         return {k: v for k, v in component.items() if not k.startswith("_")}
 
-    def create_request(self, payload, idem):
+    def create_request(self, payload, idem, device_id=None, inbox=False):
+        if payload.get('kind') is not None and not isinstance(payload['kind'], str):
+            raise ConsoleError('INVALID_REQUEST', 'Invalid install request kind')
         if set(payload) - {"release_id", "release_ids", "conversion", "component_ids", "unlock_packages", "kind", "game_identity", "for_title_id"}:
             raise ConsoleError("INVALID_REQUEST", "Unknown installation option")
         identity = None
@@ -387,9 +392,13 @@ class ConsoleService:
                 raise ConsoleError("INVALID_REQUEST", "Title updates are prepared on the server")
             normalized.update(kind="title_update", game_identity=identity, unlock_packages=False)
         encoded = json_bytes(normalized).decode()
-        device = g.console_device["id"]
+        device = device_id if device_id is not None else g.console_device["id"]
         with self.connect() as c:
             c.execute("BEGIN IMMEDIATE")
+            if device_id is not None:
+                target = c.execute('SELECT revoked,hidden FROM console_devices WHERE id=?', (device,)).fetchone()
+                if not target or target['revoked'] or target['hidden']:
+                    raise ConsoleError('DEVICE_REVOKED', 'Choose an active paired console', 409)
             old = c.execute("SELECT * FROM console_requests WHERE device_id=? AND idem=?", (device, idem)).fetchone()
             if old:
                 if "unlock_packages" not in payload and not identity:
@@ -400,13 +409,19 @@ class ConsoleService:
                 if old["payload"] != encoded:
                     raise ConsoleError("IDEMPOTENCY_CONFLICT", "Request key was already used with different options", 409)
                 return dict(old)
+            if inbox:
+                old = c.execute("SELECT r.* FROM console_requests r JOIN console_inbox i ON i.request_id=r.id WHERE r.device_id=? AND r.payload=? AND r.state IN ('queued','waiting','preparing','ready') AND (r.state!='ready' OR EXISTS (SELECT 1 FROM console_artifacts a WHERE a.id=r.artifact_id AND a.expires>?)) AND NOT EXISTS (SELECT 1 FROM console_events e WHERE e.request_id=r.id AND json_extract(e.payload,'$.outcome')='installed') LIMIT 1", (device, encoded, time.time())).fetchone()
+                if old: return dict(old)
+                count = c.execute("SELECT count(*) FROM console_requests r JOIN console_inbox i ON i.request_id=r.id WHERE r.device_id=? AND r.state IN ('queued','waiting','preparing','ready') AND (r.state!='ready' OR EXISTS (SELECT 1 FROM console_artifacts a WHERE a.id=r.artifact_id AND a.expires>?)) AND NOT EXISTS (SELECT 1 FROM console_events e WHERE e.request_id=r.id AND json_extract(e.payload,'$.outcome')='installed')", (device, time.time())).fetchone()[0]
+                if count >= 32: raise ConsoleError('QUEUE_FULL', 'Install or remove some of the 32 prepared requests first', 429)
             active = c.execute("SELECT count(*) FROM console_requests WHERE state IN ('queued','waiting','preparing') AND device_id=?", (device,)).fetchone()[0]
             total = c.execute("SELECT count(*) FROM console_requests WHERE state IN ('queued','waiting','preparing')").fetchone()[0]
-            if active >= 2 or total >= 8:
+            if active >= (32 if inbox else 2) or total >= (64 if inbox else 8):
                 raise ConsoleError("QUEUE_FULL", "Wait for an active preparation to finish", 429)
             rid, now = secrets.token_hex(16), utc_now()
             c.execute("INSERT INTO console_requests(id,device_id,idem,payload,state,message,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                       (rid, device, idem, encoded, "queued", "Waiting for preparation", now, now))
+            if inbox: c.execute('INSERT INTO console_inbox(request_id) VALUES(?)', (rid,))
             c.commit()
         self.wake.set()
         return self.get_request(rid, device)
@@ -425,7 +440,7 @@ class ConsoleService:
         result["selection"] = json.loads(row["payload"])
         result["progress"] = 0
         with self.connect() as c:
-            event = c.execute("SELECT payload FROM console_events WHERE request_id=? ORDER BY created_at DESC LIMIT 1", (row["id"],)).fetchone()
+            event = c.execute("SELECT payload FROM console_events WHERE request_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1", (row["id"],)).fetchone()
             if row["state"] == "ready":
                 artifact = c.execute("SELECT expires FROM console_artifacts WHERE id=?", (row["artifact_id"],)).fetchone()
                 if artifact is None or artifact[0] < time.time():
@@ -464,8 +479,9 @@ class ConsoleService:
         with self.connect() as c:
             links = c.execute('SELECT release_id,job_id FROM console_request_sources WHERE request_id=?', (row['id'],)).fetchall()
             artifact = c.execute('SELECT bytes,expires FROM console_artifacts WHERE id=?', (row['artifact_id'],)).fetchone()
+            inbox = c.execute('SELECT accepted_at FROM console_inbox WHERE request_id=?', (row['id'],)).fetchone()
             transfer = c.execute('SELECT * FROM console_transfers WHERE request_id=?', (row['id'],)).fetchone()
-            event = c.execute('SELECT created_at FROM console_events WHERE request_id=? ORDER BY created_at DESC LIMIT 1', (row['id'],)).fetchone()
+            event = c.execute('SELECT created_at FROM console_events WHERE request_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1', (row['id'],)).fetchone()
         jobs = []
         for link in links or ([{'release_id': selection.get('release_id'), 'job_id': row['job_id']}] if row['job_id'] else []):
             job = self.database.get_job(link['job_id'])
@@ -479,8 +495,22 @@ class ConsoleService:
                       download_available=bool(artifact and artifact['expires'] > time.time()),
                       can_delete=bool(artifact and row['state'] not in {'queued', 'waiting', 'preparing'}),
                       transfer=dict(transfer) if transfer else None,
+                      inbox=inbox is not None, accepted_at=inbox['accepted_at'] if inbox else None,
+                      expires_at=artifact['expires'] if artifact else None,
                       reported_at=event['created_at'] if event else None)
         return result
+
+    def inbox_view(self, device):
+        with self.connect() as c:
+            rows = c.execute("SELECT r.* FROM console_requests r JOIN console_inbox i ON i.request_id=r.id WHERE r.device_id=? AND r.state!='cancelled' AND NOT EXISTS (SELECT 1 FROM console_events e WHERE e.request_id=r.id AND json_extract(e.payload,'$.outcome')='installed') ORDER BY r.state NOT IN ('ready','queued','waiting','preparing'),r.created_at DESC,r.id DESC LIMIT 32", (device,)).fetchall()
+        self.browser.refresh()
+        artwork = {r['release_id']: group['art_title_id'] for group in self.browser.groups for r in group['_releases']}
+        items = []
+        for row in rows:
+            view = self.admin_request_view(dict(row), None)
+            items.append({k: view[k] for k in ('id','name','state','message','error_code','conversion','selection','progress','expires_at','accepted_at')})
+            items[-1].update(bytes=str(view['prepared_bytes']), art_title_id=artwork.get(view['selection'].get('release_id')))
+        return {'items': items, 'limit': 32, 'retention_days': self.retention // 86400}
 
     def delete_request_files(self, rid):
         # Only prepared console snapshots are in scope. Shared library outputs,
@@ -1004,7 +1034,8 @@ def register_console_api(app, config, database, runner, remote, start_background
                        manifest_limit_bytes="1048576", max_page_size=50, max_components=100,
                        max_file_bytes=str(MAX_FILE), checksums=["sha256"], pairing=True,
                        online_title_updates=config.xboxunity_tu_downloads, store_browsing=True, dlc_multi_select=True, max_dlc_sources=32,
-                       disc_multi_select=True, max_disc_sources=8, disc_set_conversion="server")
+                       disc_multi_select=True, max_disc_sources=8, disc_set_conversion="server",
+                       prepared_inbox=True, max_inbox_items=32)
 
     @api.post("/pairings")
     def pair():
@@ -1109,6 +1140,23 @@ def register_console_api(app, config, database, runner, remote, start_background
         service.scope("install:create")
         return jsonify(service.request_view(service.get_request(rid, g.console_device["id"])))
 
+    @api.get('/inbox')
+    def inbox():
+        service.scope('install:create')
+        return jsonify(service.inbox_view(g.console_device['id']))
+
+    @api.post('/inbox/<rid>/accept')
+    def accept_inbox(rid):
+        service.scope('install:create')
+        row = service.get_request(rid, g.console_device['id'])
+        if service.request_view(row)['state'] != 'ready':
+            raise ConsoleError('NOT_READY', 'This prepared request is not ready; refresh the list', 409)
+        with service.connect() as c:
+            found = c.execute('SELECT request_id FROM console_inbox WHERE request_id=?', (rid,)).fetchone()
+            if not found: raise ConsoleError('NOT_FOUND', 'Prepared request not found', 404)
+            c.execute('UPDATE console_inbox SET accepted_at=coalesce(accepted_at,?) WHERE request_id=?', (utc_now(), rid))
+        return jsonify(accepted=True)
+
     @api.post("/install-requests/<rid>/events")
     def event(rid):
         service.scope("install:report")
@@ -1194,6 +1242,40 @@ def register_console_api(app, config, database, runner, remote, start_background
                            next_cursor=str(offset+50) if offset+50 < total else None, previous_cursor=str(max(0,offset-50)) if offset else None)
         response.headers['Cache-Control'] = 'private, no-store'
         return response
+
+    @app.get('/consoles/prepare')
+    def prepare_console_page():
+        return render_template('prepare.html')
+
+    @app.get('/api/consoles/catalog')
+    def prepare_catalog():
+        kind = request.args.get('kind', 'game')
+        if kind not in {'game', 'digital'}: raise ConsoleError('INVALID_REQUEST', 'Invalid source category')
+        offset = browse_page()
+        category = "(source_kind='digital' OR lower(name) LIKE '%(addon)%' OR lower(name) LIKE '%(dlc)%')" if kind == 'digital' else "(source_kind='disc' AND lower(name) NOT LIKE '%(addon)%' AND lower(name) NOT LIKE '%(dlc)%')"
+        terms = normalize_search_text(request.args.get('q', '')[:120]).split()
+        filters = ''.join(' AND search_text LIKE ?' for _ in terms)
+        with service.connect() as c:
+            rows = c.execute('SELECT * FROM catalog_items WHERE '+category+filters+' ORDER BY name,id LIMIT 31 OFFSET ?', (*['%'+t+'%' for t in terms], offset)).fetchall()
+        return jsonify(items=[service.summary(dict(r)) for r in rows[:30]], next_cursor=str(offset+30) if len(rows)>30 else None,
+                       previous_cursor=str(max(0,offset-30)) if offset else None)
+
+    @app.get('/api/consoles/releases/<release>')
+    def prepare_release(release):
+        item = service.item(release)
+        return jsonify(**service.summary(item), disc_set=browser.disc_plan(release) if item['source_kind']=='disc' and not is_addon_source(item['name']) else None)
+
+    @app.post('/api/consoles/<device>/prepare')
+    def prepare_for_console(device):
+        value = payload()
+        idem = value.get('request_key', '')
+        if not isinstance(idem, str) or not re.fullmatch(r'[A-Za-z0-9_-]{16,96}', idem):
+            raise ConsoleError('INVALID_REQUEST', 'A unique request key is required')
+        selection = value.get('selection')
+        if not isinstance(selection, dict) or selection.get('kind') == 'title_update':
+            raise ConsoleError('INVALID_REQUEST', 'Select a game or add-on; choose exact title updates on the Xbox')
+        result = service.create_request(selection, idem, device_id=device, inbox=True)
+        return jsonify(service.admin_request_view(result, None))
 
     @app.post('/api/consoles/requests/<rid>/delete-files')
     def delete_console_files(rid):

@@ -9,9 +9,14 @@ struct cJSON;
 // Foundry is independent of the Archive.org catalog and credentials.
 bool StartFoundry(const char *gamesRoot, const char *contentRoot);
 void StopFoundry(DWORD timeoutMs);
+void SetFoundryInstallPaths(const char *gamesRoot, const char *contentRoot);
 void OpenFoundryUI(const char *gamesRoot, const char *contentRoot);
 // The main Store uses the same visual renderers as the original provider.
 bool OpenFoundryStoreUI(const char *gamesRoot, const char *contentRoot); // true: open Queue
+bool OpenFoundryPreparedUI(const char *gamesRoot, const char *contentRoot);
+bool FoundryQueuePrepared(const cJSON *reply, const char *gamesRoot, const char *contentRoot, const std::string &only=std::string());
+bool FoundryPreparedCompleted(const std::string &requestId);
+void FoundryPreparedOptionsUI();
 bool OpenFoundryDlcUI(const char *gamesRoot, const char *contentRoot, const char *name, unsigned long titleId);
 void OpenFoundryUpdatesUI(const char *gamesRoot, const char *contentRoot, unsigned long titleId);
 void FoundryInstallDlcBatch(const std::vector<std::string> &releases, const std::string &name,

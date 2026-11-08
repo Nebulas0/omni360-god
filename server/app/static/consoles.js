@@ -65,6 +65,7 @@ function renderRequest(request, expanded) {
   heading.append(el("p", "eyebrow", request.console_name), el("h3", "", request.name));
   top.append(heading, el("span", `status-chip ${installed ? "success" : failed ? "warning" : ""}`, status)); card.append(top);
   card.append(el("p", "request-meta", `${request.conversion === "server" ? "Server preparation" : "ISO download · convert on Xbox"} · Requested ${date(request.created_at)}`));
+  if(request.inbox)card.append(el("p","muted",`Prepared for Xbox inbox${request.accepted_at?" · accepted by Xbox":" · waiting for Xbox"}${request.expires_at?` · expires ${date(new Date(request.expires_at*1000).toISOString())}`:""}`));
   const progress = el("div", "activity-box");
   if (preparing) {
     const bar = el("progress"); bar.max = 100; if (request.jobs.length) bar.value = request.progress;
@@ -89,6 +90,7 @@ function renderRequest(request, expanded) {
   footer.append(el("span", "muted", request.prepared_bytes ? `${bytes(request.prepared_bytes)} · prepared server copy` : "No prepared server download stored"));
   if (request.can_delete) footer.append(action("Delete download files", `/api/consoles/requests/${request.id}/delete-files`, {confirm: true},
     `Delete ${bytes(request.prepared_bytes)} of prepared SERVER download files for ${request.name}?\n\nAn unfinished Xbox download may stop and need to be requested again. Shared library games, original source archives, and games installed on your Xbox will remain.`, "Prepared server download deleted.", true));
+  if(request.inbox&&["expired","failed","cancelled"].includes(request.state))footer.append(action("Prepare again",`/api/consoles/${request.device_id}/prepare`,{selection:request.selection,request_key:"web_"+crypto.randomUUID().replaceAll("-","")},null,"Fresh preparation requested."));
   card.append(footer); return card;
 }
 async function load(force = false) {

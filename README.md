@@ -28,6 +28,9 @@ Physical-console acceptance is still required.
 - Source versions scroll their focused name; **Y** opens the full filename.
 - Recent catalog pages are cached, with background preloading to reduce waits.
 - Pair on your Foundry website at `/consoles`.
+- [Prepare games on the website while the Xbox is off](docs/PREPARED-FOR-XBOX.md),
+  then use **Store → Prepared for Xbox** to download individual items or all ready
+  items. Selections survive restart; automatic downloading is optional.
 - Choose server or Xbox conversion for disc games; digital content uses server
   processing. DLC and title updates are selected explicitly.
 - [Maintenance README: our changes and how to merge future official Omni360 updates](docs/MAINTAINING-THE-FOUNDRY-FORK.md)
