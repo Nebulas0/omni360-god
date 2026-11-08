@@ -295,8 +295,25 @@ static void CatalogTransport()
     assert(Call(std::string(API)+"/install-requests",w.body,true,&reply,&error,false,w.key,NULL,1,NULL,NULL,&session,&owner));cJSON_Delete(reply);
     assert(sessionGets==gets+3&&session==NULL);
 }
+static void MultiDiscReplacement()
+{
+    for(int cut=0;cut<2;++cut)
+    {
+        Case(cut?"multi-disc-rollback":"multi-disc-replacement");Work w;w.games=w.content="Hdd1:\\Content\\0000000000000000";
+        FoundryManifest m;m.id=std::string(32,'d');FoundryComponent c;c.kind="god";c.titleId="415607E1";c.mediaId="12345678";c.discNumber=2;c.discCount=2;
+        FoundryFile f;f.path="415607E1/00007000/new-disc2";f.role="header";c.files.push_back(f);m.components.push_back(c);
+        std::string first=w.games+"\\415607E1\\00007000\\disc1",second=w.games+"\\415607E1\\00007000\\disc2",replacement=w.games+"\\415607E1\\00007000\\new-disc2";
+        std::string h1=Header(),h2=Header();h1[0x366]=1;h2[0x366]=2;h1[0x367]=h2[0x367]=2;
+        Put(first,h1);Put(first+".data\\Data0000","KEEP DISC 1");Put(second,h2);Put(second+".data\\Data0000","OLD DISC 2");
+        std::string staged=Stage(w.games,m.id)+"\\files\\415607E1\\00007000\\new-disc2";Put(staged,h2);Put(staged+".data\\Data0000","NEW DISC 2");
+        std::string error;crashAfterMove=cut?2:-1;
+        try{assert(Commit(w,m,&error));assert(!cut);}catch(const PowerLoss&){assert(cut);}
+        crashAfterMove=-1;if(cut){assert(Recover(&error));assert(Get(second)==h2&&!Exists(replacement));}else assert(Get(replacement)==h2&&!Exists(second));
+        assert(Get(first)==h1&&Get(first+".data\\Data0000")=="KEEP DISC 1");
+    }
+}
 int main()
 {
-    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();AggregateProgress();CatalogCache();CatalogTransport();
+    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();AggregateProgress();CatalogCache();CatalogTransport();MultiDiscReplacement();
     std::cout<<"Real client runtime: interrupted transfers, in-piece resume, lost POST/reboot idempotency, cross-server guard, GoD/Cache TU power cuts and shared-volume space checks passed\n";
 }

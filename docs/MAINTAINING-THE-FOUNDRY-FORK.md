@@ -88,6 +88,16 @@ credentials must continue to work when merging official UI or installer changes.
   identical destination packages and rejects conflicting copies before publishing
   one manifest. Manifests support at most 100 components. Never silently drop
   failed or mismatched entries from a user's selection.
+- Foundry disc sets send `kind: disc_bundle` with at most eight sources, selected
+  from the same upstream release grouping or conservatively matched filename
+  edition. The checklist selects supported matching discs by default and allows
+  manual subsets. Keep region/language/revision separation, missing-disc notices,
+  actual executable disc-number checks, source job recovery and one manifest.
+  Disc sets use server preparation; play/content/mixed roles must stay distinct.
+  Preserve `disc_sets.py`, exported `disc_sets` metadata, and the mixed-disc
+  pipeline path. See [disc installation and exceptions](MULTI-DISC-INSTALLS.md).
+  Optional manifest disc fields remain backward compatible. Do not replace a
+  different numbered disc merely because its Title ID / Media ID matches.
 - Unlocking applies only to XBLA/DLC on a private installation copy, with a
   backup. Preserve GoD licenses and leave title updates alone. False means
   preserve supplied bytes; it cannot restore licenses erased by an earlier tool.

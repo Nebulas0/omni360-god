@@ -16,7 +16,8 @@
 
 namespace {
 struct Title { std::string id,name,kind,genre,release,source,parent;unsigned long art;char letter;bool addon; };
-struct Release { std::string id,name,size; };
+struct DiscSource { std::string id,name,role,note;unsigned number;bool recommended; };
+struct Release { std::string id,name,size,discNote;std::vector<DiscSource> discs; };
 struct Row { std::string name;std::vector<Title> titles;std::vector<StoreTileView> tiles;int scroll;Row():scroll(0){} };
 static const char *letters="*#ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 static std::string Text(const cJSON *o,const char *key){const cJSON *v=cJSON_GetObjectItemCaseSensitive(o,key);return cJSON_IsString(v)&&v->valuestring?v->valuestring:"";}
@@ -45,9 +46,40 @@ static bool LoadReleases(const Title &title,const std::string &cursor,std::vecto
 {
     cJSON *reply=NULL;if(!FoundryStoreRequest("/store/titles/"+title.id+"?cursor="+(cursor.empty()?"0":cursor),&reply))return false;
     releases->clear();const cJSON *rows=cJSON_GetObjectItemCaseSensitive(reply,"releases");
-    for(int i=0;cJSON_IsArray(rows)&&i<cJSON_GetArraySize(rows)&&i<50;++i){const cJSON *o=cJSON_GetArrayItem(rows,i);Release r;r.id=Text(o,"release_id");r.name=Text(o,"name");std::string n=Text(o,"source_bytes");unsigned long long bytes=0;FoundryDecimal(n.c_str(),&bytes);char size[48];_snprintf(size,sizeof(size),"%.2f GB",bytes/1073741824.0);size[sizeof(size)-1]=0;r.size=size;if(r.id.compare(0,8,"catalog-")==0&&r.name.size()<=1024)releases->push_back(r);}
+    for(int i=0;cJSON_IsArray(rows)&&i<cJSON_GetArraySize(rows)&&i<50;++i){const cJSON *o=cJSON_GetArrayItem(rows,i);Release r;r.id=Text(o,"release_id");r.name=Text(o,"name");std::string n=Text(o,"source_bytes");unsigned long long bytes=0;FoundryDecimal(n.c_str(),&bytes);char size[48];_snprintf(size,sizeof(size),"%.2f GB",bytes/1073741824.0);size[sizeof(size)-1]=0;r.size=size;
+        const cJSON *set=cJSON_GetObjectItemCaseSensitive(o,"disc_set"),*items=cJSON_GetObjectItemCaseSensitive(set,"items");r.discNote=Text(set,"note");
+        for(int j=0;cJSON_IsArray(items)&&j<cJSON_GetArraySize(items)&&j<8;++j){const cJSON *item=cJSON_GetArrayItem(items,j);DiscSource d;d.id=Text(item,"release_id");d.name=Text(item,"name");d.role=Text(item,"disc_role");d.note=Text(item,"disc_note");d.recommended=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(item,"recommended"));const cJSON *number=cJSON_GetObjectItemCaseSensitive(item,"disc_number");d.number=cJSON_IsNumber(number)&&number->valuedouble>=0&&number->valuedouble<=255?(unsigned)number->valueint:0;if(d.id.compare(0,8,"catalog-")==0&&!d.name.empty()&&d.name.size()<=1024)r.discs.push_back(d);}
+        if(r.id.compare(0,8,"catalog-")==0&&r.name.size()<=1024)releases->push_back(r);}
     *next=Text(reply,"next_cursor");*previous=Text(reply,"previous_cursor");cJSON_Delete(reply);
     if(!next->empty())PrefetchFoundryStore("/store/titles/"+title.id+"?cursor="+*next);return true;
+}
+static bool DiscChecklist(const Release &release,const Title &title,const char *games,const char *content)
+{
+    std::vector<bool> selected;for(size_t i=0;i<release.discs.size();++i)selected.push_back(release.discs[i].recommended);
+    ListPageView view;memset(&view,0,sizeof(view));view.focused=true;view.showCounter=true;ResyncUiInput();
+    for(;;)
+    {
+        unsigned count=0;std::vector<std::string> labels;std::vector<const char*> pointers,subtitles;
+        for(size_t i=0;i<release.discs.size();++i){const DiscSource &d=release.discs[i];if(selected[i])++count;char label[128];_snprintf(label,sizeof(label),"[%s] Disc %u - %s",selected[i]?"x":" ",d.number,d.role=="content"?"Install / add-on content":d.role=="mixed"?"Play + content":d.role=="play"?"Playable GoD":"Special handling required");label[sizeof(label)-1]=0;labels.push_back(label);}
+        for(size_t i=0;i<labels.size();++i){pointers.push_back(labels[i].c_str());subtitles.push_back(release.discs[i].name.c_str());}
+        char heading[96];_snprintf(heading,sizeof(heading),"Disc set - %u of %u selected",count,(unsigned)selected.size());heading[sizeof(heading)-1]=0;
+        view.heading=heading;view.subheading=release.discNote.c_str();view.labels=&pointers[0];view.sublabels=&subtitles[0];view.count=(int)pointers.size();
+        UiHint hints[]={{UI_BUTTON_A,L"Toggle disc",L"Toggle"},{UI_BUTTON_START,L"Install selected",L"Install"},{UI_BUTTON_X,L"Select / clear all",L"All"},{UI_BUTTON_Y,L"Disc details",L"Details"},{UI_BUTTON_B,L"Back",NULL}};
+        Pump();RenderListFrame(view,hints,5);UiInput input=PollUiInput();
+        if(input.pressed&XINPUT_GAMEPAD_B){ResyncUiInput();return false;}
+        else if(input.pressed&XINPUT_GAMEPAD_A){const DiscSource &d=release.discs[view.selected];if(d.recommended)selected[view.selected]=!selected[view.selected];else ShowMessageUI("Special disc",d.note.c_str(),"This disc is not prepared automatically.");ResyncUiInput();}
+        else if(input.pressed&XINPUT_GAMEPAD_X){bool all=true;for(size_t i=0;i<selected.size();++i)if(release.discs[i].recommended&&!selected[i])all=false;for(size_t i=0;i<selected.size();++i)selected[i]=!all&&release.discs[i].recommended;}
+        else if(input.pressed&XINPUT_GAMEPAD_Y){const DiscSource &d=release.discs[view.selected];ShowNotesUI("Disc details",title.name.c_str(),d.name.c_str(),d.note.c_str(),L"Back");ResyncUiInput();}
+        else if(input.pressed&XINPUT_GAMEPAD_START){std::vector<std::string> ids;std::string notes;bool contentPackages=false;
+            for(size_t i=0;i<selected.size();++i)if(selected[i]){ids.push_back(release.discs[i].id);notes+=release.discs[i].name+"\n"+release.discs[i].note+"\n\n";contentPackages=contentPackages||release.discs[i].role=="content"||release.discs[i].role=="mixed";}
+            if(ids.empty()){ShowMessageUI("Nothing selected","Choose at least one supported disc",NULL);ResyncUiInput();continue;}
+            notes+="Prepared on server. In-game disc switching depends on your console loader.";
+            if(ShowConfirmUI("Prepare disc set",title.name.c_str(),notes.c_str(),"Continue"))FoundryInstallDiscSet(ids,title.name,games,content,contentPackages);ResyncUiInput();if(Active())return true;
+        }
+        else if(input.nav==XINPUT_GAMEPAD_DPAD_UP&&view.selected>0)--view.selected;
+        else if(input.nav==XINPUT_GAMEPAD_DPAD_DOWN&&view.selected+1<view.count)++view.selected;
+        Sleep(16);
+    }
 }
 static bool Game(const Title &title,const char *games,const char *content,const std::string &forTitle=std::string())
 {
@@ -79,7 +111,7 @@ static bool Game(const Title &title,const char *games,const char *content,const 
         {if(input.nav==XINPUT_GAMEPAD_DPAD_UP&&versionFocus>0)--versionFocus;if(input.nav==XINPUT_GAMEPAD_DPAD_DOWN&&versionFocus+1<(int)releases.size())++versionFocus;if(input.pressed&XINPUT_GAMEPAD_A){chosen=versionFocus;versionsOpen=false;}}
         else if(input.pressed&XINPUT_GAMEPAD_A)
         {
-            if(focus==0){if(Active())return true;FoundryInstallFromStore(releases[chosen].id,title.name,games,content,title.kind=="digital",forTitle);ResyncUiInput();if(Active())return true;}
+            if(focus==0){if(Active())return true;if(!releases[chosen].discs.empty()&&title.kind!="digital"&&forTitle.empty()){if(DiscChecklist(releases[chosen],title,games,content))return true;}else FoundryInstallFromStore(releases[chosen].id,title.name,games,content,title.kind=="digital",forTitle);ResyncUiInput();if(Active())return true;}
             else if(focus==1){versionsOpen=true;versionFocus=chosen;}
             else if(focus==2){unsigned long target=forTitle.empty()?title.art:strtoul(forTitle.c_str(),NULL,16);const std::string &parent=title.addon&&!title.parent.empty()?title.parent:title.name;if(OpenFoundryDlcUI(games,content,parent.c_str(),target))return true;ResyncUiInput();}
             else if(focus==3)return true;

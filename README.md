@@ -6,7 +6,12 @@ packages or download an ISO archive for on-console conversion.
 
 Based on upstream **Omni360 0.13.4-beta** (`6d9c323`), with the Foundry service
 integration and the fork's own signed updater preserved. Fork version:
-**1.0.0-alpha.8**.
+**1.0.0-alpha.9**.
+
+Foundry multi-disc games select the matching edition's discs by default, with
+a checklist before installation. Play discs become GoD; supported content discs
+are extracted, and mixed discs include both. Disc sets use server preparation.
+See [multi-disc installation and exceptions](docs/MULTI-DISC-INSTALLS.md).
 
 Foundry browsing reuses verified HTTPS connections and keeps recently visited
 catalog pages in a bounded five-minute memory cache. Refresh reloads the catalog.

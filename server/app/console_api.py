@@ -30,6 +30,7 @@ from validation import validate_god, validate_title_update
 from unlock import is_unlocked, unlock_package
 from xboxunity import XboxUnityClient, XboxUnityError
 from store_browser import StoreBrowser, is_addon_source
+from disc_sets import disc_info
 
 PREFIX = "/api/console/v1"
 SCOPES = {"catalog:read", "install:create", "artifact:read", "install:report"}
@@ -69,6 +70,7 @@ def safe_relative(value: str) -> str:
 class ConsoleService:
     def __init__(self, config, database, runner, remote):
         self.config, self.database, self.runner, self.remote = config, database, runner, remote
+        self.browser = StoreBrowser(database)
         self.root = config.work_dir / "console"
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.wake = threading.Event()
@@ -294,6 +296,7 @@ class ConsoleService:
                                "content_type": info.content_folder, "content_id": head[0x32C:0x340].hex().upper(),
                                "version": head[0x358:0x35C].hex().upper(),
                                "base_version": head[0x35C:0x360].hex().upper(),
+                               "disc_number": head[0x366], "disc_count": head[0x367],
                                "_path": p, "_root": root, "_cache": folder == "Cache"})
         return result
 
@@ -305,19 +308,30 @@ class ConsoleService:
         if set(payload) - {"release_id", "release_ids", "conversion", "component_ids", "unlock_packages", "kind", "game_identity", "for_title_id"}:
             raise ConsoleError("INVALID_REQUEST", "Unknown installation option")
         identity = None
-        bundle = payload.get("kind") == "dlc_bundle"
+        disc_bundle = payload.get("kind") == "disc_bundle"
+        bundle = payload.get("kind") in {"dlc_bundle", "disc_bundle"}
         releases = payload.get("release_ids")
         if bundle:
             if not isinstance(releases, list) or not 1 <= len(releases) <= 32 or any(not isinstance(x, str) or not re.fullmatch(r"catalog-[1-9][0-9]*", x) for x in releases):
-                raise ConsoleError("INVALID_REQUEST", "Select between 1 and 32 DLC sources")
+                raise ConsoleError("INVALID_REQUEST", "Select between 1 and 32 sources")
             releases = sorted(set(releases))
             if "game_identity" in payload or ("release_id" in payload and payload["release_id"] != releases[0]):
                 raise ConsoleError("INVALID_REQUEST", "A DLC selection uses release_ids and a target game")
             for source in releases:
                 source_item = self.item(source)
-                if source_item["source_kind"] != "digital" and not is_addon_source(source_item["name"]):
+                if disc_bundle:
+                    if source_item["source_kind"] != "disc" or is_addon_source(source_item["name"]):
+                        raise ConsoleError("UNSUPPORTED_SOURCE", "Disc sets accept game disc archives only")
+                    info = disc_info(source_item["name"])
+                    if not info["recommended"]:
+                        raise ConsoleError("UNSUPPORTED_SOURCE", info["disc_note"])
+                elif source_item["source_kind"] != "digital" and not is_addon_source(source_item["name"]):
                     raise ConsoleError("UNSUPPORTED_SOURCE", "DLC multi-select accepts add-on archives, not base-game ISOs")
-            item, release = {"source_kind": "digital"}, releases[0]
+            if disc_bundle:
+                plan = self.browser.disc_plan(releases[0])
+                if not plan or len(releases) > 8 or not set(releases) <= {r["release_id"] for r in plan["items"]}:
+                    raise ConsoleError("INCOMPATIBLE_DISCS", "Select discs from the same known edition, region and revision; refresh the Store", 409)
+            item, release = {"source_kind": "disc" if disc_bundle else "digital"}, releases[0]
         elif releases is not None or "release_ids" in payload:
             raise ConsoleError("INVALID_REQUEST", "release_ids requires a DLC selection")
         if not bundle and payload.get("kind") == "title_update":
@@ -335,6 +349,10 @@ class ConsoleService:
             item = self.item(payload.get("release_id"))
             release = payload["release_id"]
         mode = payload.get("conversion", "server")
+        if not bundle and not identity and item["source_kind"] == "disc" and not is_addon_source(item["name"]):
+            info = disc_info(item["name"])
+            if not info["recommended"] or (mode == "console" and info["disc_role"] != "play"):
+                raise ConsoleError("UNSUPPORTED_SOURCE", info["disc_note"] + " Use server preparation for install/content discs.")
         if mode not in {"server", "console"} or (mode == "console" and (item["source_kind"] != "disc" or is_addon_source(item.get("name", "")))):
             raise ConsoleError("UNSUPPORTED_SOURCE", "Xbox conversion is only available for disc archives")
         ids = payload.get("component_ids", [])
@@ -351,9 +369,13 @@ class ConsoleService:
                 raise ConsoleError("INVALID_REQUEST", "DLC requires a valid target game Title ID and server preparation")
             normalized["for_title_id"] = title_id.upper()
         if bundle:
-            if "for_title_id" not in normalized or ids or mode != "server":
+            if disc_bundle:
+                if title_id is not None or ids or mode != "server":
+                    raise ConsoleError("INVALID_REQUEST", "Disc sets require server preparation without a DLC target or component overrides")
+                normalized.update(kind="disc_bundle", release_ids=releases)
+            elif "for_title_id" not in normalized or ids or mode != "server":
                 raise ConsoleError("INVALID_REQUEST", "DLC selections require server preparation and a target game; component selection is not supported")
-            normalized.update(kind="dlc_bundle", release_ids=releases)
+            else: normalized.update(kind="dlc_bundle", release_ids=releases)
         if identity:
             if mode != "server" or ids:
                 raise ConsoleError("INVALID_REQUEST", "Title updates are prepared on the server")
@@ -450,8 +472,8 @@ class ConsoleService:
 
     def prepare(self, row):
         payload = json.loads(row["payload"])
-        if payload.get("kind") == "dlc_bundle":
-            self.prepare_dlc_bundle(row, payload)
+        if payload.get("kind") in {"dlc_bundle", "disc_bundle"}:
+            self.prepare_source_bundle(row, payload)
             return
         if payload.get("kind") == "title_update":
             self.update(row["id"], state="preparing", message="Finding the exact update for the installed game")
@@ -490,7 +512,8 @@ class ConsoleService:
             components = [c for c in components if c["component_id"] in selected]
         else:
             # No implicit DLC or title-update installation.
-            allowed = {"dlc"} if is_addon_source(item["name"]) or payload.get("for_title_id") else {"god"} if item["source_kind"] == "disc" else {"xbla", "dlc"}
+            role = disc_info(item["name"])["disc_role"] if item["source_kind"] == "disc" else "play"
+            allowed = {"dlc"} if is_addon_source(item["name"]) or payload.get("for_title_id") or role == "content" else {"god", "dlc"} if role == "mixed" else {"god"} if item["source_kind"] == "disc" else {"xbla", "dlc"}
             produced = {str(Path(p).resolve()) for p in Database.decode_output_paths(job.get("artifact_paths"))}
             components = [c for c in components if c["kind"] in allowed and str(c["_path"].resolve()) in produced]
         if not components:
@@ -499,15 +522,21 @@ class ConsoleService:
             raise ConsoleError("INCOMPATIBLE_DLC", "The actual DLC package does not belong to the selected game; nothing was installed", 409)
         self.publish_packages(row, payload, components)
 
-    def prepare_dlc_bundle(self, row, payload):
-        """One durable request/manifest for multiple independently prepared DLCs."""
+    def prepare_source_bundle(self, row, payload):
+        """One durable request/manifest for independently prepared sources."""
+        discs = payload.get("kind") == "disc_bundle"
+        label = "Disc" if discs else "DLC"
         components, seen, ready = [], {}, 0
         for release in payload["release_ids"]:
             item = self.item(release)
             with self.connect() as c:
                 link = c.execute("SELECT job_id FROM console_request_sources WHERE request_id=? AND release_id=?", (row["id"], release)).fetchone()
             if link is None:
-                job_id = self.database.enqueue_items([item["id"]], options={"unlock_packages": payload["unlock_packages"]})[0]["job_id"]
+                try:
+                    job_id = self.database.enqueue_items([item["id"]], options={"unlock_packages": payload["unlock_packages"]})[0]["job_id"]
+                except ValueError as exc:
+                    if "active job uses different settings" not in str(exc).lower(): raise
+                    continue  # wait for the existing browser job; don't fail or duplicate it
                 with self.connect() as c:
                     c.execute("INSERT OR IGNORE INTO console_request_sources VALUES(?,?,?)", (row["id"], release, job_id))
                 self.runner.wake()
@@ -517,7 +546,9 @@ class ConsoleService:
                 raise ConsoleError("CONVERSION_FAILED", "A selected DLC failed server processing; inspect its job in Foundry", 409)
             if job["status"] != "complete": continue
             produced = {str(Path(p).resolve()) for p in Database.decode_output_paths(job.get("artifact_paths"))}
-            selected = [c for c in self.components(item) if c["kind"] == "dlc" and str(c["_path"].resolve()) in produced]
+            role = disc_info(item["name"])["disc_role"] if discs else "content"
+            kinds = {"god", "dlc"} if role == "mixed" else {"god"} if discs and role == "play" else {"dlc"}
+            selected = [c for c in self.components(item) if c["kind"] in kinds and str(c["_path"].resolve()) in produced]
             if not selected and job.get("reprocess_of") is None:
                 replacement = self.database.enqueue_items([item["id"]],
                     {item["id"]: Database.decode_output_paths(job.get("target_title_ids"))},
@@ -529,7 +560,12 @@ class ConsoleService:
             if not selected:
                 raise ConsoleError("METADATA_UNKNOWN", "A selected source contains no identified DLC packages", 409)
             for component in selected:
-                if component["title_id"].upper() != payload["for_title_id"]:
+                if discs and component["kind"] == "god":
+                    actual = validate_god(component["_path"])
+                    number = disc_info(item["name"])["disc_number"]
+                    if number and actual["execution_disc_number"] != number:
+                        raise ConsoleError("INCOMPATIBLE_DISCS", "Prepared disc number differs from the selected source; reprocess it before installing", 409)
+                if not discs and component["title_id"].upper() != payload["for_title_id"]:
                     raise ConsoleError("INCOMPATIBLE_DLC", "A selected DLC package belongs to a different game; nothing was installed", 409)
                 key = (component["title_id"].upper(), component["_path"].relative_to(component["_root"]).as_posix().casefold())
                 previous = seen.get(key)
@@ -543,11 +579,13 @@ class ConsoleService:
                 components.append(component)
             ready += 1
         if ready != len(payload["release_ids"]):
-            self.update(row["id"], state="waiting", message=f"DLC preparation: {ready} of {len(payload['release_ids'])} sources ready")
+            self.update(row["id"], state="waiting", message=f"{label} preparation: {ready} of {len(payload['release_ids'])} sources ready")
             return
         if not components or len(components) > 100:
             raise ConsoleError("INVALID_REQUEST", "Select fewer DLCs; the installation supports at most 100 packages")
-        self.update(row["id"], state="preparing", message=f"Checking {len(components)} selected DLC packages")
+        if discs and len({c["title_id"] for c in components}) != 1:
+            raise ConsoleError("INCOMPATIBLE_DISCS", "Selected packages belong to different game Title IDs; nothing was installed", 409)
+        self.update(row["id"], state="preparing", message=f"Checking {len(components)} selected {label} packages")
         self.publish_packages(row, payload, components)
 
     def check_quota(self, size):
@@ -582,7 +620,9 @@ class ConsoleService:
         manifest = {"schema_version": 1, "artifact_id": rid, "provider_id": "foundry",
                     "release_id": payload["release_id"], "conversion": "server", "components": [],
                     "created_at": utc_now(), "warnings": []}
-        if payload.get("kind") == "dlc_bundle": manifest["release_ids"] = payload["release_ids"]
+        if payload.get("kind") in {"dlc_bundle", "disc_bundle"}: manifest["release_ids"] = payload["release_ids"]
+        if payload.get("kind") == "disc_bundle":
+            manifest["warnings"] = list(dict.fromkeys(disc_info(self.item(r)["name"])["disc_note"] for r in payload["release_ids"]))
         try:
             all_files, seen = [], set()
             for component in components:
@@ -837,7 +877,7 @@ class ConsoleService:
 
 def register_console_api(app, config, database, runner, remote, start_background):
     service = ConsoleService(config, database, runner, remote)
-    browser = StoreBrowser(database)
+    browser = service.browser
     app.config["CONSOLE_SERVICE"] = service
     api = Blueprint("console", __name__, url_prefix=PREFIX)
 
@@ -874,7 +914,8 @@ def register_console_api(app, config, database, runner, remote, start_background
                        modes=["server", "console"], source_formats=["zip-stored", "zip-deflate"],
                        manifest_limit_bytes="1048576", max_page_size=50, max_components=100,
                        max_file_bytes=str(MAX_FILE), checksums=["sha256"], pairing=True,
-                       online_title_updates=config.xboxunity_tu_downloads, store_browsing=True, dlc_multi_select=True, max_dlc_sources=32)
+                       online_title_updates=config.xboxunity_tu_downloads, store_browsing=True, dlc_multi_select=True, max_dlc_sources=32,
+                       disc_multi_select=True, max_disc_sources=8, disc_set_conversion="server")
 
     @api.post("/pairings")
     def pair():

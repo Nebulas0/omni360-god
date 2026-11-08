@@ -9,6 +9,7 @@ import time
 from contextlib import closing
 
 from db import normalize_search_text
+from disc_sets import disc_plan, known_disc_sets
 
 
 def is_addon_source(name):
@@ -36,6 +37,7 @@ class StoreBrowser:
         self.groups = []
         self.by_id = {}
         rows = metadata if metadata is not None else json.loads(Path(__file__).with_name("store_metadata.json").read_text())
+        self.disc_sets = known_disc_sets(rows)
         exacts, candidates = {}, {}
         for row in rows:
             kind = row["kind"]
@@ -50,12 +52,12 @@ class StoreBrowser:
         for (_, key), values in candidates.items(): parents.setdefault(key, {}).update(values)
         self.parents = parents
 
-    def refresh(self):
+    def refresh(self, force=False):
         with self.lock:
-            if time.monotonic() - self.checked < 5: return
+            if not force and time.monotonic() - self.checked < 5: return
             with closing(self.database.connect()) as c:
                 fingerprint = tuple(c.execute("SELECT count(*),max(id),max(updated_at),sum(status='complete') FROM catalog_items").fetchone())
-                if fingerprint == self.revision:
+                if not force and fingerprint == self.revision:
                     self.checked = time.monotonic(); return
                 rows = c.execute("SELECT id,source_kind,name,remote_size,status FROM catalog_items ORDER BY id").fetchall()
             groups = {}
@@ -141,6 +143,13 @@ class StoreBrowser:
         group = self.by_id.get(gid)
         if group is None: return None
         rows = group["_releases"]
-        return {**self.public(group), "releases": rows[offset:offset+limit],
+        return {**self.public(group), "releases": [{**r, "disc_set": disc_plan(rows, r["release_id"], self.disc_sets)} for r in rows[offset:offset+limit]],
                 "next_cursor": str(offset+limit) if offset+limit < len(rows) else None,
                 "previous_cursor": str(max(0, offset-limit)) if offset else None}
+
+    def disc_plan(self, release):
+        self.refresh(force=True)
+        for group in self.groups:
+            if any(r["release_id"] == release for r in group["_releases"]):
+                return disc_plan(group["_releases"], release, self.disc_sets)
+        return None

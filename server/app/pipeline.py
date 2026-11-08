@@ -315,8 +315,8 @@ class Pipeline:
                     f"Compatibility rules identify {iso.name} as a non-GOD "
                     "disc; extract its documented content separately"
                 )
-            if layout["is_content_disc"] or (
-                compatibility and compatibility.action == "content"
+            if (layout["is_content_disc"] and not (compatibility and compatibility.action == "god")) or (
+                compatibility and compatibility.action in {"content", "mixed"}
             ):
                 extracted_root = self._extract_content_disc(
                     job_id,
@@ -347,7 +347,8 @@ class Pipeline:
                     45 + (45 * index / len(isos)),
                     f"Organized content disc {index} of {len(isos)}",
                 )
-                continue
+                if not (compatibility and compatibility.action == "mixed"):
+                    continue
             convert_dir = input_root.parent / f"god-output-{index:02d}"
             god_root, title_name = self._run_converter(job_id, iso, convert_dir)
             title_id = god_root.name.upper()

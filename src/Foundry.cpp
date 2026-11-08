@@ -477,6 +477,8 @@ static bool CheckPackage(const std::string &path,const FoundryComponent &c,std::
     {
         bool licensed=false;for(unsigned i=0x22c;i<0x32c;++i)if(header[i])licensed=true;
         ok=ok&&licensed;
+        if(c.discNumber)ok=ok&&header[0x366]==c.discNumber;
+        if(c.discCount)ok=ok&&header[0x367]==c.discCount;
     }
     if(c.kind=="god"||c.kind=="title_update")ok=ok&&Hex32(BE32(&header[0x354]))==c.mediaId;
     if(c.kind=="title_update")ok=ok&&Hex32(BE32(&header[0x35c]))==c.baseVersion;
@@ -549,8 +551,9 @@ static bool Commit(const Work &w,const FoundryManifest &m,std::string *error)
             {
                 do {
                     if(fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)continue;
-                    std::string p=dir+"\\"+fd.cFileName;FILE *f=fopen(p.c_str(),"rb");unsigned char head[0x364];
+                    std::string p=dir+"\\"+fd.cFileName;FILE *f=fopen(p.c_str(),"rb");unsigned char head[0x368];
                     bool match=f&&fread(head,1,sizeof(head),f)==sizeof(head)&&!memcmp(head,"LIVE",4)&&BE32(head+0x344)==0x7000&&Hex32(BE32(head+0x360))==c.titleId&&Hex32(BE32(head+0x354))==c.mediaId;
+                    if(match&&c.discNumber)match=head[0x366]==c.discNumber;
                     if(f)fclose(f);if(!match)continue;
                     std::string rel=c.titleId+"/00007000/"+fd.cFileName;
                     AddMove(&moves,root,rel,staging+"/rollback/"+rel);
@@ -617,7 +620,9 @@ static bool Prepared(const Work &w,const FoundryManifest &m,std::string *error)
         for(size_t j=0;j<c.files.size();++j)
         {
             if(Cancelled()){*error="Cancelled; checked files are kept for resume";return false;}
-            const FoundryFile &f=c.files[j];BeginTransferFile(++index,files,completed,m.totalBytes,f.path.substr(f.path.find_last_of('/')+1));
+            const FoundryFile &f=c.files[j];std::string label=f.path.substr(f.path.find_last_of('/')+1);
+            if(c.kind=="god"&&c.discNumber)label="Disc "+Decimal(c.discNumber)+" "+label;
+            BeginTransferFile(++index,files,completed,m.totalBytes,label);
             if(!Fetch(std::string(API)+"/artifacts/"+m.id+"/files/"+f.id,Stage(root,m.id)+"\\files\\"+Native(f.path),f.bytes,f.sha256,error))return false;
             g_transferBase=0;DownloadProgress(f.bytes,f.bytes,0,0);completed+=f.bytes;
         }
@@ -709,6 +714,7 @@ static bool ConsoleConvert(const Work &w,const FoundryManifest &m,std::string *e
     {ReadAheadSource ahead(image,1024*1024,8);result=GodConvert(&ahead,info,output.c_str(),s.name.c_str(),NULL,0,ConvertProgress,NULL,package,sizeof(package));}
     free(points);if(result!=GOD_OK){*error=GodResultText(result);return false;}
     FoundryManifest generated;generated.id=m.id;FoundryComponent c;c.kind="god";c.titleId=Hex32(info.title.titleId);c.mediaId=Hex32(info.title.mediaId);c.contentType="00007000";
+    c.discNumber=info.title.discNumber;c.discCount=info.title.discCount;
     std::string relative=std::string(package).substr(output.size()+1);std::replace(relative.begin(),relative.end(),'\\','/');
     FoundryFile header;header.path=relative;header.root="content";header.role="header";c.files.push_back(header);generated.components.push_back(c);
     if(!CheckPackage(package,c,error))return false;
@@ -1081,4 +1087,19 @@ void FoundryInstallDlcBatch(const std::vector<std::string> &releases,const std::
     char *raw=cJSON_PrintUnformatted(body);std::string error;bool ok=QueuePayload(raw,name,games,content,&error);cJSON_free(raw);cJSON_Delete(body);
     if(!ok){ShowMessageUI("Not queued",error.c_str(),NULL);return;}
     ShowMessageUI("DLC selection queued","All selected DLCs are prepared as one checked installation","Open Queue for combined progress. Interrupted downloads can be resumed.");
+}
+
+void FoundryInstallDiscSet(const std::vector<std::string> &releases,const std::string &name,const char *games,const char *content,bool contentPackages)
+{
+    if(releases.empty()||releases.size()>8)return;
+    QueueJobSnapshot snap;if(SnapshotFoundryJobs(&snap,1)&&snap.state!=QUEUE_FINISHED){ShowMessageUI("Foundry","An installation is already active","Open Queue for progress.");return;}
+    cJSON *caps=NULL;if(!FoundryStoreRequest("/capabilities",&caps))return;bool supported=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(caps,"disc_multi_select"));cJSON_Delete(caps);
+    if(!supported){ShowMessageUI("Server update needed","This server does not support checked disc sets yet",NULL);return;}
+    cJSON *body=cJSON_CreateObject();cJSON_AddStringToObject(body,"kind","disc_bundle");cJSON_AddStringToObject(body,"conversion","server");
+    cJSON *ids=cJSON_AddArrayToObject(body,"release_ids");for(size_t i=0;i<releases.size();++i)cJSON_AddItemToArray(ids,cJSON_CreateString(releases[i].c_str()));
+    if(contentPackages){if(!ChoosePackageLicenses(body)){cJSON_Delete(body);return;}}
+    else cJSON_AddBoolToObject(body,"unlock_packages",false);
+    char *raw=cJSON_PrintUnformatted(body);std::string error;bool ok=QueuePayload(raw,name,games,content,&error);cJSON_free(raw);cJSON_Delete(body);
+    if(!ok){ShowMessageUI("Not queued",error.c_str(),NULL);return;}
+    ShowMessageUI("Disc set queued","All selected discs form one checked, resumable installation","Open Queue for combined file counts and progress.");
 }

@@ -13,6 +13,8 @@ int main(){puts("[");bool first=true;
   for(int j=0;j<STORE_INFO_COUNT;++j)if(kStoreGameInfo[j].titleId==g.titleId){const StoreGameInfo &info=kStoreGameInfo[j];printf(",\"ratings\":%lu,\"stars\":%u,\"genre\":",info.ratings,info.stars);text(info.genre?kStoreGenres[info.genre-1]:"");break;}
   printf(",\"aliases\":[");bool comma=false;
   for(int v=0;v<g.versionCount;++v){const StoreRelease &r=kStoreReleases[g.firstVersion+v];for(int d=0;d<r.discCount;++d){if(comma)putchar(',');comma=true;text(kStoreDiscs[kStoreReleaseDiscs[r.firstDisc+d]].zip);}}
+  printf("],\"disc_sets\":[");comma=false;
+  for(int v=0;v<g.versionCount;++v){const StoreRelease &r=kStoreReleases[g.firstVersion+v];if(r.discCount<2)continue;if(comma)putchar(',');comma=true;putchar('[');for(int d=0;d<r.discCount;++d){if(d)putchar(',');text(kStoreDiscs[kStoreReleaseDiscs[r.firstDisc+d]].zip);}putchar(']');}
   printf("]}");
  }
  for(int i=0;i<XBLA_GAME_COUNT;++i){const XblaGame &g=kXblaGames[i];puts(",");printf("{\"name\":");text(g.name);printf(",\"title_id\":\"%08lX\",\"kind\":\"digital\",\"aliases\":[",g.titleId);text(g.rar);printf("]}");}

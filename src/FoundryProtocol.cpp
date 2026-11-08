@@ -96,12 +96,22 @@ bool FoundryParseManifest(const char *json, FoundryManifest *out, std::string *e
             comp.id=Text(c,"component_id"); comp.kind=Text(c,"kind"); comp.titleId=Text(c,"title_id");
             comp.mediaId=Text(c,"media_id"); comp.contentType=Text(c,"content_type");
             comp.contentId=Text(c,"content_id"); comp.baseVersion=Text(c,"base_version");
-            ok=FoundryHex(comp.id,32) && FoundryHex(comp.titleId,8) && FoundryHex(comp.mediaId,8)
+            const cJSON *dn=cJSON_GetObjectItemCaseSensitive(c,"disc_number"),*dc=cJSON_GetObjectItemCaseSensitive(c,"disc_count");
+            if(dn){ok=ok&&cJSON_IsNumber(dn)&&dn->valuedouble>=0&&dn->valuedouble<=255&&dn->valuedouble==(int)dn->valuedouble;if(ok)comp.discNumber=(unsigned)dn->valueint;}
+            if(dc){ok=ok&&cJSON_IsNumber(dc)&&dc->valuedouble>=0&&dc->valuedouble<=255&&dc->valuedouble==(int)dc->valuedouble;if(ok)comp.discCount=(unsigned)dc->valueint;}
+            ok=ok && FoundryHex(comp.id,32) && FoundryHex(comp.titleId,8) && FoundryHex(comp.mediaId,8)
                 && FoundryHex(comp.contentType,8) && FoundryHex(comp.contentId,40) && FoundryHex(comp.baseVersion,8);
             const char *expected=comp.kind=="god"?"00007000":comp.kind=="xbla"?"000D0000":comp.kind=="dlc"?"00000002":comp.kind=="title_update"?"000B0000":"";
             ok=ok && comp.contentType==expected;
             ok=ok && componentIds.insert(comp.id).second;
-            if(comp.kind=="god") ok=ok && discs.insert(Fold(comp.titleId+"/"+comp.mediaId)).second;
+            if(comp.kind=="god")
+            {
+                std::string base=Fold(comp.titleId+"/"+comp.mediaId)+"/";
+                char number[4]={(char)('0'+comp.discNumber/100),(char)('0'+comp.discNumber/10%10),(char)('0'+comp.discNumber%10),0};
+                if(!comp.discNumber){for(std::set<std::string>::const_iterator it=discs.begin();it!=discs.end();++it)if(it->compare(0,base.size(),base)==0)ok=false;}
+                else if(discs.count(base+"000"))ok=false;
+                ok=ok && (!comp.discCount||comp.discNumber<=comp.discCount) && discs.insert(base+number).second;
+            }
             const cJSON *files=cJSON_GetObjectItemCaseSensitive(c,"files");
             ok=ok && cJSON_IsArray(files) && cJSON_GetArraySize(files)>0;
             int headers=0; std::string header;

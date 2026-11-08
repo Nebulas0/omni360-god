@@ -50,13 +50,16 @@ _RULES = (
     CompatibilityRule(("metal gear solid v the phantom pain",), ("disc 1",), "content", "4B4E085E"),
     CompatibilityRule(("saints row the third the full package",), ("disc 1",), "content", "5451086D"),
     CompatibilityRule(("saints row iv national treasure edition",), ("disc 1",), "content", "4B4D07F6"),
-    CompatibilityRule(("tom clancy s splinter cell blacklist",), ("disc 2",), "content", "555308B6"),
+    CompatibilityRule(("tom clancy s splinter cell blacklist",), ("disc 2",), "mixed", "555308B6"),
+    CompatibilityRule(("wolfenstein the new order",), ("disc 1",), "god"),
 )
 
 
 def compatibility_rule(name: str) -> CompatibilityRule | None:
     normalized = _normalize(name)
     for rule in _RULES:
+        if rule.name_terms == ("mass effect",) and re.search(r"\bmass effect [23]\b", normalized):
+            continue  # continuation game discs are not Mass Effect 1's DLC installer
         if all(term in normalized for term in rule.name_terms) and all(
             term in normalized for term in rule.disc_terms
         ):

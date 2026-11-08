@@ -16,6 +16,8 @@ bool OpenFoundryDlcUI(const char *gamesRoot, const char *contentRoot, const char
 void OpenFoundryUpdatesUI(const char *gamesRoot, const char *contentRoot, unsigned long titleId);
 void FoundryInstallDlcBatch(const std::vector<std::string> &releases, const std::string &name,
                            const char *gamesRoot, const char *contentRoot, const std::string &forTitle);
+void FoundryInstallDiscSet(const std::vector<std::string> &releases, const std::string &name,
+                          const char *gamesRoot, const char *contentRoot, bool contentPackages);
 bool FoundryStoreRequest(const std::string &path, cJSON **reply);
 void PrefetchFoundryStore(const std::string &path);
 void ClearFoundryStoreCache();

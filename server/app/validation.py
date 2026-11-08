@@ -136,7 +136,8 @@ def god_execution_info(header: Path) -> dict:
                     raw = volume.read(start + value, 24)
                     media, version, base, title = struct.unpack_from(">IIII", raw)
                     return {"title_id": f"{title:08X}", "media_id": f"{media:08X}",
-                            "version": f"{version:08X}", "base_version": f"{base:08X}"}
+                            "version": f"{version:08X}", "base_version": f"{base:08X}",
+                            "disc_number": raw[18], "disc_count": raw[19]}
             raise ValidationError("Game executable has no execution ID")
         pending.extend(link * 4 for link in (left, right) if link not in (0, 0xFFFF))
     raise ValidationError("Game volume has no default.xex")
@@ -197,5 +198,9 @@ def validate_god(header: Path, *, full_data: bool = False) -> dict:
     execution = god_execution_info(header)
     if execution["title_id"] != info.title_id or execution["media_id"] != info.media_id:
         raise ValidationError("GoD header identifiers differ from the game executable")
+    if (h[0x366] and h[0x366] != execution["disc_number"]) or (h[0x367] and h[0x367] != execution["disc_count"]):
+        raise ValidationError("GoD header disc identity differs from the game executable")
     return {**execution, "header": header.name, "fragments": count, "blocks": total_blocks,
+            "execution_disc_number": execution["disc_number"], "execution_disc_count": execution["disc_count"],
+            "disc_number": h[0x366], "disc_count": h[0x367],
             "status": "passed", "level": "full_data" if full_data else "structure"}

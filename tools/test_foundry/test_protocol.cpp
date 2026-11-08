@@ -27,6 +27,14 @@ int main(int argc,char **argv)
     std::string prepared=Load(dir+"/prepared.json");assert(Parse(prepared));
     FoundryManifest m;std::string error;assert(FoundryParseManifest(prepared.c_str(),&m,&error));
     assert(m.components.size()==1&&m.components[0].files.size()==2&&m.totalBytes>0);
+    std::string multi=Load(dir+"/multi-disc.json");assert(Parse(multi));
+    cJSON *multiRoot=cJSON_Parse(multi.c_str());cJSON *multiRows=cJSON_GetObjectItemCaseSensitive(multiRoot,"components");
+    assert(cJSON_GetArraySize(multiRows)==2);cJSON *first=cJSON_GetArrayItem(multiRows,0),*second=cJSON_GetArrayItem(multiRows,1);
+    // A shared Media ID may still identify different numbered discs.
+    cJSON_ReplaceItemInObjectCaseSensitive(second,"media_id",cJSON_CreateString(cJSON_GetObjectItemCaseSensitive(first,"media_id")->valuestring));assert(Changed(multiRoot));
+    cJSON_ReplaceItemInObjectCaseSensitive(second,"disc_number",cJSON_CreateNumber(1));assert(!Changed(multiRoot));
+    cJSON_ReplaceItemInObjectCaseSensitive(second,"disc_number",cJSON_CreateNumber(0));assert(!Changed(multiRoot));
+    cJSON_ReplaceItemInObjectCaseSensitive(second,"disc_number",cJSON_CreateNumber(2.5));assert(!Changed(multiRoot));cJSON_Delete(multiRoot);
     cJSON *o=cJSON_Parse(prepared.c_str());
     cJSON_ReplaceItemInObjectCaseSensitive(o,"schema_version",cJSON_CreateNumber(2));assert(!Changed(o));cJSON_Delete(o);
     o=cJSON_Parse(prepared.c_str());cJSON_ReplaceItemInObjectCaseSensitive(o,"provider_id",cJSON_CreateString("other"));assert(!Changed(o));cJSON_Delete(o);
