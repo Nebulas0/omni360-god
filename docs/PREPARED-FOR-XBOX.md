@@ -14,6 +14,12 @@ pairing and `settings.txt` install paths still apply; no new API key is needed.
    in the list. Duplicate selections are skipped, and the 32-item cart limit is
    checked before adding the batch. Add-ons always use server processing and
    capture the unlock choice when added.
+   Digital catalog copies with the same full filename and known byte size appear
+   once, preferring the digital catalog consistently. Regions, revisions and
+   different/unknown sizes stay separate. Underlying source IDs are retained for
+   existing drafts/requests; saved mirrored checks collapse to one selection.
+   Add controls show remaining capacity. If a batch exceeds the 32-item list,
+   the explanation appears beside Add; successful additions scroll into view.
 3. Choose **Convert on server** for checked GoD/package files, or **Convert on
    Xbox** for supported single-disc ISO archives. Disc sets, install/content discs
    and digital packages use server processing. Unsupported custom merges remain

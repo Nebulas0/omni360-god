@@ -127,3 +127,46 @@ def test_new_browser_routes_require_basic_auth(tmp_path,monkeypatch):
     for path in ('/consoles/prepare','/api/consoles/catalog','/api/consoles/releases/catalog-1'):
         assert client.get(path).status_code==401
     assert client.post('/api/consoles/'+'a'*32+'/prepare',headers=CSRF,json={}).status_code==401
+
+
+def test_digital_mirror_copies_collapse_before_paging_and_keep_ids(setup):
+    app,client,s=setup;name='Synthetic game - Extra (World) (Addon).zip'
+    for kind in ('disc','digital'):
+        s.database.upsert_catalog(kind,[{'name':name,'source_path':kind+'/'+name,'size':1234}])
+    with s.connect() as c:
+        rows=c.execute('SELECT id,source_kind FROM catalog_items ORDER BY id').fetchall()
+        c.execute("UPDATE catalog_items SET status='complete' WHERE source_kind='disc'")
+    items=client.get('/api/consoles/catalog?kind=digital&q=synthetic').json['items']
+    assert len(items)==1 and items[0]['source_copies']==2
+    assert items[0]['release_id']=='catalog-'+str(next(r['id'] for r in rows if r['source_kind']=='digital'))
+    assert items[0]['equivalent_release_ids']==['catalog-'+str(r['id']) for r in rows]
+    with s.connect() as c:assert c.execute('SELECT count(*) FROM catalog_items').fetchone()[0]==2
+    # Existing draft IDs are still valid, and processing status cannot switch the representative.
+    for row in rows:assert client.get('/api/consoles/releases/catalog-'+str(row['id'])).status_code==200
+    with s.connect() as c:c.execute("UPDATE catalog_items SET status='available'")
+    assert client.get('/api/consoles/catalog?kind=digital').json['items'][0]['release_id']==items[0]['release_id']
+
+
+def test_digital_distinct_regions_revisions_sizes_and_unknowns_stay_separate(setup):
+    app,client,s=setup
+    names=['Example (World) (Addon).zip','Example (USA) (Addon).zip','Example (World) (Rev 1) (Addon).zip']
+    for kind in ('disc','digital'):
+        s.database.upsert_catalog(kind,[{'name':name,'source_path':kind+'/'+name,'size':100} for name in names])
+    s.database.upsert_catalog('digital',[{'name':names[0],'source_path':'other-size.zip','size':200}])
+    for kind in ('disc','digital'):
+        s.database.upsert_catalog(kind,[{'name':'Example unknown (Addon).zip','source_path':kind+'/unknown.zip','size':0}])
+    items=client.get('/api/consoles/catalog?kind=digital').json['items']
+    assert len(items)==6
+    assert sorted(i['source_bytes'] for i in items if i['name']==names[0])==['100','200']
+    assert len([i for i in items if i['name']=='Example unknown (Addon).zip'])==2
+
+
+def test_digital_duplicate_groups_have_stable_page_boundaries(setup):
+    app,client,s=setup
+    for kind in ('disc','digital'):
+        s.database.upsert_catalog(kind,[{'name':f'Page Test {i:02d} (Addon).zip','source_path':f'{kind}/{i}.zip','size':100+i} for i in range(35)])
+    first=client.get('/api/consoles/catalog?kind=digital&q=page%20test').json
+    second=client.get('/api/consoles/catalog?kind=digital&q=page%20test&cursor='+first['next_cursor']).json
+    assert len(first['items'])==30 and len(second['items'])==5 and second['next_cursor'] is None
+    assert len({i['name'] for i in first['items']+second['items']})==35
+    assert all(i['source_copies']==2 for i in first['items']+second['items'])

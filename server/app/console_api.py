@@ -1256,8 +1256,23 @@ def register_console_api(app, config, database, runner, remote, start_background
         terms = normalize_search_text(request.args.get('q', '')[:120]).split()
         filters = ''.join(' AND search_text LIKE ?' for _ in terms)
         with service.connect() as c:
-            rows = c.execute('SELECT * FROM catalog_items WHERE '+category+filters+' ORDER BY name,id LIMIT 31 OFFSET ?', (*['%'+t+'%' for t in terms], offset)).fetchall()
-        return jsonify(items=[service.summary(dict(r)) for r in rows[:30]], next_cursor=str(offset+30) if len(rows)>30 else None,
+            if kind == 'digital':
+                # The regular and digital catalogs contain many same-name/size
+                # copies. Collapse those before paging, retaining every ID for
+                # old drafts. Prefer the digital source consistently, regardless
+                # of processing status. Unknown sizes remain distinct.
+                group = 'name COLLATE NOCASE,CASE WHEN coalesce(remote_size,0)>0 THEN remote_size ELSE -id END'
+                query = ('SELECT * FROM (SELECT *,row_number() OVER (PARTITION BY '+group+" ORDER BY source_kind!='digital',id) AS copy_rank,"
+                         'count(*) OVER (PARTITION BY '+group+') AS source_copies,'
+                         'json_group_array(id) OVER (PARTITION BY '+group+') AS copy_ids FROM catalog_items WHERE '+category+filters+
+                         ') WHERE copy_rank=1 ORDER BY name COLLATE NOCASE,id LIMIT 31 OFFSET ?')
+            else: query = 'SELECT * FROM catalog_items WHERE '+category+filters+' ORDER BY name,id LIMIT 31 OFFSET ?'
+            rows = c.execute(query, (*['%'+t+'%' for t in terms], offset)).fetchall()
+        items = [service.summary(dict(r)) for r in rows[:30]]
+        if kind == 'digital':
+            for view, row in zip(items, rows):
+                view.update(source_copies=row['source_copies'],equivalent_release_ids=['catalog-'+str(i) for i in sorted(json.loads(row['copy_ids']))])
+        return jsonify(items=items, next_cursor=str(offset+30) if len(rows)>30 else None,
                        previous_cursor=str(max(0,offset-30)) if offset else None)
 
     @app.get('/api/consoles/releases/<release>')

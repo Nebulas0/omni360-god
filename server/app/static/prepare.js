@@ -46,36 +46,52 @@ function renderCart() {
   renderBulk();saveDraft();
 }
 function addonSelection(source) { return {conversion:"server",unlock_packages:byId("prepare-unlock").checked,release_id:source.release_id}; }
+function addonAliases(source) { return new Set([source.release_id,...(Array.isArray(source.equivalent_release_ids)?source.equivalent_release_ids:[])]); }
+function addonAlreadyListed(source) {
+  const aliases=addonAliases(source);return cart.some(e=>aliases.has(e.selection.release_id)&&e.selection.conversion==="server"&&e.selection.unlock_packages===byId("prepare-unlock").checked);
+}
+function normalizeSelectedAddons() {
+  const groups=new Map();
+  for(const source of selectedAddons.values()) {
+    const identity=source.name.toLowerCase()+"\0"+(Number(source.source_bytes)>0?Number(source.source_bytes):source.release_id);
+    if(groups.has(identity)){const previous=groups.get(identity);previous.equivalent_release_ids=[...new Set([...addonAliases(previous),...addonAliases(source)])];}
+    else groups.set(identity,{...source});
+  }
+  selectedAddons.clear();for(const source of groups.values())selectedAddons.set(source.release_id,source);
+}
+function bulkFeedback(text,error=false) { const n=byId("dlc-feedback");if(n){n.textContent=text;n.className=error?"dlc-feedback error-note":"dlc-feedback muted";} }
 function renderBulk() {
   const panel=byId("dlc-bulk-tools");if(!panel)return;
   panel.hidden=!digitalPage.length&&!selectedAddons.size;
   const count=selectedAddons.size, checked=digitalPage.filter(s=>selectedAddons.has(s.release_id)).length;
   byId("dlc-page").checked=digitalPage.length>0&&checked===digitalPage.length;byId("dlc-page").indeterminate=checked>0&&checked<digitalPage.length;
   byId("dlc-page").disabled=sending||!digitalPage.length;
-  byId("dlc-count").textContent=`${count} selected · selections stay across result pages`;
+  byId("dlc-count").textContent=`${count} selected · ${Math.max(0,32-cart.length)} places left in preparation list`;
   byId("add-selected-dlc").textContent=`Add ${count||"selected"} add-on${count===1?"":"s"}`;
   byId("add-selected-dlc").disabled=sending||!count;byId("clear-selected-dlc").disabled=sending||!count;
   for(const check of byId("prepare-results").querySelectorAll("input[data-addon]")){check.checked=selectedAddons.has(check.value);check.disabled=sending;}
 }
 function addSelectedAddons() {
   if(sending||!selectedAddons.size)return;
-  const additions=[...selectedAddons.values()].map(source=>({source,selection:addonSelection(source)})).filter(({selection})=>!cart.some(e=>JSON.stringify(e.selection)===JSON.stringify(selection)));
-  if(cart.length+additions.length>32){notice(`There is room for ${32-cart.length} more items. Reduce the add-on selection or send the current list first.`);return;}
+  normalizeSelectedAddons();
+  const additions=[...selectedAddons.values()].filter(source=>!addonAlreadyListed(source)).map(source=>({source,selection:addonSelection(source)}));
+  if(cart.length+additions.length>32){const extra=additions.length-(32-cart.length),message=`Your list has ${cart.length} item${cart.length===1?"":"s"} and room for ${32-cart.length} more. Uncheck ${extra} add-on${extra===1?"":"s"}, or remove items from the list below. Nothing was added.`;notice(message);bulkFeedback(message,true);byId("dlc-feedback").scrollIntoView({behavior:"smooth",block:"nearest"});renderBulk();saveDraft();return;}
   for(const {source,selection} of additions)cart.push({selection,name:source.name,request_key:key(),sent:false,device:null});
-  selectedAddons.clear();renderCart();notice(additions.length?`${additions.length} add-ons added together. Server processing and the current unlock choice are saved for each; your game/disc selection stays in the list.`:"These add-ons are already in your preparation list.");
+  selectedAddons.clear();renderCart();const message=additions.length?`${additions.length} add-ons added. Your game/disc selection stays in the list below.`:"These add-ons are already in your preparation list below.";notice(message);bulkFeedback(message);byId("prepare-cart").scrollIntoView({behavior:"smooth",block:"start"});
 }
 function setupBulk() {
   const panel=item("div","dlc-bulk-tools");panel.id="dlc-bulk-tools";panel.hidden=true;
   const label=item("label","checkbox-label"),check=item("input");check.id="dlc-page";check.type="checkbox";label.append(check,document.createTextNode("Select this page"));
   const count=item("span","muted");count.id="dlc-count";count.setAttribute("aria-live","polite");
-  const add=item("button","","Add selected add-ons");add.type="button";add.id="add-selected-dlc";add.onclick=addSelectedAddons;
-  const clear=item("button","button-secondary","Clear selection");clear.type="button";clear.id="clear-selected-dlc";clear.onclick=()=>{selectedAddons.clear();renderBulk();saveDraft();};
+  const add=item("button","","Add selected add-ons");add.type="button";add.id="add-selected-dlc";add.onclick=()=>{try{addSelectedAddons();}catch(e){bulkFeedback(`Could not add selections: ${e.message}`,true);}};
+  const clear=item("button","button-secondary","Clear selection");clear.type="button";clear.id="clear-selected-dlc";clear.onclick=()=>{selectedAddons.clear();bulkFeedback("");renderBulk();saveDraft();};
   const note=item("p","muted","Tick several XBLA / DLC sources, then add them together. Add-ons use server processing and the current unlock choice. Nothing is submitted until Prepare for Xbox.");
-  panel.append(label,count,add,clear,note);byId("prepare-results").before(panel);
+  const feedback=item("p","dlc-feedback muted");feedback.id="dlc-feedback";feedback.setAttribute("role","status");feedback.setAttribute("aria-live","polite");
+  panel.append(label,count,add,clear,note,feedback);byId("prepare-results").before(panel);
   check.onchange=()=>{
     if(check.checked){const missing=digitalPage.filter(s=>!selectedAddons.has(s.release_id));if(selectedAddons.size+missing.length>32){notice("Select at most 32 add-ons at a time. Your earlier selections are kept.");renderBulk();return;}for(const source of missing)selectedAddons.set(source.release_id,source);}
     else for(const source of digitalPage)selectedAddons.delete(source.release_id);
-    renderBulk();saveDraft();
+    bulkFeedback("");renderBulk();saveDraft();
   };
 }
 async function choose(release) {
@@ -91,10 +107,12 @@ async function find() {
   const sequence=++searchSequence, kind=byId("prepare-kind").value;
   const params=new URLSearchParams({q:byId("prepare-query").value,kind:byId("prepare-kind").value,cursor:search.cursor});
   const v=await request(`/api/consoles/catalog?${params}`);if(sequence!==searchSequence)return;byId("prepare-results").replaceChildren();digitalPage=kind==="digital"?v.items.filter(s=>s.kind==="digital"):[];
+  for(const source of digitalPage){const aliases=addonAliases(source);if([...aliases].some(id=>selectedAddons.has(id))){for(const id of aliases)selectedAddons.delete(id);selectedAddons.set(source.release_id,source);}}
+  normalizeSelectedAddons();
   for(const source of v.items) { const row=item("div","prepare-result"),info=item("div");info.append(item("strong","",source.name),item("p","muted",`${size(source.source_bytes)} · ${source.availability}`));
     if(kind==="digital"&&source.kind==="digital"){
       const label=item("label","addon-result"),check=item("input");check.type="checkbox";check.value=source.release_id;check.dataset.addon="true";check.checked=selectedAddons.has(source.release_id);
-      check.onchange=()=>{if(check.checked){if(selectedAddons.size>=32){check.checked=false;notice("Select at most 32 add-ons at a time.");return;}selectedAddons.set(source.release_id,source);}else selectedAddons.delete(source.release_id);renderBulk();saveDraft();};
+      check.onchange=()=>{if(check.checked){if(selectedAddons.size>=32){check.checked=false;bulkFeedback("Select at most 32 add-ons at a time.",true);return;}selectedAddons.set(source.release_id,source);}else selectedAddons.delete(source.release_id);bulkFeedback("");renderBulk();saveDraft();};
       label.append(check,info);row.append(label,button("Details",()=>choose(source.release_id)));
     }else row.append(info,button("Choose",()=>choose(source.release_id)));byId("prepare-results").append(row); }
   if(!v.items.length)byId("prepare-results").append(item("p","empty","No matching sources. Try another title."));
@@ -130,7 +148,7 @@ byId("send-preparations").onclick=async()=>{
 };
 setupBulk();
 (async()=>{try{const [v,settings]=await Promise.all([request("/api/consoles"),request("/api/settings")]);byId("prepare-unlock").checked=settings.unlock_packages===true;byId("prepare-device").replaceChildren();for(const d of v.devices.filter(d=>!d.revoked&&!d.hidden)){const o=item("option","",d.name);o.value=d.id;byId("prepare-device").append(o);}
-  restoreDraft();draftReady=true;if(!byId("prepare-device").options.length)notice("Pair a console on Console activity first.");else if(cart.length)notice("Your unsent preparation list was restored in this tab.");renderCart();
+  restoreDraft();normalizeSelectedAddons();draftReady=true;if(!byId("prepare-device").options.length)notice("Pair a console on Console activity first.");else if(cart.length)notice("Your unsent preparation list was restored in this tab.");renderCart();
   seeds=(new URLSearchParams(location.search).get("releases")||"").split(",").filter(s=>/^catalog-[1-9][0-9]*$/.test(s)).slice(0,32);
   const covered=new Set(cart.flatMap(e=>e.selection.release_ids||[e.selection.release_id]));seeds=seeds.filter(id=>!covered.has(id));
   if(seeds.length){await choose(seeds[0]);if(seeds.length>1)notice("Review this game's matching discs first. Add other games using search below.");}else await find();
