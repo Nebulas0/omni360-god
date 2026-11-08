@@ -61,6 +61,13 @@ static unsigned long long g_transferJobDone=0,g_transferJobTotal=0;
 static DWORD g_conversionStarted=0;
 static unsigned g_transferFile=0,g_transferFiles=0;
 static std::string g_transferName;
+struct StoreCacheEntry { std::string key,json;DWORD fetched,used; };
+static std::vector<StoreCacheEntry> g_storeCache;
+static size_t g_storeCacheBytes=0;
+static unsigned g_storeCacheGeneration=0;
+static HANDLE g_storePrefetch=NULL;
+static std::string g_storePrefetchKey;
+static volatile LONG g_storePrefetchCancel=0;
 
 static std::string Text(const cJSON *o,const char *k)
 {
@@ -183,9 +190,9 @@ static bool RetryPause(unsigned attempt,bool ui=false)
     return true;
 }
 
-static bool Call(const std::string &path,const std::string &body,bool auth,cJSON **reply,std::string *error,bool ui=false,const std::string &key="",int *lastStatus=NULL,unsigned attempts=6)
+static bool Call(const std::string &path,const std::string &body,bool auth,cJSON **reply,std::string *error,bool ui=false,const std::string &key="",int *lastStatus=NULL,unsigned attempts=6,const Device *boundDevice=NULL,DownloadProgressFn progress=NULL)
 {
-    Device d=DeviceCopy();
+    Device d=boundDevice?*boundDevice:DeviceCopy();
     if(!FoundryOrigin(d.origin)||path.compare(0,strlen(API),API)!=0||path.find_first_of("\r\n")!=std::string::npos)
     { *error="Invalid Foundry URL";return false; }
     std::string headers=auth?"Authorization: Bearer "+d.token+"\r\n":"";
@@ -196,7 +203,7 @@ static bool Call(const std::string &path,const std::string &body,bool auth,cJSON
     {
         std::fill(buffer.begin(),buffer.end(),0);len=buffer.size()-1;
         status=httpRequestHTTPS(d.origin+path,body.empty()?HTTP_GET:HTTP_POST,body.empty()?NULL:body.c_str(),headers.c_str(),"",
-            &buffer[0],&len,false,NULL,0,dprintf,0,ui?UiProgress:NULL,false,&policy);
+            &buffer[0],&len,false,NULL,0,dprintf,0,progress?progress:ui?UiProgress:NULL,false,&policy);
         if(!FoundryRetryableStatus(status)||attempt+1==attempts||!RetryPause(attempt,ui))break;
     }
     if(lastStatus)*lastStatus=status;
@@ -231,6 +238,62 @@ static bool UiCall(const std::string &path,const std::string &body,bool auth,cJS
     CloseHandle(thread);ResyncUiInput();
     if(!task.ok) { ShowMessageUI("Foundry",task.error.c_str(),NULL);return false; }
     *reply=task.reply;return true;
+}
+
+// Catalog-only, short-lived and bounded. Install requests/manifests/files never
+// use this cache. A device/server change cannot reuse another account's pages.
+static std::string StoreCacheKey(const Device &d,const std::string &path)
+{return d.origin+"\n"+d.id+"\n"+d.token+"\n"+path;}
+static bool StoreCacheRead(const std::string &key,cJSON **reply)
+{
+    DWORD now=GetTickCount();std::string raw;bool found=false;
+    EnterCriticalSection(&g_lock);
+    for(size_t i=0;i<g_storeCache.size();)
+    {
+        StoreCacheEntry &e=g_storeCache[i];
+        if(now-e.fetched>=60000){g_storeCacheBytes-=e.json.size();g_storeCache.erase(g_storeCache.begin()+i);continue;}
+        if(e.key==key){e.used=now;if(reply)raw=e.json;found=true;}
+        ++i;
+    }
+    LeaveCriticalSection(&g_lock);
+    if(!found)return false;if(!reply)return true;
+    *reply=cJSON_Parse(raw.c_str());return cJSON_IsObject(*reply)!=0;
+}
+static void StoreCacheSave(const std::string &key,const cJSON *reply,unsigned generation)
+{
+    char *json=cJSON_PrintUnformatted(reply);if(!json)return;std::string raw=json;cJSON_free(json);
+    if(raw.size()>512*1024)return;
+    DWORD now=GetTickCount();EnterCriticalSection(&g_lock);
+    if(generation!=g_storeCacheGeneration){LeaveCriticalSection(&g_lock);return;}
+    for(size_t i=0;i<g_storeCache.size();++i)if(g_storeCache[i].key==key){g_storeCacheBytes-=g_storeCache[i].json.size();g_storeCache.erase(g_storeCache.begin()+i);break;}
+    while(!g_storeCache.empty()&&(g_storeCache.size()>=16||g_storeCacheBytes+raw.size()>2*1024*1024))
+    {size_t oldest=0;for(size_t i=1;i<g_storeCache.size();++i)if(now-g_storeCache[i].used>now-g_storeCache[oldest].used)oldest=i;
+        g_storeCacheBytes-=g_storeCache[oldest].json.size();g_storeCache.erase(g_storeCache.begin()+oldest);}
+    StoreCacheEntry e;e.key=key;e.json=raw;e.fetched=e.used=now;g_storeCache.push_back(e);g_storeCacheBytes+=raw.size();LeaveCriticalSection(&g_lock);
+}
+void ClearFoundryStoreCache()
+{EnterCriticalSection(&g_lock);++g_storeCacheGeneration;g_storeCache.clear();g_storeCacheBytes=0;LeaveCriticalSection(&g_lock);InterlockedExchange(&g_storePrefetchCancel,1);}
+struct StorePrefetchTask { Device device;std::string path,key;unsigned generation; };
+static bool StorePrefetchProgress(unsigned long long,unsigned long long,unsigned long long,unsigned long long)
+{return !InterlockedCompareExchange(&g_storePrefetchCancel,0,0)&&!InterlockedCompareExchange(&g_stop,0,0);}
+static DWORD WINAPI StorePrefetchEntry(LPVOID value)
+{
+    StorePrefetchTask *task=(StorePrefetchTask*)value;cJSON *reply=NULL;std::string error;
+    if(StorePrefetchProgress(0,0,0,0)&&Call(std::string(API)+task->path,"",true,&reply,&error,false,"",NULL,1,&task->device,StorePrefetchProgress))
+        StoreCacheSave(task->key,reply,task->generation);
+    cJSON_Delete(reply);delete task;return 0;
+}
+void PrefetchFoundryStore(const std::string &path)
+{
+    if(!g_started||g_stop||path.compare(0,7,"/store/")!=0)return;
+    QueueJobSnapshot snap;if(SnapshotFoundryJobs(&snap,1)&&snap.state!=QUEUE_FINISHED)return; // Downloads have priority.
+    Device d=DeviceCopy();if(d.token.empty())return;std::string key=StoreCacheKey(d,path);
+    if(g_storePrefetch){if(WaitForSingleObject(g_storePrefetch,0)!=WAIT_OBJECT_0)return;CloseHandle(g_storePrefetch);g_storePrefetch=NULL;}
+    if(StoreCacheRead(key,NULL))return;
+    StorePrefetchTask *task=new StorePrefetchTask;task->device=d;task->path=path;task->key=key;
+    EnterCriticalSection(&g_lock);task->generation=g_storeCacheGeneration;LeaveCriticalSection(&g_lock);
+    g_storePrefetchKey=key;InterlockedExchange(&g_storePrefetchCancel,0);
+    g_storePrefetch=CreateThread(NULL,256*1024,StorePrefetchEntry,task,0,NULL);if(!g_storePrefetch)delete task;
 }
 static std::string Encode(const std::string &s)
 {
@@ -694,6 +757,7 @@ static bool QueuePayload(const char *body,const std::string &name,const char *ga
     if(w.body.empty()||w.body.size()>65536||!RootValid(w.games)||!RootValid(w.content)){*error="Invalid install selection or destination";return false;}
     Device d=DeviceCopy();if(d.token.empty()||!FoundryHex(d.id,32)){*error="Pair this console first";return false;}
     if(!NewRequestKey(&w,error))return false; // Persist body/key before any network request.
+    InterlockedExchange(&g_storePrefetchCancel,1);
     EnterCriticalSection(&g_lock);InitSnap(w);InterlockedExchange(&g_cancel,0);g_pending=true;LeaveCriticalSection(&g_lock);SetEvent(g_wake);return true;
 }
 static DWORD WINAPI Worker(LPVOID)
@@ -764,7 +828,11 @@ bool StartFoundry(const char *gamesRoot,const char *contentRoot)
 void StopFoundry(DWORD timeoutMs)
 {
     if(!g_started)return;InterlockedExchange(&g_stop,1);InterlockedExchange(&g_cancel,1);SetEvent(g_wake);
-    if(WaitForSingleObject(g_thread,timeoutMs)==WAIT_OBJECT_0){CloseHandle(g_thread);CloseHandle(g_wake);g_started=false;}
+    InterlockedExchange(&g_storePrefetchCancel,1);DWORD started=GetTickCount();
+    bool stopped=WaitForSingleObject(g_thread,timeoutMs)==WAIT_OBJECT_0;
+    DWORD elapsed=GetTickCount()-started;DWORD left=elapsed<timeoutMs?timeoutMs-elapsed:0;
+    bool prefetched=!g_storePrefetch||WaitForSingleObject(g_storePrefetch,left)==WAIT_OBJECT_0;
+    if(stopped&&prefetched){if(g_storePrefetch){CloseHandle(g_storePrefetch);g_storePrefetch=NULL;}CloseHandle(g_thread);CloseHandle(g_wake);ClearFoundryStoreCache();g_started=false;}
 }
 int SnapshotFoundryJobs(QueueJobSnapshot *out,int maximum)
 {if(!g_started||maximum<1)return 0;EnterCriticalSection(&g_lock);int n=g_used?1:0;if(n)*out=g_snap;LeaveCriticalSection(&g_lock);return n;}
@@ -804,6 +872,13 @@ static void PairUI()
     }
     cJSON_free(raw);cJSON_Delete(body);
 }
+static bool ChoosePackageLicenses(cJSON *body)
+{
+    const char *choices[]={"Unlock XBLA / DLC","Leave licenses unchanged"};
+    const char *notes[]={"Server unlocks selected XBLA / DLC with a backup. GoD and updates are unchanged.","Keep supplied licenses, including content that is already unlocked."};
+    int pick=ShowChoiceUI("XBLA / DLC licenses","Apply this choice to all selected packages",choices,notes,2,L"Choose");
+    if(pick<0)return false;cJSON_AddBoolToObject(body,"unlock_packages",pick==0);return true;
+}
 static void QueueRelease(const std::string &release,const std::string &name,const char *games,const char *content,bool digital,const std::string &forTitle=std::string())
 {
     QueueJobSnapshot snap;if(SnapshotFoundryJobs(&snap,1)&&snap.state!=QUEUE_FINISHED){ShowMessageUI("Foundry","One Foundry installation is already active","Open Queue to see progress.");return;}
@@ -842,7 +917,7 @@ static void QueueRelease(const std::string &release,const std::string &name,cons
         }
         cJSON_Delete(info);
     }
-    if(licenseChoice){const char *choices[]={"Unlock XBLA / DLC","Leave licenses unchanged"};const char *notes[]={"Server unlocks selected XBLA / DLC with a backup. GoD and updates are unchanged.","Keep supplied licenses, including content that is already unlocked."};int pick=ShowChoiceUI("XBLA / DLC licenses","Choose how Foundry prepares this installation",choices,notes,2,L"Choose");if(pick<0){cJSON_Delete(body);return;}cJSON_AddBoolToObject(body,"unlock_packages",pick==0);}
+    if(licenseChoice&&!ChoosePackageLicenses(body)){cJSON_Delete(body);return;}
     char *raw=cJSON_PrintUnformatted(body);
     bool ok=QueuePayload(raw,name,games,content,&error);cJSON_free(raw);cJSON_Delete(body);
     if(!ok){ShowMessageUI("Not queued",error.c_str(),NULL);return;}
@@ -939,9 +1014,34 @@ bool FoundryStoreRequest(const std::string &path,cJSON **reply)
     if(!g_started)return false;
     if(DeviceCopy().token.empty())PairUI();
     if(DeviceCopy().token.empty())return false;
-    return UiCall(std::string(API)+path,"",true,reply);
+    Device d=DeviceCopy();bool catalog=path.compare(0,7,"/store/")==0;std::string key=StoreCacheKey(d,path);
+    if(catalog&&StoreCacheRead(key,reply))return true;
+    if(catalog&&g_storePrefetch&&g_storePrefetchKey==key)
+    {
+        while(WaitForSingleObject(g_storePrefetch,0)!=WAIT_OBJECT_0)
+        {RenderProgressFrame("Foundry","Loading page","B cancels",-1,"Loading");
+            if(PollUiInput().pressed&XINPUT_GAMEPAD_B){InterlockedExchange(&g_storePrefetchCancel,1);ResyncUiInput();return false;}Sleep(16);}
+        CloseHandle(g_storePrefetch);g_storePrefetch=NULL;ResyncUiInput();if(StoreCacheRead(key,reply))return true;
+    }
+    unsigned generation;EnterCriticalSection(&g_lock);generation=g_storeCacheGeneration;LeaveCriticalSection(&g_lock);
+    bool ok=UiCall(std::string(API)+path,"",true,reply);if(ok&&catalog)StoreCacheSave(key,*reply,generation);return ok;
 }
 void FoundryInstallFromStore(const std::string &release,const std::string &name,const char *games,const char *content,bool digital,const std::string &forTitle)
 {QueueRelease(release,name,games,content,digital,forTitle);}
 void OpenFoundryUpdatesUI(const char *games,const char *content,unsigned long titleId)
 {OnlineUpdatesUI(games,content,titleId);}
+
+void FoundryInstallDlcBatch(const std::vector<std::string> &releases,const std::string &name,const char *games,const char *content,const std::string &forTitle)
+{
+    QueueJobSnapshot snap;if(SnapshotFoundryJobs(&snap,1)&&snap.state!=QUEUE_FINISHED){ShowMessageUI("Foundry","One Foundry installation is already active","Open Queue for progress.");return;}
+    if(releases.empty()||releases.size()>32||!FoundryHex(forTitle,8)){ShowMessageUI("DLC selection","Choose between 1 and 32 DLCs for an identified game",NULL);return;}
+    cJSON *caps=NULL;if(!FoundryStoreRequest("/capabilities",&caps))return;
+    bool supported=cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(caps,"dlc_multi_select"));cJSON_Delete(caps);
+    if(!supported){ShowMessageUI("Server update needed","This Foundry server does not support DLC multi-select yet",NULL);return;}
+    cJSON *body=cJSON_CreateObject();cJSON_AddStringToObject(body,"kind","dlc_bundle");cJSON_AddStringToObject(body,"for_title_id",forTitle.c_str());cJSON_AddStringToObject(body,"conversion","server");
+    cJSON *ids=cJSON_AddArrayToObject(body,"release_ids");for(size_t i=0;i<releases.size();++i)cJSON_AddItemToArray(ids,cJSON_CreateString(releases[i].c_str()));
+    if(!ChoosePackageLicenses(body)){cJSON_Delete(body);return;}
+    char *raw=cJSON_PrintUnformatted(body);std::string error;bool ok=QueuePayload(raw,name,games,content,&error);cJSON_free(raw);cJSON_Delete(body);
+    if(!ok){ShowMessageUI("Not queued",error.c_str(),NULL);return;}
+    ShowMessageUI("DLC selection queued","All selected DLCs are prepared as one checked installation","Open Queue for combined progress. Interrupted downloads can be resumed.");
+}

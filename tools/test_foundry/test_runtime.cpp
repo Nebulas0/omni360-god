@@ -252,8 +252,25 @@ static void AggregateProgress()
     TimedProgress("Converting on Xbox",1000,5000,start);
     assert(g_snap.bytesDone==1000&&g_snap.bytesTotal==5000&&g_snap.bytesPerSec>0&&g_snap.secondsLeft>0);
 }
+static void CatalogCache()
+{
+    Case("catalog-cache");ClearFoundryStoreCache();
+    Device d=DeviceCopy();std::string key=StoreCacheKey(d,"/store/home");
+    cJSON *o=cJSON_CreateObject();cJSON_AddStringToObject(o,"test","catalog");
+    unsigned generation=g_storeCacheGeneration;StoreCacheSave(key,o,generation);cJSON *reply=NULL;
+    assert(StoreCacheRead(key,&reply)&&Text(reply,"test")=="catalog");cJSON_Delete(reply);
+    Device other=d;other.origin="https://other.example.com";assert(!StoreCacheRead(StoreCacheKey(other,"/store/home"),NULL));
+    other=d;other.token="another-device-token";assert(!StoreCacheRead(StoreCacheKey(other,"/store/home"),NULL));
+    ClearFoundryStoreCache();StoreCacheSave(key,o,generation);assert(!StoreCacheRead(key,NULL));
+    StoreCacheSave(key,o,g_storeCacheGeneration);for(int i=0;i<610;++i)GetTickCount();assert(!StoreCacheRead(key,NULL));
+    std::string large(200*1024,'a');cJSON_AddStringToObject(o,"body",large.c_str());
+    for(int i=0;i<20;++i){char id[16];snprintf(id,sizeof(id),"page-%d",i);StoreCacheSave(id,o,g_storeCacheGeneration);}
+    assert(g_storeCache.size()<=16&&g_storeCacheBytes<=2*1024*1024);
+    assert(StoreCacheRead("page-19",NULL)&&!StoreCacheRead("page-0",NULL));
+    ClearFoundryStoreCache();assert(g_storeCache.empty()&&g_storeCacheBytes==0);cJSON_Delete(o);
+}
 int main()
 {
-    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();AggregateProgress();
+    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();AggregateProgress();CatalogCache();
     std::cout<<"Real client runtime: interrupted transfers, in-piece resume, lost POST/reboot idempotency, cross-server guard, GoD/Cache TU power cuts and shared-volume space checks passed\n";
 }

@@ -78,7 +78,7 @@ class StoreBrowser:
                 key = ("dlc" if addon else kind) + ":" + title_key(name)
                 gid = hashlib.sha256(key.encode()).hexdigest()[:32]
                 group = groups.setdefault(gid, {"group_id": gid, "kind": kind, "name": name, "content_kind": "dlc" if addon else kind,
-                    "parent_key": parent,
+                    "parent_key": parent, "parent_name": display_name(hint["name"]) if addon and hint else None,
                     "art_title_id": hint["title_id"] if hint and hint["title_id"] != "00000000" else None,
                     "genre": hint.get("genre", "") if hint else "", "ratings": hint.get("ratings", 0) if hint else 0,
                     "stars": hint.get("stars", 0) if hint else 0, "prepared": False, "_releases": []})
@@ -91,6 +91,8 @@ class StoreBrowser:
                 first = normalize_search_text(group["name"])[:1].upper()
                 group["letter"] = first if "A" <= first <= "Z" else "#"
                 group["_releases"].sort(key=lambda r: (r["availability"] != "prepared", r["name"].casefold(), r["release_id"]))
+                group["default_release_id"] = group["_releases"][0]["release_id"]
+                group["default_source_name"] = group["_releases"][0]["name"]
             self.groups = ordered
             self.by_id = {g["group_id"]: g for g in ordered}
             self.revision = fingerprint

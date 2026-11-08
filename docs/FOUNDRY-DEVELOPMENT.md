@@ -183,3 +183,30 @@ Unknown or ambiguous artwork IDs get plain tiles. Prepared package identities
 remain authoritative. Source groups do not add IDs to the production catalog.
 Read-only API initialization never recovers another worker's preparing requests;
 crash recovery belongs to the preparation worker's startup.
+
+
+## DLC multi-select (alpha.7)
+
+The native DLC action is a paged checkbox list. Up to 32 catalog source releases
+are submitted in one durable `kind: dlc_bundle` request with `release_ids`,
+`for_title_id`, `conversion: server` and one `unlock_packages` choice. Each
+source's preparation job is retained in the additive `console_request_sources`
+table, so restart/retry does not create duplicate jobs. All selected sources
+must yield matching DLCs before an immutable combined manifest is published.
+Identical destination packages are deduplicated; differing copies conflict.
+The existing manifest/parser and client transaction/resume path install the
+combined files. Package/component limit remains 100. The capability response
+advertises `dlc_multi_select` and `max_dlc_sources: 32`; the client checks it before
+queuing a batch. Single-release and older clients remain compatible.
+
+For preserving these changes across official updates, use the
+[maintenance README](MAINTAINING-THE-FOUNDRY-FORK.md).
+
+
+Catalog GET caching in `Foundry.cpp` is restricted to `/store/` responses: 16
+entries, 2 MiB total, 512 KiB per entry, 60-second TTL and keys scoped to the
+server/device/token. One bounded background request can preload the next page or
+focused title. A foreground request reuses an in-flight preload of that same
+page; refresh increments a generation so stale preloads cannot repopulate the
+cache. Shutdown cancels/joins the prefetch worker. New preloads are suppressed
+during active installs; install requests, manifests and bytes bypass the cache.

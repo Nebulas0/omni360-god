@@ -6,7 +6,7 @@ packages or download an ISO archive for on-console conversion.
 
 Based on upstream **Omni360 0.13.4-beta** (`6d9c323`), with the Foundry service
 integration and the fork's own signed updater preserved. Fork version:
-**1.0.0-alpha.6**.
+**1.0.0-alpha.7**.
 
 **Alpha builds:** ZenServer builds checked main commits with the real Xbox XDK
 under Wine. Signed test builds appear in this fork's [releases](https://github.com/Nebulas0/omni360-god/releases).
@@ -15,10 +15,13 @@ Physical-console acceptance is still required.
 - Open **Store** for Foundry cover browsing, featured games and A–Z lists.
 - Switch **Foundry / my website** or **Archive.org** in **Settings > General > Store source**.
 - Queue progress includes file counts, whole-download bytes and estimates; Xbox conversion has separate progress.
-- Installed games can get matching Foundry DLC, with an unlock / preserve-license choice.
+- Select multiple matching DLCs in one list, with one unlock / preserve-license choice.
+- Source versions scroll their focused name; **Y** opens the full filename.
+- Recent catalog pages are cached, with background preloading to reduce waits.
 - Pair on your Foundry website at `/consoles`.
 - Choose server or Xbox conversion for disc games; digital content uses server
   processing. DLC and title updates are selected explicitly.
+- [Maintenance README: our changes and how to merge future official Omni360 updates](docs/MAINTAINING-THE-FOUNDRY-FORK.md)
 - [Development, API, build instructions and remaining checks](docs/FOUNDRY-DEVELOPMENT.md)
 - [Complete implementation plan](docs/FOUNDRY-INTEGRATION-PLAN.txt)
 - Matching Flask server source is in `server/`.

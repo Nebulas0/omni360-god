@@ -3,6 +3,7 @@
 
 #include "DownloadQueue.h"
 #include <string>
+#include <vector>
 struct cJSON;
 
 // Foundry is independent of the Archive.org catalog and credentials.
@@ -13,7 +14,11 @@ void OpenFoundryUI(const char *gamesRoot, const char *contentRoot);
 bool OpenFoundryStoreUI(const char *gamesRoot, const char *contentRoot); // true: open Queue
 bool OpenFoundryDlcUI(const char *gamesRoot, const char *contentRoot, const char *name, unsigned long titleId);
 void OpenFoundryUpdatesUI(const char *gamesRoot, const char *contentRoot, unsigned long titleId);
+void FoundryInstallDlcBatch(const std::vector<std::string> &releases, const std::string &name,
+                           const char *gamesRoot, const char *contentRoot, const std::string &forTitle);
 bool FoundryStoreRequest(const std::string &path, cJSON **reply);
+void PrefetchFoundryStore(const std::string &path);
+void ClearFoundryStoreCache();
 void FoundryInstallFromStore(const std::string &release, const std::string &name,
                             const char *gamesRoot, const char *contentRoot, bool digital, const std::string &forTitle=std::string());
 int SnapshotFoundryJobs(QueueJobSnapshot *out, int maximum);

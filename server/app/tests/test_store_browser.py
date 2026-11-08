@@ -19,6 +19,8 @@ def test_store_groups_sources_and_matches_only_the_parent_dlcs(tmp_path):
     assert len(dlcs) == 1 and 'High Tech Vault' in dlcs[0]['name']
     assert dlcs[0]['art_title_id'] == '58410A8E' and dlcs[0]['kind'] == 'digital'
     assert len(store.releases(dlcs[0]['group_id'])['releases']) == 1
+    assert dlcs[0]['default_release_id'] == store.releases(dlcs[0]['group_id'])['releases'][0]['release_id']
+    assert '(Addon)' in dlcs[0]['default_source_name']
     assert not store.browse('dlc', title_id='FFFFFFFF', parent_name='Fruit Ninja Kinect')['items']
     assert is_addon_source('Game (addon).ZIP') and not is_addon_source('Game Addon Edition.zip')
     assert store.home()['game_count'] == 2

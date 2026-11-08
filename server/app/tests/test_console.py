@@ -560,3 +560,117 @@ def test_store_api_requires_device_and_validates_filters(setup):
     assert client.get(PREFIX + '/store/titles/' + gid, headers=h).json['releases'][0]['release_id'] == 'catalog-1'
     for query in ['kind=unknown', 'letter=AB', 'cursor=-1', 'title_id=not-hex']:
         assert client.get(PREFIX + '/store/titles?' + query, headers=h).status_code == 400
+
+
+def seed_addon_sources(s, god, count=3):
+    releases, paths = [], []
+    for i in range(count):
+        path = god.parent.parent / '00000002' / f'bulk-addon-{i}'
+        raw = bytearray(write_tu(path)); raw[0x344:0x348] = (2).to_bytes(4, 'big')
+        raw[0x32C:0x340] = hashlib.sha1(raw[0x344:0xB000]).digest(); path.write_bytes(raw)
+        s.database.upsert_catalog('disc', [{'name': f'Synthetic game - Extra {i} (World) (Addon).zip', 'source_path': f'addon-{i}.zip', 'size': 1}])
+        item_id = i + 2; job = s.database.enqueue_items([item_id])[0]
+        with s.connect() as c:
+            c.execute("UPDATE catalog_items SET status='complete' WHERE id=?", (item_id,))
+            c.execute("UPDATE jobs SET status='complete',artifact_paths=? WHERE id=?", (json.dumps([str(path)]), job['job_id']))
+        releases.append(f'catalog-{item_id}'); paths.append(path)
+    return releases, paths
+
+
+@pytest.mark.parametrize('unlock', [False, True])
+def test_dlc_multi_selection_publishes_one_atomic_checked_manifest(setup, unlock):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    _, god = seed_game(s); original_god = god.read_bytes()
+    releases, paths = seed_addon_sources(s, god)
+    originals = [p.read_bytes() for p in paths]
+    body = {'kind': 'dlc_bundle', 'release_ids': [*reversed(releases), releases[0]], 'for_title_id': '415607e1', 'unlock_packages': unlock}
+    headers = {**h, 'Idempotency-Key': 'bulk-selection-retry-123'}
+    first = client.post(PREFIX + '/install-requests', json=body, headers=headers)
+    assert first.status_code == 200, first.json
+    replay = client.post(PREFIX + '/install-requests', json=body, headers=headers)
+    assert replay.json['id'] == first.json['id']
+    # The selection returned to an older recovered client must also replay.
+    normalized = first.json['selection']
+    assert client.post(PREFIX + '/install-requests', json=normalized, headers=headers).status_code == 200
+    assert client.post(PREFIX + '/install-requests', json={**body, 'unlock_packages': not unlock}, headers=headers).status_code == 409
+    s.prepare(s.get_request(first.json['id']))
+    row = s.get_request(first.json['id']); assert row['state'] == 'ready'
+    manifest = client.get(f"{PREFIX}/artifacts/{row['artifact_id']}/manifest", headers=h).json
+    assert manifest['release_ids'] == sorted(releases) and len(manifest['components']) == 3
+    for component in manifest['components']:
+        assert component['kind'] == 'dlc' and component['title_id'] == '415607E1'
+        assert component['unlock_applied'] is unlock
+        assert len(component['files']) == 1
+        file = component['files'][0]; received = client.get(file['download_path'], headers=h).data
+        assert hashlib.sha256(received).hexdigest() == file['sha256']
+        assert bool(any(received[0x22C:0x32C])) is not unlock
+    assert [p.read_bytes() for p in paths] == originals and god.read_bytes() == original_god
+    with s.connect() as c:
+        assert c.execute('SELECT count(*) FROM console_request_sources WHERE request_id=?', (row['id'],)).fetchone()[0] == 3
+
+
+def test_dlc_multi_selection_resumes_preparation_without_duplicate_jobs(setup):
+    from console_api import ConsoleService
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    _, god = seed_game(s); releases, paths = seed_addon_sources(s, god, 2)
+    with s.connect() as c:
+        job = c.execute('SELECT last_job_id FROM catalog_items WHERE id=2').fetchone()[0]
+        c.execute("UPDATE jobs SET status='queued',options_json=? WHERE id=?", (json.dumps({'unlock_packages': True}), job))
+        c.execute("UPDATE catalog_items SET status='queued' WHERE id=2")
+    body = {'kind': 'dlc_bundle', 'release_ids': releases, 'for_title_id': '415607E1'}
+    response = client.post(PREFIX + '/install-requests', json=body, headers={**h, 'Idempotency-Key': 'bulk-restart-123456'})
+    row = s.get_request(response.json['id']); s.prepare(row)
+    row = s.get_request(row['id']); assert row['state'] == 'waiting' and '1 of 2' in row['message']
+    with s.connect() as c:
+        jobs = c.execute('SELECT count(*) FROM jobs').fetchone()[0]
+        c.execute("UPDATE jobs SET status='complete' WHERE id=?", (job,))
+        c.execute("UPDATE catalog_items SET status='complete' WHERE id=2")
+    restarted = ConsoleService(s.config, s.database, s.runner, s.remote)
+    restarted.prepare(restarted.get_request(row['id']))
+    assert restarted.get_request(row['id'])['state'] == 'ready'
+    with s.connect() as c: assert c.execute('SELECT count(*) FROM jobs').fetchone()[0] == jobs
+
+
+def test_dlc_multi_selection_rejects_one_wrong_title_before_publishing_anything(setup):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    _, god = seed_game(s); releases, paths = seed_addon_sources(s, god, 2)
+    wrong_root = s.config.output_dir / 'Other game' / '12345678'
+    wrong = wrong_root / '00000002' / paths[1].name
+    raw = bytearray(paths[1].read_bytes()); raw[0x360:0x364] = bytes.fromhex('12345678')
+    raw[0x32C:0x340] = hashlib.sha1(raw[0x344:0xB000]).digest()
+    wrong.parent.mkdir(parents=True); wrong.write_bytes(raw)
+    s.database.put_title('12345678', 'Other game', str(wrong_root))
+    with s.connect() as c:
+        c.execute('UPDATE jobs SET artifact_paths=? WHERE id=(SELECT last_job_id FROM catalog_items WHERE id=3)', (json.dumps([str(wrong)]),))
+    body = {'kind': 'dlc_bundle', 'release_ids': releases, 'for_title_id': '415607E1'}
+    response = client.post(PREFIX + '/install-requests', json=body, headers={**h, 'Idempotency-Key': 'bulk-wrong-title-123'})
+    with pytest.raises(ConsoleError, match='different game'):
+        s.prepare(s.get_request(response.json['id']))
+    with s.connect() as c: assert c.execute('SELECT count(*) FROM console_artifacts').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('overrides', [{'release_ids': []}, {'release_ids': ['catalog-2'] * 33}, {'for_title_id': None}, {'conversion': 'console'}, {'release_ids': ['catalog-1']}, {'release_ids': ['../2']}])
+def test_dlc_multi_selection_validates_limits_and_sources(setup, overrides):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    _, god = seed_game(s); releases, _ = seed_addon_sources(s, god, 1)
+    body = {'kind': 'dlc_bundle', 'release_ids': releases, 'for_title_id': '415607E1', **overrides}
+    result = client.post(PREFIX + '/install-requests', json=body, headers={**h, 'Idempotency-Key': 'bulk-invalid-123456'})
+    assert result.status_code == 400, result.json
+
+
+def test_dlc_multi_selection_deduplicates_identical_packages(setup):
+    app, client, s = setup
+    h, _ = pair(app, client, s)
+    _, god = seed_game(s); releases, paths = seed_addon_sources(s, god, 2)
+    with s.connect() as c:
+        c.execute('UPDATE jobs SET artifact_paths=? WHERE id=(SELECT last_job_id FROM catalog_items WHERE id=3)', (json.dumps([str(paths[0])]),))
+    body = {'kind': 'dlc_bundle', 'release_ids': releases, 'for_title_id': '415607E1', 'unlock_packages': False}
+    response = client.post(PREFIX + '/install-requests', json=body, headers={**h, 'Idempotency-Key': 'bulk-duplicate-123456'})
+    s.prepare(s.get_request(response.json['id']))
+    row = s.get_request(response.json['id'])
+    manifest = client.get(f"{PREFIX}/artifacts/{row['artifact_id']}/manifest", headers=h).json
+    assert len(manifest['components']) == 1 and len(manifest['components'][0]['files']) == 1

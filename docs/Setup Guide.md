@@ -133,7 +133,7 @@ A game download picks up where it stopped after a stall, but not across a restar
 (the fork default) or **Archive.org**. Foundry uses the same featured, cover-grid,
 A–Z and game detail renderers. Pair the Xbox in **Foundry connection** once; Archive.org
 credentials are only required for the Archive.org provider. Existing `games-path:`,
-`content-path:` and other settings stay in effect for both providers. The saved selector is:
+`xbla-path:` and other settings stay in effect for both providers. The saved selector is:
 
 ```text
 store-source: foundry
@@ -170,3 +170,30 @@ itself does not patch licenses. Leaving licenses unchanged also preserves conten
 that arrived already unlocked; it cannot restore licenses that an earlier tool erased.
 GoD and title updates are never unlocked by this option. The original Archive.org
 installer downloads/extracts the supplied DLC packages and does not unlock them.
+
+
+### Selecting multiple Foundry DLCs (alpha.7)
+
+Open a game's **DLC / add-ons** action. **A** toggles entries, **X** selects or
+clears the current page (up to 32 selected DLCs), and **LB/RB** changes pages
+while retaining the selection. **Y** shows a full DLC name. Press **START** to
+install the selection, then choose **Unlock XBLA / DLC** or **Leave licenses
+unchanged** once for all selected packages. The server checks all actual Title
+IDs and publishes one combined installation; a wrong-game DLC or conflicting
+package fails the selection rather than installing only part of it. The queue
+shows combined download progress and file counts. Up to 100 packages fit in one
+installation; split larger selections into separate installs. Existing GoD files
+are not included in this DLC-only download.
+
+In a Foundry game's **Versions / discs** panel, the focused filename scrolls
+horizontally when long. **Y** opens its full filename in a separate readable view;
+outside the panel it shows the currently chosen source. This does not change
+which source **A** selects.
+
+
+Foundry remembers up to 16 recently requested catalog pages (at most 2 MiB) for
+60 seconds and preloads nearby pages/game details in the background when no
+installation is active. Returning to a cached page avoids the server loading
+screen. First visits can still need network time. **X: Refresh** on the Foundry
+front page fetches current data. Install requests, manifests and file downloads
+are not cached by this browsing feature.

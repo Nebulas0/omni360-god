@@ -7393,7 +7393,10 @@ static void DrawVersionsPanelText(const StoreGameView &view, const VersionsPanel
         const float sizeRight = L.rowX + L.rowW - S(16.0f) - SettingsCheck() - S(14.0f);
         const float sizeW = TextWidth(ver.size, 0.78f);
         const float textX = L.rowX + S(16.0f), textW = sizeRight - sizeW - S(16.0f) - textX;
-        TextFit(textX, y + S(8.0f), 0.82f, focused ? COL_TEXT : COL_TEXT2, ver.label, textW, true);
+        if (focused)
+            MarqueeTextMid(textX, y + S(8.0f) + LineHeight(0.82f) * 0.6f, 0.82f, COL_TEXT, ver.label, textW, true);
+        else
+            TextFit(textX, y + S(8.0f), 0.82f, COL_TEXT2, ver.label, textW, true);
         if (ver.detail != NULL && ver.detail[0] != '\0')
             TextFit(textX, y + S(10.0f) + LineHeight(0.82f) * 1.2f, 0.66f, COL_DIM, ver.detail, textW);
         TextMid(sizeRight, y + L.rowH * 0.5f, 0.78f, COL_TEXT2, ver.size, ATGFONT_RIGHT);

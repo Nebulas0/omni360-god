@@ -9,6 +9,11 @@ What remains is in three states, marked per-document below: **rewritten** for th
 
 The ATG framework under `Common/` is intentionally not documented in depth. It is Microsoft helper/sample code used for console rendering, input, resources, and related XDK support. The rest of the docs only mention ATG where the project calls into it.
 
+## Foundry fork
+
+- [Maintenance README and future upstream merges](MAINTAINING-THE-FOUNDRY-FORK.md)
+- [Foundry API and implementation details](FOUNDRY-DEVELOPMENT.md)
+
 ## Documents
 
 1. [Project Layout](project-layout.md) - solution structure and which code is app-owned versus embedded/vendor code. **Rewritten for Omni360** and accurate.
