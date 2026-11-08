@@ -154,3 +154,23 @@ def test_install_disc_is_dlc_not_a_second_god_and_respects_license_choice(setup,
     page=client.get(PREFIX+'/store/titles?kind=game&cursor=0',headers=h).json
     detail=client.get(PREFIX+'/store/titles/'+page['items'][0]['group_id']+'?cursor=0',headers=h).json
     plan=detail['releases'][0]['disc_set'];assert len(plan['items'])==2
+
+
+def test_legacy_mixed_disc_missing_god_is_rebuilt_once_before_publication(setup):
+    app,client,s=setup;h,_=pair(app,client,s);ids=seed_discs(s)
+    root=s.config.output_dir/'Synthetic game'/'415607E1';package=root/'00000002'/'mixed-content'
+    raw=bytearray(write_tu(package));raw[0x344:0x348]=(2).to_bytes(4,'big');raw[0x32C:0x340]=hashlib.sha1(raw[0x344:0xB000]).digest();package.write_bytes(raw)
+    with s.connect() as c:
+        for i,release in enumerate(ids,1):c.execute('UPDATE catalog_items SET name=? WHERE id=?',(f"Tom Clancy's Splinter Cell - Blacklist (World) (Disc {i}).zip",int(release[8:])))
+        c.execute('UPDATE jobs SET artifact_paths=? WHERE id=(SELECT last_job_id FROM catalog_items WHERE id=?)',(json.dumps([str(package)]),int(ids[1][8:])))
+    result=client.post(PREFIX+'/install-requests',json={'kind':'disc_bundle','release_ids':ids,'unlock_packages':False},headers={**h,'Idempotency-Key':'mixed-disc-rebuild-test'})
+    assert result.status_code==200,result.json;s.prepare(s.get_request(result.json['id']))
+    assert s.get_request(result.json['id'])['state']=='waiting'
+    with s.connect() as c:
+        assert c.execute('SELECT count(*) FROM console_artifacts').fetchone()[0]==0
+        job=c.execute('SELECT job_id FROM console_request_sources WHERE request_id=? AND release_id=?',(result.json['id'],ids[1])).fetchone()[0]
+        assert c.execute('SELECT reprocess_of FROM jobs WHERE id=?',(job,)).fetchone()[0] is not None
+        god=root/'00007000'/'1234567A'
+        c.execute("UPDATE jobs SET status='complete',artifact_paths=? WHERE id=?",(json.dumps([str(package),str(god),str(god.with_name(god.name+'.data')/'Data0000')]),job))
+        c.execute("UPDATE catalog_items SET status='complete' WHERE id=?",(int(ids[1][8:]),))
+    s.prepare(s.get_request(result.json['id']));assert s.get_request(result.json['id'])['state']=='ready'

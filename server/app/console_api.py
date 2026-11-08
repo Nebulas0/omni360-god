@@ -549,7 +549,8 @@ class ConsoleService:
             role = disc_info(item["name"])["disc_role"] if discs else "content"
             kinds = {"god", "dlc"} if role == "mixed" else {"god"} if discs and role == "play" else {"dlc"}
             selected = [c for c in self.components(item) if c["kind"] in kinds and str(c["_path"].resolve()) in produced]
-            if not selected and job.get("reprocess_of") is None:
+            incomplete = not selected or (role == "mixed" and not {"god", "dlc"} <= {c["kind"] for c in selected})
+            if incomplete and job.get("reprocess_of") is None:
                 replacement = self.database.enqueue_items([item["id"]],
                     {item["id"]: Database.decode_output_paths(job.get("target_title_ids"))},
                     reprocess_of=job_id, options={"unlock_packages": payload["unlock_packages"]})[0]["job_id"]
@@ -557,7 +558,7 @@ class ConsoleService:
                     c.execute("UPDATE console_request_sources SET job_id=? WHERE request_id=? AND release_id=?", (replacement, row["id"], release))
                 self.runner.wake()
                 continue
-            if not selected:
+            if incomplete:
                 raise ConsoleError("METADATA_UNKNOWN", "A selected source contains no identified DLC packages", 409)
             for component in selected:
                 if discs and component["kind"] == "god":
