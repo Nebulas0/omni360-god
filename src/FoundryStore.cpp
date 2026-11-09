@@ -74,7 +74,7 @@ static bool DiscChecklist(const Release &release,const Title &title,const char *
             for(size_t i=0;i<selected.size();++i)if(selected[i]){ids.push_back(release.discs[i].id);notes+=release.discs[i].name+"\n"+release.discs[i].note+"\n\n";contentPackages=contentPackages||release.discs[i].role=="content"||release.discs[i].role=="mixed";}
             if(ids.empty()){ShowMessageUI("Nothing selected","Choose at least one supported disc",NULL);ResyncUiInput();continue;}
             notes+="Prepared on server. In-game disc switching depends on your console loader.";
-            if(ShowConfirmUI("Prepare disc set",title.name.c_str(),notes.c_str(),"Continue"))FoundryInstallDiscSet(ids,title.name,games,content,contentPackages);ResyncUiInput();if(Active())return true;
+            if(ShowConfirmUI("Prepare disc set",title.name.c_str(),notes.c_str(),"Continue"))FoundryInstallDiscSet(ids,title.name,games,content,contentPackages,title.art);ResyncUiInput();if(Active())return true;
         }
         else if(input.nav==XINPUT_GAMEPAD_DPAD_UP&&view.selected>0)--view.selected;
         else if(input.nav==XINPUT_GAMEPAD_DPAD_DOWN&&view.selected+1<view.count)++view.selected;
@@ -111,7 +111,7 @@ static bool Game(const Title &title,const char *games,const char *content,const 
         {if(input.nav==XINPUT_GAMEPAD_DPAD_UP&&versionFocus>0)--versionFocus;if(input.nav==XINPUT_GAMEPAD_DPAD_DOWN&&versionFocus+1<(int)releases.size())++versionFocus;if(input.pressed&XINPUT_GAMEPAD_A){chosen=versionFocus;versionsOpen=false;}}
         else if(input.pressed&XINPUT_GAMEPAD_A)
         {
-            if(focus==0){if(Active())return true;if(!releases[chosen].discs.empty()&&title.kind!="digital"&&forTitle.empty()){if(DiscChecklist(releases[chosen],title,games,content))return true;}else FoundryInstallFromStore(releases[chosen].id,title.name,games,content,title.kind=="digital",forTitle);ResyncUiInput();if(Active())return true;}
+            if(focus==0){if(Active())return true;if(!releases[chosen].discs.empty()&&title.kind!="digital"&&forTitle.empty()){if(DiscChecklist(releases[chosen],title,games,content))return true;}else FoundryInstallFromStore(releases[chosen].id,title.name,games,content,title.kind=="digital",forTitle,title.art);ResyncUiInput();if(Active())return true;}
             else if(focus==1){versionsOpen=true;versionFocus=chosen;}
             else if(focus==2){unsigned long target=forTitle.empty()?title.art:strtoul(forTitle.c_str(),NULL,16);const std::string &parent=title.addon&&!title.parent.empty()?title.parent:title.name;if(OpenFoundryDlcUI(games,content,parent.c_str(),target))return true;ResyncUiInput();}
             else if(focus==3)return true;

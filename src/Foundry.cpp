@@ -870,11 +870,11 @@ static void InitSnap(const Work &w)
 {
     SnapWork(w,&g_snap);g_used=true;g_delivered=false;
 }
-static bool QueuePayload(const char *body,const std::string &name,const char *games,const char *content,std::string *error)
+static bool QueuePayload(const char *body,const std::string &name,const char *games,const char *content,std::string *error,unsigned long art=0,bool addon=false)
 {
     EnterCriticalSection(&g_lock);bool active=g_used&&g_snap.state!=QUEUE_FINISHED;
     if(active||Exists(JOB)){*error=active?"A Foundry installation is already active":"Resume or discard the interrupted Foundry job first";LeaveCriticalSection(&g_lock);return false;}
-    Work w;w.body=body?body:"";w.name=name;w.games=games;w.content=content;
+    Work w;w.body=body?body:"";w.name=name;w.games=games;w.content=content;w.art=art;w.addon=addon;
     if(w.body.empty()||w.body.size()>65536||!RootValid(w.games)||!RootValid(w.content)){*error="Invalid install selection or destination";LeaveCriticalSection(&g_lock);return false;}
     Device d=g_device;if(d.token.empty()||!FoundryHex(d.id,32)){*error="Pair this console first";LeaveCriticalSection(&g_lock);return false;}
     if(!NewRequestKey(&w,error)){LeaveCriticalSection(&g_lock);return false;}
@@ -1180,7 +1180,7 @@ static bool ChoosePackageLicenses(cJSON *body)
     int pick=ShowChoiceUI("Package licenses","Apply this choice to all selected packages",choices,notes,2,L"Choose");
     if(pick<0)return false;cJSON_AddBoolToObject(body,"unlock_packages",pick==0);return true;
 }
-static void QueueRelease(const std::string &release,const std::string &name,const char *games,const char *content,bool digital,const std::string &forTitle=std::string())
+static void QueueRelease(const std::string &release,const std::string &name,const char *games,const char *content,bool digital,const std::string &forTitle=std::string(),unsigned long art=0)
 {
     QueueJobSnapshot snap;if(SnapshotFoundryActiveJob(&snap)&&snap.state!=QUEUE_FINISHED){ShowMessageUI("Foundry","One Foundry installation is already active","Open Queue to see progress.");return;}
     const char *modes[]={"Convert on server","Convert on Xbox"};const char *details[]={"Download prepared and checked GoD files","Download the ISO archive, then convert locally"};
@@ -1220,7 +1220,7 @@ static void QueueRelease(const std::string &release,const std::string &name,cons
     }
     if(licenseChoice&&!ChoosePackageLicenses(body)){cJSON_Delete(body);return;}
     char *raw=cJSON_PrintUnformatted(body);
-    bool ok=QueuePayload(raw,name,games,content,&error);cJSON_free(raw);cJSON_Delete(body);
+    bool ok=QueuePayload(raw,name,games,content,&error,art,!forTitle.empty());cJSON_free(raw);cJSON_Delete(body);
     if(!ok){ShowMessageUI("Not queued",error.c_str(),NULL);return;}
     ShowMessageUI("Queued in Foundry","Installation continues in the background","Open Queue for progress. B returns to the original store.");
 }
@@ -1274,7 +1274,7 @@ static void OnlineUpdatesUI(const char *games,const char *content,unsigned long 
     cJSON *o=cJSON_CreateObject(),*identity=cJSON_AddObjectToObject(o,"game_identity");cJSON_AddStringToObject(o,"kind","title_update");
     cJSON_AddStringToObject(identity,"title_id",ids[pick].title.c_str());cJSON_AddStringToObject(identity,"media_id",ids[pick].media.c_str());cJSON_AddStringToObject(identity,"base_version",ids[pick].base.c_str());
     char *raw=cJSON_PrintUnformatted(o);std::string error;
-    bool ok=QueuePayload(raw,labels[pick]+" - title update",games,content,&error);cJSON_free(raw);cJSON_Delete(o);
+    bool ok=QueuePayload(raw,labels[pick]+" - title update",games,content,&error,strtoul(ids[pick].title.c_str(),NULL,16),true);cJSON_free(raw);cJSON_Delete(o);
     if(!ok){ShowMessageUI("Not queued",error.c_str(),NULL);return;}
     ShowMessageUI("Title update queued","Foundry will download and check the exact matching update","Enable it in Aurora after installation. No approximate update will be installed.");
 }
@@ -1319,9 +1319,9 @@ bool FoundryQueuePrepared(const cJSON *reply,const char *games,const char *conte
     std::vector<Work> ready;std::string error;
     if(!ReadPrepared(reply,games,content,&ready)){ShowMessageUI("Prepared for Xbox","The server returned an invalid prepared list",NULL);return false;}
     FilterPrepared(reply,only,&ready);
-    if(ready.empty()){ShowMessageUI("Prepared for Xbox","No new ready downloads for the current profile","Avatar unlocks need a signed-in Live-enabled or activated offline profile. They can stay prepared until then.");return false;}
+    if(ready.empty()){ShowMessageUI("Prepared for Xbox","No new ready downloads in this selection","Games must finish preparation first. Avatar unlocks need a compatible signed-in profile; completed items are skipped.");return false;}
     if(!QueuePrepared(ready,&error)){ShowMessageUI("Not queued",error.c_str(),NULL);return false;}
-    ShowMessageUI("Saved to download list",Exists(JOB)?"The current installation resumes first; selected items follow":"Selected items will install one at a time",FoundryCanUnlockAvatars()?"Open Queue for progress. The saved list survives a restart.":"Open Queue for progress. Avatar unlocks stay prepared until a compatible profile is signed in.");return true;
+    ShowMessageUI("Saved to download list",Exists(JOB)?"The current installation resumes first; selected items follow":"Games install first, then selected add-ons",FoundryCanUnlockAvatars()?"Open Queue for progress. The saved list survives a restart.":"Open Queue for progress. Avatar unlocks stay prepared until a compatible profile is signed in.");return true;
 }
 void FoundryPreparedOptionsUI()
 {
@@ -1357,8 +1357,8 @@ bool FoundryStoreRequest(const std::string &path,cJSON **reply)
     bool ok=UiCall(std::string(API)+path,"",true,reply);if(ok&&catalog)StoreCacheSave(key,*reply,generation);
     if(catalog)dprintf("[foundry] Store page: network %s in %lu ms\n",ok?"ready":"failed",GetTickCount()-started);return ok;
 }
-void FoundryInstallFromStore(const std::string &release,const std::string &name,const char *games,const char *content,bool digital,const std::string &forTitle)
-{QueueRelease(release,name,games,content,digital,forTitle);}
+void FoundryInstallFromStore(const std::string &release,const std::string &name,const char *games,const char *content,bool digital,const std::string &forTitle,unsigned long art)
+{QueueRelease(release,name,games,content,digital,forTitle,art);}
 void OpenFoundryUpdatesUI(const char *games,const char *content,unsigned long titleId)
 {OnlineUpdatesUI(games,content,titleId);}
 
@@ -1372,12 +1372,12 @@ void FoundryInstallDlcBatch(const std::vector<std::string> &releases,const std::
     cJSON *body=cJSON_CreateObject();cJSON_AddStringToObject(body,"kind","dlc_bundle");cJSON_AddStringToObject(body,"for_title_id",forTitle.c_str());cJSON_AddStringToObject(body,"conversion","server");
     cJSON *ids=cJSON_AddArrayToObject(body,"release_ids");for(size_t i=0;i<releases.size();++i)cJSON_AddItemToArray(ids,cJSON_CreateString(releases[i].c_str()));
     if(!ChoosePackageLicenses(body)){cJSON_Delete(body);return;}
-    char *raw=cJSON_PrintUnformatted(body);std::string error;bool ok=QueuePayload(raw,name,games,content,&error);cJSON_free(raw);cJSON_Delete(body);
+    char *raw=cJSON_PrintUnformatted(body);std::string error;bool ok=QueuePayload(raw,name,games,content,&error,strtoul(forTitle.c_str(),NULL,16),true);cJSON_free(raw);cJSON_Delete(body);
     if(!ok){ShowMessageUI("Not queued",error.c_str(),NULL);return;}
     ShowMessageUI("DLC selection queued","All selected DLCs are prepared as one checked installation","Open Queue for combined progress. Interrupted downloads can be resumed.");
 }
 
-void FoundryInstallDiscSet(const std::vector<std::string> &releases,const std::string &name,const char *games,const char *content,bool contentPackages)
+void FoundryInstallDiscSet(const std::vector<std::string> &releases,const std::string &name,const char *games,const char *content,bool contentPackages,unsigned long art)
 {
     if(releases.empty()||releases.size()>8)return;
     QueueJobSnapshot snap;if(SnapshotFoundryActiveJob(&snap)&&snap.state!=QUEUE_FINISHED){ShowMessageUI("Foundry","An installation is already active","Open Queue for progress.");return;}
@@ -1387,7 +1387,7 @@ void FoundryInstallDiscSet(const std::vector<std::string> &releases,const std::s
     cJSON *ids=cJSON_AddArrayToObject(body,"release_ids");for(size_t i=0;i<releases.size();++i)cJSON_AddItemToArray(ids,cJSON_CreateString(releases[i].c_str()));
     if(contentPackages){if(!ChoosePackageLicenses(body)){cJSON_Delete(body);return;}}
     else cJSON_AddBoolToObject(body,"unlock_packages",false);
-    char *raw=cJSON_PrintUnformatted(body);std::string error;bool ok=QueuePayload(raw,name,games,content,&error);cJSON_free(raw);cJSON_Delete(body);
+    char *raw=cJSON_PrintUnformatted(body);std::string error;bool ok=QueuePayload(raw,name,games,content,&error,art,contentPackages);cJSON_free(raw);cJSON_Delete(body);
     if(!ok){ShowMessageUI("Not queued",error.c_str(),NULL);return;}
     ShowMessageUI("Disc set queued","All selected discs form one checked, resumable installation","Open Queue for combined file counts and progress.");
 }

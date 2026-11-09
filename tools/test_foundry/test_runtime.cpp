@@ -376,6 +376,8 @@ static void VisiblePreparedQueue()
     assert(QueuePrepared(legacy,&error)&&RefreshQueuedMetadata(reply,&error));
     assert(SnapshotFoundryJobs(snaps,MAX_FOUNDRY_JOBS)==2&&snaps[0].kind==QUEUE_JOB_GAME_INSTALL&&snaps[1].kind==QUEUE_JOB_DLC_PACK&&snaps[1].titleId==0x415607E1);
     assert(LoadInbox(&pending)&&pending[0].request==std::string(32,'3')&&pending[1].body=="{}");cJSON_Delete(reply);
+    Case("direct-store-art");assert(QueuePayload("{}","Store game",items[0].games.c_str(),items[0].content.c_str(),&error,0x415607E1));
+    assert(LoadWork(&restored)&&restored.art==0x415607E1);assert(SnapshotFoundryActiveJob(&delivered)&&delivered.titleId==0x415607E1);
 }
 static unsigned long long TestBE64(const std::string &s,size_t at)
 {return (static_cast<unsigned long long>(BE32((const unsigned char*)s.data()+at))<<32)|BE32((const unsigned char*)s.data()+at+4);}

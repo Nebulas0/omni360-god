@@ -25,12 +25,12 @@ void OpenFoundryUpdatesUI(const char *gamesRoot, const char *contentRoot, unsign
 void FoundryInstallDlcBatch(const std::vector<std::string> &releases, const std::string &name,
                            const char *gamesRoot, const char *contentRoot, const std::string &forTitle);
 void FoundryInstallDiscSet(const std::vector<std::string> &releases, const std::string &name,
-                          const char *gamesRoot, const char *contentRoot, bool contentPackages);
+                          const char *gamesRoot, const char *contentRoot, bool contentPackages, unsigned long artTitleId=0);
 bool FoundryStoreRequest(const std::string &path, cJSON **reply);
 void PrefetchFoundryStore(const std::string &path);
 void ClearFoundryStoreCache();
 void FoundryInstallFromStore(const std::string &release, const std::string &name,
-                            const char *gamesRoot, const char *contentRoot, bool digital, const std::string &forTitle=std::string());
+                            const char *gamesRoot, const char *contentRoot, bool digital, const std::string &forTitle=std::string(), unsigned long artTitleId=0);
 int SnapshotFoundryActiveJob(QueueJobSnapshot *out);
 int SnapshotFoundryJobs(QueueJobSnapshot *out, int maximum);
 bool TakeFinishedFoundryJob(QueueJobSnapshot *out);
