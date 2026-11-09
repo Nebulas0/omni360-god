@@ -11,6 +11,7 @@ from typing import Iterable
 
 STFS_MAGICS = {b"CON ", b"LIVE", b"PIRS"}
 CONTENT_DLC = 0x00000002
+CONTENT_AVATAR = 0x00009000
 CONTENT_TITLE_UPDATE = 0x000B0000
 CONTENT_ARCADE = 0x000D0000
 CONTENT_GOD = 0x00007000
@@ -197,6 +198,8 @@ def package_kind(info: STFSInfo | None, filename: str = "") -> str:
         return "unknown"
     if info.content_type == CONTENT_DLC:
         return "dlc"
+    if info.content_type == CONTENT_AVATAR:
+        return "avatar"
     if info.content_type == CONTENT_TITLE_UPDATE:
         return "title-update-cache" if is_cache_title_update(filename) else "title-update"
     if info.content_type == CONTENT_GOD:

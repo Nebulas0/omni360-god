@@ -25,6 +25,11 @@ int main(int argc,char **argv)
     assert(!FoundryOrigin("http://example.org"));assert(!FoundryOrigin("https://evil.org/path"));
     assert(!FoundryOrigin("https://user@evil.org"));assert(!FoundryOrigin("https://evil.org:1234"));
     std::string prepared=Load(dir+"/prepared.json");assert(Parse(prepared));
+    std::string avatar=Load(dir+"/avatar.json");assert(Parse(avatar));
+    cJSON *av=cJSON_Parse(avatar.c_str());cJSON *avComp=cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(av,"components"),0);
+    cJSON_DeleteItemFromObjectCaseSensitive(avComp,"avatar_unlock");assert(!Changed(av));
+    cJSON_AddBoolToObject(avComp,"avatar_unlock",0);assert(Changed(av));
+    cJSON_ReplaceItemInObjectCaseSensitive(avComp,"content_type",cJSON_CreateString("00000002"));assert(!Changed(av));cJSON_Delete(av);
     FoundryManifest m;std::string error;assert(FoundryParseManifest(prepared.c_str(),&m,&error));
     assert(m.components.size()==1&&m.components[0].files.size()==2&&m.totalBytes>0);
     std::string multi=Load(dir+"/multi-disc.json");assert(Parse(multi));

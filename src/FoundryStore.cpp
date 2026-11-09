@@ -262,6 +262,7 @@ bool OpenFoundryPreparedUI(const char *games,const char *content)
                 if(!FoundryHex(t.id,32)||t.name.empty()||t.name.size()>512)continue;
                 unsigned long long bytes=0;FoundryDecimal(Text(o,"bytes").c_str(),&bytes);char size[48];_snprintf(size,sizeof(size),"%.2f GB",bytes/1073741824.0);size[sizeof(size)-1]=0;
                 std::string state=FoundryPreparedCompleted(t.id)?"installed locally":Text(o,"state");
+                if(state=="ready"&&cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o,"contains_avatar"))&&cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o,"avatar_unlock"))&&!FoundryCanUnlockAvatars())state="needs compatible signed-in profile";
                 std::string detail=state+" - "+size+" - "+(Text(o,"conversion")=="console"?"convert on Xbox":"server prepared");
                 if(state=="expired"||state=="failed")detail+=" - Prepare again on the website";
                 titles.push_back(t);states.push_back(state);details.push_back(detail);

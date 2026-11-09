@@ -1,6 +1,7 @@
 // Omni360 GoD Foundry integration, 2026. AGPL-3.0; see LICENSE.
 #include "Foundry.h"
 #include "FoundryProtocol.h"
+#include "AvatarPackage.h"
 #include "ContentWriteLock.h"
 #include "GameInstaller.h"
 #include "DiscWorker.h"
@@ -29,6 +30,8 @@
 #include <time.h>
 #include <algorithm>
 #include <map>
+#include <set>
+#include <ctype.h>
 
 static const char *API="/api/console/v1";
 static const char *DEVICE="game:\\FoundryDevice.json";
@@ -493,6 +496,47 @@ static bool CheckPackage(const std::string &path,const FoundryComponent &c,std::
     if(!ok){*error="Package metadata does not match the installation";return false;}
     return true;
 }
+static std::vector<unsigned long long> AvatarProfileXuids()
+{
+    std::vector<unsigned long long> out;
+    for(DWORD user=0;user<4;++user)for(DWORD flag=1;flag<=2;++flag){XUSER_SIGNIN_INFO info;memset(&info,0,sizeof(info));
+        if(XUserGetSigninInfo(user,flag,&info)==ERROR_SUCCESS&&info.UserSigninState!=eXUserSigninState_NotSignedIn&&AvatarOnlineXuid(info.xuid)&&std::find(out.begin(),out.end(),info.xuid)==out.end())out.push_back(info.xuid);}
+    return out;
+}
+bool FoundryCanUnlockAvatars(){return !AvatarProfileXuids().empty();}
+static bool PatchAvatarForInstall(const Work &w,const std::string &aid,FoundryComponent *component,std::string *error)
+{
+    if(component->kind!="avatar"||!component->avatarUnlock)return true;
+    std::vector<unsigned long long> xuids=AvatarProfileXuids();
+    if(xuids.empty()){*error="Sign in with a Live-enabled or activated offline profile to unlock Avatar items. Your downloaded files are kept. Omni360 does not change profiles.";return false;}
+    std::string source=Stage(w.content,aid)+"\\files\\"+Native(component->files[0].path);
+    FILE *in=fopen(source.c_str(),"rb");if(!in){*error="Avatar source is missing";return false;}
+    unsigned char first[0x344];bool ok=fread(first,1,sizeof(first),in)==sizeof(first);unsigned size=ok?BE32(first+0x340):0,end=(size+0xFFF)&~0xFFF;
+    if(!ok||size<0x971A||size>0x100000||end>Length(source)){fclose(in);*error="Invalid Avatar metadata length";return false;}
+    std::vector<unsigned char> header(end);fseek(in,0,SEEK_SET);ok=fread(&header[0],1,end,in)==end;
+    std::string relative,contentId;if(!ok||!AvatarPatchHeader(&header,xuids,&relative,&contentId,error)){fclose(in);return false;}
+    // Keep previous profile licenses when replacing an installed item.
+    std::string existing=w.content+"\\"+Native(relative);
+    if(Exists(existing)){
+        FoundryComponent expected;expected.kind="avatar";expected.titleId="AAAAAAAA";expected.contentType="00009000";
+        if(!CheckPackage(existing,expected,error)){fclose(in);return false;}
+        FILE *old=fopen(existing.c_str(),"rb");unsigned char oldHeader[0x3F1];bool read=old&&fread(oldHeader,1,sizeof(oldHeader),old)==sizeof(oldHeader);if(old)fclose(old);
+        if(!read||memcmp(oldHeader+0x3E1,&header[0x3E1],16)){fclose(in);*error="Existing Avatar asset identity differs; nothing replaced";return false;}
+        for(unsigned i=0;i<16;++i){unsigned long long x=(static_cast<unsigned long long>(BE32(oldHeader+0x22C+i*16))<<32)|BE32(oldHeader+0x230+i*16);
+            if(AvatarOnlineXuid(x)&&std::find(xuids.begin(),xuids.end(),x)==xuids.end())xuids.push_back(x);}
+        if(!AvatarPatchHeader(&header,xuids,&relative,&contentId,error)){fclose(in);return false;}
+    }
+    std::string target=Stage(w.content,aid)+"\\files\\"+Native(relative),temporary=target+".tmp";
+    if(!Parents(target)){fclose(in);*error="Could not create Avatar staging folder";return false;}
+    HANDLE out=CreateFileA(temporary.c_str(),GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);DWORD written=0;
+    ok=out!=INVALID_HANDLE_VALUE&&WriteFile(out,&header[0],end,&written,NULL)&&written==end;
+    unsigned char buffer[65536];size_t n=0;while(ok&&(n=fread(buffer,1,sizeof(buffer),in))>0){ok=!Cancelled()&&WriteFile(out,buffer,(DWORD)n,&written,NULL)&&written==n;}
+    ok=ok&&!ferror(in);fclose(in);if(out!=INVALID_HANDLE_VALUE){ok=ok&&FlushFileBuffers(out);CloseHandle(out);}
+    if(!ok){DeleteFileA(temporary.c_str());*error="Could not stage Avatar ownership; checked downloads are kept";return false;}
+    DeleteFileA(target.c_str());if(!MoveFileA(temporary.c_str(),target.c_str())){*error="Could not publish staged Avatar item";return false;}
+    component->titleId="AAAAAAAA";component->contentId=contentId;component->files[0].path=relative;
+    return Length(target)==component->files[0].bytes&&CheckPackage(target,*component,error);
+}
 static bool SaveJournal(const Work &w,const std::string &aid,const std::vector<Move> &moves,bool committed)
 {
     cJSON *o=cJSON_CreateObject(),*a=cJSON_AddArrayToObject(o,"moves");
@@ -541,6 +585,15 @@ static void AddMove(std::vector<Move> *moves,const std::string &root,const std::
 static bool Commit(const Work &w,const FoundryManifest &m,std::string *error)
 {
     ContentWriteLock lock;if(!lock.Ok()){*error="Could not lock content storage";return false;}
+    // Avatar ownership changes canonical filenames after manifest validation.
+    // Reject collisions before creating a journal or replacing installed files.
+    std::set<std::string> destinations;
+    for(size_t i=0;i<m.components.size();++i)for(size_t j=0;j<m.components[i].files.size();++j){
+        const FoundryComponent &c=m.components[i];const FoundryFile &f=c.files[j];
+        std::string key=Root(w,c.kind=="god"?"games":f.root)+"\\"+Native(f.path);
+        std::transform(key.begin(),key.end(),key.begin(),::tolower);
+        if(!destinations.insert(key).second){*error="Selected packages have conflicting installation paths; nothing replaced";return false;}
+    }
     std::vector<Move> moves;
     for(int pass=0;pass<2;++pass) for(size_t i=0;i<m.components.size();++i)
     {
@@ -611,6 +664,7 @@ static bool CheckRequiredSpace(const Work &w,const FoundryManifest &m,std::strin
             unsigned long long partial=Length(Stage(root,m.id)+"\\parts\\"+f.id+".part");
             unsigned long long available=staged==f.bytes?staged:partial<=f.bytes?partial:0;
             required[Volume(root)]+=f.bytes-available;
+            if(c.kind=="avatar"&&c.avatarUnlock)required[Volume(root)]+=f.bytes;
         }
     }
     for(std::map<std::string,unsigned long long>::const_iterator it=required.begin();it!=required.end();++it)
@@ -619,6 +673,7 @@ static bool CheckRequiredSpace(const Work &w,const FoundryManifest &m,std::strin
 }
 static bool Prepared(const Work &w,const FoundryManifest &m,std::string *error)
 {
+    FoundryManifest installing=m;
     if(!CheckRequiredSpace(w,m,error))return false;
     unsigned files=0,index=0;unsigned long long completed=0;
     for(size_t i=0;i<m.components.size();++i)files+=(unsigned)m.components[i].files.size();
@@ -636,13 +691,14 @@ static bool Prepared(const Work &w,const FoundryManifest &m,std::string *error)
         }
         const FoundryFile *package=&c.files[0];for(size_t j=0;j<c.files.size();++j)if(c.files[j].role=="header")package=&c.files[j];
         Phase("Checking package metadata",m.totalBytes?(float)((double)completed/m.totalBytes):-1,completed,m.totalBytes);if(!CheckPackage(Stage(root,m.id)+"\\files\\"+Native(package->path),c,error))return false;
+        if(!PatchAvatarForInstall(w,m.id,&installing.components[i],error))return false;
     }
     // Validate TUs after every selected base game has arrived, independent of
     // manifest component ordering.
     for(size_t i=0;i<m.components.size();++i)
         if(m.components[i].kind=="title_update"&&!MatchingInstalledGame(w,m,m.components[i])){*error="Title update does not match the installed game's actual Media ID and base version";return false;}
     if(Cancelled()){*error="Cancelled before installation; checked files are kept";return false;}
-    Phase("Installing; recovery journal saved",1,completed,m.totalBytes);return Commit(w,m,error);
+    Phase("Installing; recovery journal saved",1,completed,m.totalBytes);return Commit(w,installing,error);
 }
 class StoredImage : public GodSource
 {
@@ -866,6 +922,7 @@ static bool ReadPrepared(const cJSON *reply,const char *games,const char *conten
     ready->clear();Device d=owner?*owner:DeviceCopy();const cJSON *rows=cJSON_GetObjectItemCaseSensitive(reply,"items");
     if(!cJSON_IsArray(rows)||cJSON_GetArraySize(rows)>32)return false;
     for(int i=0;i<cJSON_GetArraySize(rows);++i){const cJSON *v=cJSON_GetArrayItem(rows,i);if(Text(v,"state")!="ready"||FoundryPreparedCompleted(Text(v,"id")))continue;
+        if(cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(v,"contains_avatar"))&&cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(v,"avatar_unlock"))&&!FoundryCanUnlockAvatars())continue;
         Work w;w.inbox=true;w.request=Text(v,"id");w.name=Text(v,"name");w.games=games;w.content=content;w.origin=d.origin;w.device=d.id;
         const cJSON *selection=cJSON_GetObjectItemCaseSensitive(v,"selection");if(!FoundryHex(w.request,32)||w.name.empty()||w.name.size()>512||!cJSON_IsObject(selection))return false;
         char *raw=cJSON_PrintUnformatted(selection);if(!raw)return false;w.body=raw;cJSON_free(raw);if(w.body.size()>65536)return false;ready->push_back(w);}
@@ -1031,9 +1088,9 @@ static void PairUI()
 }
 static bool ChoosePackageLicenses(cJSON *body)
 {
-    const char *choices[]={"Unlock XBLA / DLC","Leave licenses unchanged"};
-    const char *notes[]={"Server unlocks selected XBLA / DLC with a backup. GoD and updates are unchanged.","Keep supplied licenses, including content that is already unlocked."};
-    int pick=ShowChoiceUI("XBLA / DLC licenses","Apply this choice to all selected packages",choices,notes,2,L"Choose");
+    const char *choices[]={"Unlock XBLA / DLC / Avatar items","Leave licenses unchanged"};
+    const char *notes[]={"DLC/XBLA unlock on server; Avatars bind to signed-in compatible profiles on Xbox. GoD/TUs unchanged.","Keep supplied licenses, including content that is already unlocked."};
+    int pick=ShowChoiceUI("Package licenses","Apply this choice to all selected packages",choices,notes,2,L"Choose");
     if(pick<0)return false;cJSON_AddBoolToObject(body,"unlock_packages",pick==0);return true;
 }
 static void QueueRelease(const std::string &release,const std::string &name,const char *games,const char *content,bool digital,const std::string &forTitle=std::string())
@@ -1057,7 +1114,7 @@ static void QueueRelease(const std::string &release,const std::string &name,cons
             for(int i=0;i<count;++i)
             {
                 const cJSON *c=cJSON_GetArrayItem(components,i);ids.push_back(Text(c,"component_id"));kinds.push_back(Text(c,"kind"));names.push_back(Text(c,"name"));
-                selected[i]=!forTitle.empty()?kinds[i]=="dlc"&&Text(c,"title_id")==forTitle:digital?(kinds[i]=="dlc"||kinds[i]=="xbla"):(kinds[i]=="god"||kinds[i]=="xbla");
+                selected[i]=!forTitle.empty()?(kinds[i]=="dlc"||kinds[i]=="avatar")&&Text(c,"title_id")==forTitle:digital?(kinds[i]=="dlc"||kinds[i]=="xbla"||kinds[i]=="avatar"):(kinds[i]=="god"||kinds[i]=="xbla");
             }
             for(;;)
             {
@@ -1069,7 +1126,7 @@ static void QueueRelease(const std::string &release,const std::string &name,cons
                 if(pick==0)break;selected[pick-1]=!selected[pick-1];
             }
             cJSON *chosen=cJSON_AddArrayToObject(body,"component_ids");bool any=false;
-            for(int i=0;i<count;++i)if(selected[i]){cJSON_AddItemToArray(chosen,cJSON_CreateString(ids[i].c_str()));any=true;if(kinds[i]=="dlc"||kinds[i]=="xbla")licenseChoice=true;}
+            for(int i=0;i<count;++i)if(selected[i]){cJSON_AddItemToArray(chosen,cJSON_CreateString(ids[i].c_str()));any=true;if(kinds[i]=="dlc"||kinds[i]=="xbla"||kinds[i]=="avatar")licenseChoice=true;}
             if(!any){cJSON_Delete(info);cJSON_Delete(body);ShowMessageUI("Nothing selected","Choose at least one component",NULL);return;}
         }
         cJSON_Delete(info);
@@ -1175,9 +1232,9 @@ bool FoundryQueuePrepared(const cJSON *reply,const char *games,const char *conte
     std::vector<Work> ready;std::string error;
     if(!ReadPrepared(reply,games,content,&ready)){ShowMessageUI("Prepared for Xbox","The server returned an invalid prepared list",NULL);return false;}
     if(!only.empty()){for(size_t i=0;i<ready.size();){if(ready[i].request!=only)ready.erase(ready.begin()+i);else ++i;}}
-    if(ready.empty()){ShowMessageUI("Prepared for Xbox","No new ready downloads in this selection",NULL);return false;}
+    if(ready.empty()){ShowMessageUI("Prepared for Xbox","No new ready downloads for the current profile","Avatar unlocks need a signed-in Live-enabled or activated offline profile. They can stay prepared until then.");return false;}
     if(!QueuePrepared(ready,&error)){ShowMessageUI("Not queued",error.c_str(),NULL);return false;}
-    ShowMessageUI("Saved to download list",Exists(JOB)?"The current installation resumes first; selected items follow":"Selected items will install one at a time","Open Queue for the current download. The saved list survives a restart.");return true;
+    ShowMessageUI("Saved to download list",Exists(JOB)?"The current installation resumes first; selected items follow":"Selected items will install one at a time",FoundryCanUnlockAvatars()?"Open Queue for progress. The saved list survives a restart.":"Open Queue for progress. Avatar unlocks stay prepared until a compatible profile is signed in.");return true;
 }
 void FoundryPreparedOptionsUI()
 {

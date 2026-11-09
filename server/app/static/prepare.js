@@ -85,7 +85,7 @@ function setupBulk() {
   const count=item("span","muted");count.id="dlc-count";count.setAttribute("aria-live","polite");
   const add=item("button","","Add selected add-ons");add.type="button";add.id="add-selected-dlc";add.onclick=()=>{try{addSelectedAddons();}catch(e){bulkFeedback(`Could not add selections: ${e.message}`,true);}};
   const clear=item("button","button-secondary","Clear selection");clear.type="button";clear.id="clear-selected-dlc";clear.onclick=()=>{selectedAddons.clear();bulkFeedback("");renderBulk();saveDraft();};
-  const note=item("p","muted","Tick several XBLA / DLC sources, then add them together. Add-ons use server processing and the current unlock choice. Nothing is submitted until Prepare for Xbox.");
+  const note=item("p","muted","Tick several XBLA / DLC sources, then add them together. Add-ons use server processing and the current unlock choice. Avatar items need Omni360 alpha.11 and a compatible signed-in profile for unlocking. Nothing is submitted until Prepare for Xbox.");
   const feedback=item("p","dlc-feedback muted");feedback.id="dlc-feedback";feedback.setAttribute("role","status");feedback.setAttribute("aria-live","polite");
   panel.append(label,count,add,clear,note,feedback);byId("prepare-results").before(panel);
   check.onchange=()=>{

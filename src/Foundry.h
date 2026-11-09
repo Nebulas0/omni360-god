@@ -17,6 +17,7 @@ bool OpenFoundryPreparedUI(const char *gamesRoot, const char *contentRoot);
 bool FoundryQueuePrepared(const cJSON *reply, const char *gamesRoot, const char *contentRoot, const std::string &only=std::string());
 bool FoundryPreparedCompleted(const std::string &requestId);
 void FoundryPreparedOptionsUI();
+bool FoundryCanUnlockAvatars();
 bool OpenFoundryDlcUI(const char *gamesRoot, const char *contentRoot, const char *name, unsigned long titleId);
 void OpenFoundryUpdatesUI(const char *gamesRoot, const char *contentRoot, unsigned long titleId);
 void FoundryInstallDlcBatch(const std::vector<std::string> &releases, const std::string &name,

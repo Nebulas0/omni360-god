@@ -14,6 +14,9 @@ int test_snprintf(char*,size_t,const char*,...);
 #define _snprintf test_snprintf
 typedef void *HANDLE;typedef void *LPVOID;typedef uint32_t DWORD;typedef int32_t LONG;
 typedef int BOOL;typedef uint16_t WORD;typedef uint8_t BYTE;typedef wchar_t WCHAR;typedef const WCHAR *LPCWSTR;
+typedef unsigned long long XUID;
+enum XUSER_SIGNIN_STATE{eXUserSigninState_NotSignedIn=0,eXUserSigninState_SignedInLocally=1};
+struct XUSER_SIGNIN_INFO{XUID xuid;DWORD dwInfoFlags;XUSER_SIGNIN_STATE UserSigninState;DWORD dwGuestNumber,dwSponsorUserIndex;char szUserName[16];};
 struct CRITICAL_SECTION{int unused;};
 struct ULARGE_INTEGER{unsigned long long QuadPart;};
 struct WIN32_FIND_DATAA{DWORD dwFileAttributes;char cFileName[260];};
@@ -34,6 +37,7 @@ struct WIN32_FILE_ATTRIBUTE_DATA{DWORD dwFileAttributes,nFileSizeHigh,nFileSizeL
 #define GetFileExInfoStandard 0
 #define XINPUT_GAMEPAD_B 0x2000
 extern "C" {
+DWORD XUserGetSigninInfo(DWORD,DWORD,XUSER_SIGNIN_INFO*);
 DWORD GetFileAttributesA(const char*);
 BOOL CreateDirectoryA(const char*,void*);
 HANDLE FindFirstFileA(const char*,WIN32_FIND_DATAA*);

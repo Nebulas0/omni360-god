@@ -378,6 +378,7 @@
     <ClInclude Include="zlib\gzguts.h" />
     <ClInclude Include="src\Foundry.h" />
     <ClInclude Include="src\FoundryProtocol.h" />
+    <ClInclude Include="src\AvatarPackage.h" />
     <ClInclude Include="src\ContentWriteLock.h" />
     <ClInclude Include="src\GameInstaller.h" />
     <ClInclude Include="src\HttpPlain.h" />
@@ -474,6 +475,7 @@
     <ClCompile Include="src\Foundry.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
     <ClCompile Include="src\FoundryStore.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
     <ClCompile Include="src\FoundryProtocol.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
+    <ClCompile Include="src\AvatarPackage.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
     <ClCompile Include="src\GameInstaller.cpp" />
     <ClCompile Include="src\HttpPlain.cpp" />
     <ClCompile Include="src\SpeedTest.cpp" />

@@ -164,9 +164,10 @@ specific compatible title update; enable the correct update in Aurora when requi
 The Library's Foundry title-update action reads the installed GoD's actual Title ID,
 Media ID and base version for an exact server-side match.
 
-When installing XBLA/DLC, choose **Unlock XBLA / DLC** or **Leave licenses unchanged**.
-Foundry performs unlocking on a private installation copy with a backup; the client
-itself does not patch licenses. Leaving licenses unchanged also preserves content
+When installing packages, choose **Unlock XBLA / DLC / Avatar items** or **Leave licenses unchanged**.
+Foundry unlocks XBLA/DLC on a private installation copy with a backup. Avatar
+ownership is assigned on the Xbox to compatible signed-in profiles, using alpha.11
+or newer; see [Avatar items](AVATAR-ITEMS.md). Leaving licenses unchanged preserves content
 that arrived already unlocked; it cannot restore licenses that an earlier tool erased.
 GoD and title updates are never unlocked by this option. The original Archive.org
 installer downloads/extracts the supplied DLC packages and does not unlock them.

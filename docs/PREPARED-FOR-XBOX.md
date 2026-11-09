@@ -2,6 +2,9 @@
 
 Requires the Foundry fork's alpha.10 or newer XEX and matching server. Existing
 pairing and `settings.txt` install paths still apply; no new API key is needed.
+Avatar packs require **alpha.11 or newer**. They use the same add-on checklist
+and unlock choice. Unlock requests stay prepared until a compatible profile is
+signed in; [Avatar items](AVATAR-ITEMS.md) explains offline-profile limitations.
 
 1. Open **Prepare for Xbox** from the website catalog or Console activity. Choose
    your paired console. Selecting catalog sources first opens their review flow.

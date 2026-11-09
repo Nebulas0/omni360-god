@@ -23,6 +23,7 @@ from pathlib import Path
 
 from formats import (
     CONTENT_ARCADE,
+    CONTENT_AVATAR,
     CONTENT_DLC,
     CONTENT_GOD,
     CONTENT_TITLE_UPDATE,
@@ -40,11 +41,11 @@ BACKUP_SUFFIX = ".x360lock.bak"
 # Content types that represent licensed content and should be unlocked.
 #   0x00000002 – DLC / Marketplace content
 #   0x000D0000 – Xbox Live Arcade
-#   0x00009000 – Avatar items / game add-on bundles
+# Avatar ownership must be assigned on the Xbox using an online XUID. Keep its
+# original license entries intact here; zeroing them is not an Avatar unlock.
 _UNLOCKABLE_TYPES = {
     CONTENT_DLC,
     CONTENT_ARCADE,
-    0x00009000,
 }
 
 
@@ -114,7 +115,7 @@ def unlock_package(
             skipped=True,
             reason=(
                 "preserve SVOD converter license metadata"
-                if info and info.is_god else "not eligible for unlock"
+                if info and info.is_god else "Avatar ownership is assigned on the Xbox" if info and info.content_type == CONTENT_AVATAR else "not eligible for unlock"
             ),
         )
 

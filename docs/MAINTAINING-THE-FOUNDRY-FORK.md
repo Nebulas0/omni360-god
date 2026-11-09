@@ -11,6 +11,12 @@ Xbox list and opt-in automatic downloads. Preserve these alongside the original
 Foundry integration; see [Prepared for Xbox](PREPARED-FOR-XBOX.md) for API, files,
 limits and validation details.
 
+Alpha.11 adds [Avatar items](AVATAR-ITEMS.md). Preserve `src/AvatarPackage.cpp/.h`,
+their project entries and MIT notice, manifest kind `avatar` / type `00009000`,
+the explicit `avatar_unlock` flag, server license preservation and client profile
+detection. Offline profile activation is outside this integration. Run the
+33-item API fixture and native ownership/rollback tests when merging upstream.
+
 - Official project: <https://github.com/JustGillin/omni360>, default branch `master`.
 - Our fork: <https://github.com/Nebulas0/omni360-god>, deployment branch `main`.
 - Recorded upstream baseline: **0.13.4-beta**, commit

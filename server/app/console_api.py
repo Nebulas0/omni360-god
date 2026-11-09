@@ -24,7 +24,7 @@ from pathlib import Path, PurePosixPath
 from flask import Blueprint, Response, g, jsonify, request, send_file, render_template
 
 from db import Database, normalize_search_text, utc_now
-from formats import CONTENT_ARCADE, CONTENT_DLC, CONTENT_GOD, CONTENT_TITLE_UPDATE, is_cache_title_update, parse_stfs_header
+from formats import CONTENT_ARCADE, CONTENT_AVATAR, CONTENT_DLC, CONTENT_GOD, CONTENT_TITLE_UPDATE, is_cache_title_update, parse_stfs_header
 from remote import RemoteClient
 from validation import validate_god, validate_title_update
 from unlock import is_unlocked, unlock_package
@@ -284,7 +284,7 @@ class ConsoleService:
         if not root.is_relative_to(self.config.output_dir.resolve()):
             raise ConsoleError("INVALID_PATH", "Title directory is outside the output root", 409)
         result = []
-        for folder in ("00007000", "000D0000", "00000002", "000B0000", "Cache"):
+        for folder in ("00007000", "000D0000", "00000002", "00009000", "000B0000", "Cache"):
             directory = root / folder
             for p in sorted(directory.glob("*")):
                 if not p.is_file() or p.is_symlink() or p.name.endswith((".bak", ".partial", ".previous")):
@@ -292,7 +292,7 @@ class ConsoleService:
                 info = parse_stfs_header(p)
                 if info is None or info.title_id != title_id:
                     continue
-                kinds = {CONTENT_GOD: "god", CONTENT_ARCADE: "xbla", CONTENT_DLC: "dlc", CONTENT_TITLE_UPDATE: "title_update"}
+                kinds = {CONTENT_GOD: "god", CONTENT_ARCADE: "xbla", CONTENT_DLC: "dlc", CONTENT_AVATAR: "avatar", CONTENT_TITLE_UPDATE: "title_update"}
                 if info.content_type not in kinds:
                     continue
                 if folder != "Cache" and folder != info.content_folder:
@@ -478,7 +478,7 @@ class ConsoleService:
             if len(sources) > 1: result['name'] += f" · {len(sources)} sources"
         with self.connect() as c:
             links = c.execute('SELECT release_id,job_id FROM console_request_sources WHERE request_id=?', (row['id'],)).fetchall()
-            artifact = c.execute('SELECT bytes,expires FROM console_artifacts WHERE id=?', (row['artifact_id'],)).fetchone()
+            artifact = c.execute('SELECT bytes,expires,manifest FROM console_artifacts WHERE id=?', (row['artifact_id'],)).fetchone()
             inbox = c.execute('SELECT accepted_at FROM console_inbox WHERE request_id=?', (row['id'],)).fetchone()
             transfer = c.execute('SELECT * FROM console_transfers WHERE request_id=?', (row['id'],)).fetchone()
             event = c.execute('SELECT created_at FROM console_events WHERE request_id=? ORDER BY created_at DESC,rowid DESC LIMIT 1', (row['id'],)).fetchone()
@@ -488,6 +488,8 @@ class ConsoleService:
             if job:
                 jobs.append({k: job[k] for k in ('id', 'status', 'stage', 'progress', 'message')})
         result['jobs'] = jobs
+        avatars = [v for v in json.loads(artifact['manifest']).get('components', []) if v['kind']=='avatar'] if artifact else []
+        result.update(avatar_count=len(avatars),avatar_unlock=any(v.get('avatar_unlock') for v in avatars))
         if row['state'] in {'queued', 'waiting', 'preparing'} and jobs:
             total = max(len(releases), len(jobs))
             result['progress'] = min(99, sum(100 if j['status'] == 'complete' else max(0, min(100, j['progress'] or 0)) for j in jobs) / total)
@@ -510,6 +512,7 @@ class ConsoleService:
             view = self.admin_request_view(dict(row), None)
             items.append({k: view[k] for k in ('id','name','state','message','error_code','conversion','selection','progress','expires_at','accepted_at')})
             items[-1].update(bytes=str(view['prepared_bytes']), art_title_id=artwork.get(view['selection'].get('release_id')))
+            items[-1].update(contains_avatar=view['avatar_count']>0,avatar_unlock=view['avatar_unlock'])
         return {'items': items, 'limit': 32, 'retention_days': self.retention // 86400}
 
     def delete_request_files(self, rid):
@@ -631,12 +634,12 @@ class ConsoleService:
         else:
             # No implicit DLC or title-update installation.
             role = disc_info(item["name"])["disc_role"] if item["source_kind"] == "disc" else "play"
-            allowed = {"dlc"} if is_addon_source(item["name"]) or payload.get("for_title_id") or role == "content" else {"god", "dlc"} if role == "mixed" else {"god"} if item["source_kind"] == "disc" else {"xbla", "dlc"}
+            allowed = {"dlc", "avatar"} if is_addon_source(item["name"]) or payload.get("for_title_id") or role == "content" else {"god", "dlc", "avatar"} if role == "mixed" else {"god"} if item["source_kind"] == "disc" else {"xbla", "dlc", "avatar"}
             produced = {str(Path(p).resolve()) for p in Database.decode_output_paths(job.get("artifact_paths"))}
             components = [c for c in components if c["kind"] in allowed and str(c["_path"].resolve()) in produced]
         if not components:
             raise ConsoleError("METADATA_UNKNOWN", "No supported, identified components are ready for this release", 409)
-        if payload.get("for_title_id") and any(c["kind"] != "dlc" or c["title_id"].upper() != payload["for_title_id"] for c in components):
+        if payload.get("for_title_id") and any(c["kind"] not in {"dlc", "avatar"} or c["title_id"].upper() != payload["for_title_id"] for c in components):
             raise ConsoleError("INCOMPATIBLE_DLC", "The actual DLC package does not belong to the selected game; nothing was installed", 409)
         self.publish_packages(row, payload, components)
 
@@ -665,7 +668,7 @@ class ConsoleService:
             if job["status"] != "complete": continue
             produced = {str(Path(p).resolve()) for p in Database.decode_output_paths(job.get("artifact_paths"))}
             role = disc_info(item["name"])["disc_role"] if discs else "content"
-            kinds = {"god", "dlc"} if role == "mixed" else {"god"} if discs and role == "play" else {"dlc"}
+            kinds = {"god", "dlc", "avatar"} if role == "mixed" else {"god"} if discs and role == "play" else {"dlc", "avatar"}
             selected = [c for c in self.components(item) if c["kind"] in kinds and str(c["_path"].resolve()) in produced]
             incomplete = not selected or (role == "mixed" and not {"god", "dlc"} <= {c["kind"] for c in selected})
             if incomplete and job.get("reprocess_of") is None:
@@ -742,6 +745,9 @@ class ConsoleService:
         if payload.get("kind") in {"dlc_bundle", "disc_bundle"}: manifest["release_ids"] = payload["release_ids"]
         if payload.get("kind") == "disc_bundle":
             manifest["warnings"] = list(dict.fromkeys(disc_info(self.item(r)["name"])["disc_note"] for r in payload["release_ids"]))
+        if any(c['kind']=='avatar' for c in components):
+            manifest['min_client_version']='1.0.0-alpha.11'
+            if payload['unlock_packages']:manifest['warnings'].append('Avatar unlocks need a signed-in Live-enabled or activated offline profile. Ownership is applied on the Xbox; profiles are not modified.')
         try:
             all_files, seen = [], set()
             for component in components:
@@ -789,6 +795,12 @@ class ConsoleService:
                     checked = validate_god(staged, full_data=True)
                     entry.update(checked)
                     game_info[entry["media_id"]] = checked
+                elif component["kind"] == "avatar":
+                    with staged.open('rb') as avatar: avatar.seek(0x3E1); asset_id = avatar.read(16)
+                    if len(asset_id)!=16 or not any(asset_id) or asset_id[-4:].hex().upper()!=component['title_id']:
+                        raise ConsoleError('VALIDATION_FAILED', 'Avatar asset identity differs from its package Title ID')
+                    entry.update(avatar_unlock=payload['unlock_packages'],license_state='on_console' if payload['unlock_packages'] else 'preserved',validation='metadata_and_transport')
+                    self.validate_content(staged)
                 elif component["kind"] == "title_update":
                     entry.update(validate_title_update(staged, title_id=entry["title_id"]))
                 else:
@@ -1035,7 +1047,7 @@ def register_console_api(app, config, database, runner, remote, start_background
                        max_file_bytes=str(MAX_FILE), checksums=["sha256"], pairing=True,
                        online_title_updates=config.xboxunity_tu_downloads, store_browsing=True, dlc_multi_select=True, max_dlc_sources=32,
                        disc_multi_select=True, max_disc_sources=8, disc_set_conversion="server",
-                       prepared_inbox=True, max_inbox_items=32)
+                       prepared_inbox=True, max_inbox_items=32,avatar_items=True,avatar_min_client_version="1.0.0-alpha.11",avatar_unlock="online_xuid_on_console")
 
     @api.post("/pairings")
     def pair():

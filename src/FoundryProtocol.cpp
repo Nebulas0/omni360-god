@@ -101,7 +101,8 @@ bool FoundryParseManifest(const char *json, FoundryManifest *out, std::string *e
             if(dc){ok=ok&&cJSON_IsNumber(dc)&&dc->valuedouble>=0&&dc->valuedouble<=255&&dc->valuedouble==(int)dc->valuedouble;if(ok)comp.discCount=(unsigned)dc->valueint;}
             ok=ok && FoundryHex(comp.id,32) && FoundryHex(comp.titleId,8) && FoundryHex(comp.mediaId,8)
                 && FoundryHex(comp.contentType,8) && FoundryHex(comp.contentId,40) && FoundryHex(comp.baseVersion,8);
-            const char *expected=comp.kind=="god"?"00007000":comp.kind=="xbla"?"000D0000":comp.kind=="dlc"?"00000002":comp.kind=="title_update"?"000B0000":"";
+            const char *expected=comp.kind=="god"?"00007000":comp.kind=="xbla"?"000D0000":comp.kind=="dlc"?"00000002":comp.kind=="avatar"?"00009000":comp.kind=="title_update"?"000B0000":"";
+            if(comp.kind=="avatar"){const cJSON *unlock=cJSON_GetObjectItemCaseSensitive(c,"avatar_unlock");ok=ok&&cJSON_IsBool(unlock);comp.avatarUnlock=cJSON_IsTrue(unlock);}
             ok=ok && comp.contentType==expected;
             ok=ok && componentIds.insert(comp.id).second;
             if(comp.kind=="god")

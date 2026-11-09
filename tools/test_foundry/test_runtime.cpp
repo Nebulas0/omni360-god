@@ -19,6 +19,7 @@
 static std::string hostRoot;
 static unsigned long long diskAvailable=100ULL*1024*1024*1024;
 static unsigned diskQueries=0;
+static XUID avatarTestXuid=0;
 static int crashAfterMove=-1;
 struct PowerLoss {};
 static std::string MapPath(std::string p)
@@ -44,6 +45,8 @@ int test_snprintf(char *out,size_t n,const char *format,...)
     va_list args;va_start(args,format);int result=vsnprintf(out,n,f.c_str(),args);va_end(args);return result;
 }
 extern "C" void dprintf(const char*,...){}
+extern "C" DWORD XUserGetSigninInfo(DWORD user,DWORD flag,XUSER_SIGNIN_INFO *info)
+{memset(info,0,sizeof(*info));if(user==0&&avatarTestXuid){info->xuid=flag==1?avatarTestXuid:0xE000000000000001ULL;info->UserSigninState=eXUserSigninState_SignedInLocally;return 0;}return 1;}
 extern "C" DWORD GetFileAttributesA(const char *p)
 {struct stat s;if(stat(MapPath(p).c_str(),&s))return INVALID_FILE_ATTRIBUTES;return S_ISDIR(s.st_mode)?FILE_ATTRIBUTE_DIRECTORY:FILE_ATTRIBUTE_NORMAL;}
 extern "C" BOOL CreateDirectoryA(const char *p,void*){return mkdir(MapPath(p).c_str(),0700)==0;}
@@ -100,7 +103,7 @@ static void Case(const char *name)
 {
     hostRoot=std::string(getenv("FOUNDRY_TEST_ROOT"))+"/"+name;assert(mkdir(hostRoot.c_str(),0700)==0);
     assert(mkdir((hostRoot+"/game").c_str(),0700)==0);assert(mkdir((hostRoot+"/Hdd1").c_str(),0700)==0);
-    g_stop=g_cancel=0;g_started=true;g_used=g_pending=false;g_delivered=false;g_work=Work();crashAfterMove=-1;
+    g_stop=g_cancel=0;g_started=true;g_used=g_pending=false;g_delivered=false;g_work=Work();crashAfterMove=-1;avatarTestXuid=0;
     g_transferBase=g_transferTotal=g_transferJobDone=g_transferJobTotal=0;g_transferFile=g_transferFiles=0;
     diskAvailable=100ULL*1024*1024*1024;diskQueries=0;
     g_device=Device();g_device.id=std::string(32,'a');g_device.token="fg_"+std::string(43,'b');g_device.sequence=0;
@@ -340,8 +343,41 @@ static void PreparedInbox()
     assert(!g_device.autoInbox);g_device.autoInbox=true;assert(SaveDevice());g_device=Device();LoadDevice();assert(g_device.autoInbox);
     SetFoundryInstallPaths("Usb0:\\Games","Usb0:\\Content\\0000000000000000");assert(g_defaultGames=="Usb0:\\Games");
 }
+static unsigned long long TestBE64(const std::string &s,size_t at)
+{return (static_cast<unsigned long long>(BE32((const unsigned char*)s.data()+at))<<32)|BE32((const unsigned char*)s.data()+at+4);}
+static void AvatarItems()
+{
+    Case("avatar-items");Work w;w.games=w.content="Hdd1:\\Content\\0000000000000000";
+    std::string raw=Header();raw[0x342]=(char)0xAD;raw[0x343]=0x0E;memset(&raw[0x22C],0xFF,8);raw[0x345]=0;raw[0x346]=(char)0x90;raw[0x3E1]=1;memcpy(&raw[0x3ED],&raw[0x360],4);raw[0x23B]=1;
+    br_sha1_context sha;br_sha1_init(&sha);br_sha1_update(&sha,raw.data()+0x344,raw.size()-0x344);br_sha1_out(&sha,&raw[0x32C]);raw+="AVATAR PAYLOAD";
+    std::string aid(32,'c');FoundryComponent original;original.kind="avatar";original.titleId="415607E1";original.contentType="00009000";original.avatarUnlock=true;
+    FoundryFile f;f.root="content";f.role="package";f.path="415607E1/00009000/original";f.bytes=raw.size();original.files.push_back(f);
+    std::string source=Stage(w.content,aid)+"\\files\\"+Native(f.path);Put(source,raw);std::string error;FoundryComponent patched=original;
+    assert(!FoundryCanUnlockAvatars()&&!PatchAvatarForInstall(w,aid,&patched,&error));assert(Get(source)==raw);
+    avatarTestXuid=0x0009000000000001ULL;assert(FoundryCanUnlockAvatars());patched=original;assert(PatchAvatarForInstall(w,aid,&patched,&error));
+    assert(patched.titleId=="AAAAAAAA"&&patched.files[0].path.find("AAAAAAAA/00009000/")==0&&Get(source)==raw);
+    std::string staged=Stage(w.content,aid)+"\\files\\"+Native(patched.files[0].path),bytes=Get(staged);
+    assert(bytes.substr(0xB000)=="AVATAR PAYLOAD"&&TestBE64(bytes,0x23C)==avatarTestXuid&&TestBE64(bytes,0x22C)==~0ULL);
+    FoundryManifest m;m.id=aid;m.components.push_back(patched);assert(Commit(w,m,&error));
+    std::string installed=w.content+"\\"+Native(patched.files[0].path);assert(Get(installed)==bytes);
+    // A second profile is added without losing the first owner's license.
+    avatarTestXuid=0x0009000000000002ULL;patched=original;assert(PatchAvatarForInstall(w,aid,&patched,&error));bytes=Get(staged);
+    bool first=false,second=false;for(unsigned i=1;i<16;++i){first|=TestBE64(bytes,0x22C+i*16)==0x0009000000000001ULL;second|=TestBE64(bytes,0x22C+i*16)==avatarTestXuid;}assert(first&&second);
+    m.components[0]=patched;crashAfterMove=1;try{Commit(w,m,&error);assert(false);}catch(const PowerLoss&){}crashAfterMove=-1;
+    assert(Recover(&error)&&TestBE64(Get(installed),0x23C)==0x0009000000000001ULL); // rollback restored previous owner/header
+    assert(Commit(w,m,&error)&&Get(installed)==bytes);
+    m.components.push_back(patched);assert(!Commit(w,m,&error)&&Get(installed)==bytes&&!Exists(TXN));m.components.pop_back();
+    // Full license tables and local profile IDs cannot silently discard owners.
+    std::vector<unsigned char> h(raw.begin(),raw.begin()+0xB000),before;for(unsigned i=1;i<16;++i){unsigned long long x=0x0009000000000100ULL+i;for(int j=7;j>=0;--j){h[0x22C+i*16+j]=(unsigned char)x;x>>=8;}}
+    before=h;std::vector<unsigned long long> owners;owners.push_back(0x0009000000000003ULL);std::string rel,id;
+    assert(!AvatarPatchHeader(&h,owners,&rel,&id,&error)&&h==before);
+    owners[0]=0xE000000000000001ULL;assert(!AvatarPatchHeader(&h,owners,&rel,&id,&error));
+    cJSON *reply=cJSON_Parse("{\"items\":[{\"id\":\"dddddddddddddddddddddddddddddddd\",\"name\":\"Avatar pack\",\"state\":\"ready\",\"contains_avatar\":true,\"avatar_unlock\":true,\"selection\":{\"release_id\":\"catalog-1\"}}]}");
+    std::vector<Work> ready;avatarTestXuid=0;assert(ReadPrepared(reply,w.games.c_str(),w.content.c_str(),&ready)&&ready.empty());
+    avatarTestXuid=0x0009000000000001ULL;assert(ReadPrepared(reply,w.games.c_str(),w.content.c_str(),&ready)&&ready.size()==1);cJSON_Delete(reply);
+}
 int main()
 {
-    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();AggregateProgress();CatalogCache();CatalogTransport();MultiDiscReplacement();PreparedInbox();
+    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();AggregateProgress();CatalogCache();CatalogTransport();MultiDiscReplacement();PreparedInbox();AvatarItems();
     std::cout<<"Real client runtime: interrupted transfers, in-piece resume, lost POST/reboot idempotency, cross-server guard, GoD/Cache TU power cuts, shared-volume space and durable prepared-inbox checks passed\n";
 }

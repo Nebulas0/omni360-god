@@ -16,7 +16,8 @@ struct FoundryComponent
     std::string id, kind, titleId, mediaId, contentType, contentId, baseVersion;
     std::vector<FoundryFile> files;
     unsigned discNumber,discCount;
-    FoundryComponent():discNumber(0),discCount(0){}
+    bool avatarUnlock;
+    FoundryComponent():discNumber(0),discCount(0),avatarUnlock(false){}
 };
 
 struct FoundrySource

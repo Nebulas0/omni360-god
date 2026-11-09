@@ -66,6 +66,7 @@ function renderRequest(request, expanded) {
   top.append(heading, el("span", `status-chip ${installed ? "success" : failed ? "warning" : ""}`, status)); card.append(top);
   card.append(el("p", "request-meta", `${request.conversion === "server" ? "Server preparation" : "ISO download · convert on Xbox"} · Requested ${date(request.created_at)}`));
   if(request.inbox)card.append(el("p","muted",`Prepared for Xbox inbox${request.accepted_at?" · accepted by Xbox":" · waiting for Xbox"}${request.expires_at?` · expires ${date(new Date(request.expires_at*1000).toISOString())}`:""}`));
+  if(request.avatar_count)card.append(el("p","muted",`${request.avatar_count} Avatar items · Omni360 alpha.11 or newer required${request.avatar_unlock?" · unlocks when a compatible profile is signed in on Xbox":" · supplied licenses preserved"}`));
   const progress = el("div", "activity-box");
   if (preparing) {
     const bar = el("progress"); bar.max = 100; if (request.jobs.length) bar.value = request.progress;

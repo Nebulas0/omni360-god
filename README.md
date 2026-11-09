@@ -6,7 +6,7 @@ packages or download an ISO archive for on-console conversion.
 
 Based on upstream **Omni360 0.13.4-beta** (`6d9c323`), with the Foundry service
 integration and the fork's own signed updater preserved. Fork version:
-**1.0.0-alpha.9**.
+**1.0.0-alpha.11**.
 
 Foundry multi-disc games select the matching edition's discs by default, with
 a checklist before installation. Play discs become GoD; supported content discs
@@ -25,6 +25,8 @@ Physical-console acceptance is still required.
 - Switch **Foundry / my website** or **Archive.org** in **Settings > General > Store source**.
 - Queue progress includes file counts, whole-download bytes and estimates; Xbox conversion has separate progress.
 - Select multiple matching DLCs in one list, with one unlock / preserve-license choice.
+- [Avatar item packs](docs/AVATAR-ITEMS.md) can be prepared with add-ons. The Xbox
+  assigns ownership locally to compatible signed-in profiles; profiles are never edited.
 - Source versions scroll their focused name; **Y** opens the full filename.
 - Recent catalog pages are cached, with background preloading to reduce waits.
 - Pair on your Foundry website at `/consoles`.
@@ -243,6 +245,11 @@ If you'd like to chip in anyway, you can sponsor it on GitHub. It's entirely opt
 AGPL-3.0, inherited from the original X-Store project (see `LICENSE`). Vendored components keep their own licenses: BearSSL (`SSL/`, MIT), zlib (`zlib/`, zlib license), cJSON (`cJSON.c/.h`, MIT), dmc_unrar (`dmc_unrar/`, GPL-2.0-or-later), the Selawik font (OFL). A modified version you distribute must stay under AGPL-3.0 with copyright notices preserved and source available to anyone you give the binary to.
 
 ### Credits
+
+Foundry Avatar package metadata handling follows
+[F4b1-/avatar-thrift-store](https://github.com/F4b1-/avatar-thrift-store).
+Its MIT notice is retained in [licenses/avatar-thrift-store-MIT.txt](licenses/avatar-thrift-store-MIT.txt).
+This fork uses its item ownership method, without profile activation or profile edits.
 
 Omni360 is a modified version of [X-Store](https://github.com/951261/X-Store) by 951261, released under AGPL-3.0; this section is its notice that it has been modified (AGPL-3.0 section 5(a)). Most of the application has since been rewritten, but X-Store's code is still at its foundation: the TLS wrapper around BearSSL (`XboxTLS.cpp/.h`), the HTTPS client (`downloadFile.cpp`), DNS (`dns.cpp`), URL and text helpers (`parsing.cpp`), drive mounting (`driveMount.c`), the log console (`OutputConsole.cpp`) and the on-screen keyboard (`Keyboard.cpp`). Several of those files carry `PROGRAMMER : 951261` headers. Those headers are copyright notices, and AGPL-3.0 requires them to survive - rename the product as much as you like, but leave them, and this section, in place.
 

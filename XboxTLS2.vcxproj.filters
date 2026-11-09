@@ -160,6 +160,7 @@
     <ClCompile Include="src\Foundry.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\FoundryStore.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\FoundryProtocol.cpp"><Filter>Source Files</Filter></ClCompile>
+    <ClCompile Include="src\AvatarPackage.cpp"><Filter>Source Files</Filter></ClCompile>
     <ClCompile Include="src\GameInstaller.cpp">
       <Filter>Source Files\Installs</Filter>
     </ClCompile>
@@ -1196,6 +1197,7 @@
     </ClInclude>
     <ClInclude Include="src\Foundry.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\FoundryProtocol.h"><Filter>Header Files</Filter></ClInclude>
+    <ClInclude Include="src\AvatarPackage.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\ContentWriteLock.h"><Filter>Header Files</Filter></ClInclude>
     <ClInclude Include="src\GameInstaller.h">
       <Filter>Source Files\Installs</Filter>

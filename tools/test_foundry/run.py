@@ -43,7 +43,7 @@ with tempfile.TemporaryDirectory(prefix="foundry-protocol-") as temp:
     subprocess.run([clangxx, "-std=c++03", "-fms-extensions", "-ffunction-sections", "-fdata-sections",
                     "-D_XBOX", "-I", str(root / "tools/test_foundry/shim"), "-I", str(root / "src"),
                     "-I", str(root / "SSL"), "-Wno-deprecated-declarations", "-Wno-format",
-                    str(root / "tools/test_foundry/test_runtime.cpp"), str(root / "src/FoundryProtocol.cpp"),
+                    str(root / "tools/test_foundry/test_runtime.cpp"), str(root / "src/FoundryProtocol.cpp"), str(root / "src/AvatarPackage.cpp"),
                     *objects, linker_gc, "-o", str(runtime)], check=True)
     test_root = Path(temp) / "filesystem"
     test_root.mkdir()
