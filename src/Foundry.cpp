@@ -396,7 +396,7 @@ static bool RangeDownload(const std::string &url,const std::string &partial,unsi
 {
     if(!size||start>fullSize||size>fullSize-start||!Parents(partial)){*error="Invalid download range or staging path";return false;}
     if(Length(partial)>size)DeleteFileA(partial.c_str());
-    unsigned failures=0;
+    unsigned failures=0;int lastStatus=0;
     for(unsigned attempt=0;attempt<200 && failures<6;++attempt)
     {
         if(Cancelled()){*error="Paused; downloaded bytes are kept for resume";return false;}
@@ -412,11 +412,19 @@ static bool RangeDownload(const std::string &url,const std::string &partial,unsi
         if(after<before||after>size){*error="Download length changed unexpectedly";return false;}
         if(after==size)return true; // Full-file SHA-256/ZIP CRC is checked by the caller.
         if(status==HTTP_STATUS_CANCELLED||Cancelled()){*error="Paused; downloaded bytes are kept for resume";return false;}
-        if(!FoundryRetryableStatus(status)&&status!=206){*error=status==401||status==403?"Pair this console again":"Server could not resume this immutable download";return false;}
+        lastStatus=status;
+        if(status!=206)dprintf("[foundry] resume HTTP %d at %I64u/%I64u for %s\n",status,start+before,fullSize,url.c_str());
+        // A proxy can temporarily return 404 while its healthy app route is
+        // being replaced. Retry this idempotent range without touching bytes.
+        // Keep strict ETag/range/length checks; never append an HTML response.
+        if(!FoundryRetryableStatus(status)&&status!=206&&status!=404){
+            if(status==401||status==403)*error="Pair this console again";
+            else{char message[256];_snprintf(message,sizeof(message),"Download stopped (HTTP %d). %s Checked and partial files are kept.",status,status==409||status==410?"Prepare this selection again on the website.":"Resume the interrupted installation when the server is available.");message[sizeof(message)-1]=0;*error=message;}
+            return false;}
         failures=after>before?0:failures+1;
         if(!RetryPause(failures))break;
     }
-    *error="Connection interrupted; partial download is saved for resume";return false;
+    *error=lastStatus==404?"Download temporarily unavailable (HTTP 404). Resume the interrupted installation; checked and partial files are kept.":"Connection interrupted; partial download is saved for resume";return false;
 }
 static bool Fetch(const std::string &path,const std::string &destination,unsigned long long bytes,const std::string &sha,std::string *error)
 {

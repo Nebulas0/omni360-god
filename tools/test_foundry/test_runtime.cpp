@@ -117,6 +117,7 @@ static std::string Header()
 }
 static std::string netData;
 static std::vector<unsigned> cuts;
+static std::vector<int> rangeStatuses;
 static std::vector<unsigned long long> offsets;
 static int postLosses=0,posts=0,serverCreates=0;
 static bool cancelTransfer=false,firstPostWasDurable=false;
@@ -151,6 +152,7 @@ int httpRequestHTTPS(const std::string,HttpMethod method,const char *body,const 
     assert(sscanf(range.c_str(),"bytes=%llu-%llu",&start,&end)==2&&start<=end&&end<netData.size());
     assert(expected==end-start+1);assert(std::string(policy->contentRange)=="bytes "+Decimal(start)+"-"+Decimal(end)+"/"+Decimal(netData.size()));
     assert(HeaderValue(headers,"If-Range")==policy->etag);offsets.push_back(start);
+    if(!rangeStatuses.empty()){int status=rangeStatuses[0];rangeStatuses.erase(rangeStatuses.begin());if(status!=206)return status;}
     unsigned long long n=expected;
     if(!cuts.empty()){n=std::min(n,(unsigned long long)cuts[0]);cuts.erase(cuts.begin());}
     FILE *f=host_fopen(filename.c_str(),append?"ab":"wb");assert(f);assert(fwrite(netData.data()+(size_t)start,1,(size_t)n,f)==n);fclose(f);
@@ -166,6 +168,18 @@ static void Transfers()
     Put("game:\\expected",netData);std::string sha,error;assert(HashFile("game:\\expected",&sha,netData.size()));
     assert(Fetch("/api/console/v1/artifacts/id/files/"+std::string(32,'e'),dest,netData.size(),sha,&error));
     assert(Get(dest)==netData&&offsets.size()==3&&offsets[0]==0&&offsets[1]==7&&offsets[2]==12);
+    // Proxy route replacement can return404 mid-file; retry the exact suffix
+    // without erasing the already durable prefix or relaxing response checks.
+    Case("temporary-route-404");offsets.clear();cuts.clear();rangeStatuses.clear();rangeStatuses.push_back(404);rangeStatuses.push_back(404);
+    std::string saved="Hdd1:\\resume\\piece.part";Put(saved,netData.substr(0,9));
+    assert(RangeDownload("/api/console/v1/artifacts/id/files/"+std::string(32,'e'),saved,netData.size(),0,netData.size(),sha,&error));
+    assert(Get(saved)==netData&&offsets.size()==3&&offsets[0]==9&&offsets[1]==9&&offsets[2]==9);
+    Case("persistent-route-404");offsets.clear();rangeStatuses.assign(6,404);Put(saved,netData.substr(0,9));
+    assert(!RangeDownload("/api/console/v1/artifacts/id/files/"+std::string(32,'e'),saved,netData.size(),0,netData.size(),sha,&error));
+    assert(error.find("HTTP 404")!=std::string::npos&&Get(saved)==netData.substr(0,9)&&offsets.size()==6&&rangeStatuses.empty());
+    Case("permanent-artifact-response");offsets.clear();rangeStatuses.push_back(410);Put(saved,netData.substr(0,9));
+    assert(!RangeDownload("/api/console/v1/artifacts/id/files/"+std::string(32,'e'),saved,netData.size(),0,netData.size(),sha,&error));
+    assert(error.find("HTTP 410")!=std::string::npos&&Get(saved)==netData.substr(0,9)&&offsets.size()==1);
     // A power-cycle/cancel preserves a short partial and resumes its suffix.
     Case("cancel-resume");offsets.clear();cuts.clear();cuts.push_back(9);cancelTransfer=true;
     assert(!Fetch("/api/console/v1/artifacts/id/files/"+std::string(32,'e'),dest,netData.size(),sha,&error));

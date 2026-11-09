@@ -96,7 +96,12 @@ Activation saves the active job before removing its pending-list entry. Local
 completion receipts prevent a lost final report or a repeated click from causing
 an automatic reinstall. Missing success reports are retried during idle checks.
 Completed receipts are bounded to 256 request IDs; selection lists are bounded
-to 32. Existing checksum, range/ETag resume, disk-space and transactional install
+to 32. Temporary404 responses during a proxy/app rollout are retried with bounded
+backoff, keeping the same range and partial bytes. A persistent404 or permanent
+artifact error stops with its HTTP status and keeps local files. This does not
+weaken ETag, content-range, length or checksum validation.
+
+Existing checksum, range/ETag resume, disk-space and transactional install
 checks remain the file-writing path. A new deliberate reinstall starts with a
 new website request; installed content is never assumed solely from server-ready.
 
