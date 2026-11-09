@@ -33,6 +33,13 @@ detection. Offline profile activation is outside this integration. Run the
 The recorded baseline is not a claim about the newest upstream release. Check
 the official repository and pin the exact commit for each future update.
 
+Alpha.12 adds exact-identity prepared groups, base-before-add-on queue ordering,
+artwork propagation, full waiting/active/completed snapshots and persistent bounded
+completion display history. Preserve the separate active-job snapshot used for
+resume controls, stable UI IDs and the original completion receipts. See
+[Prepared for Xbox](PREPARED-FOR-XBOX.md). The server keeps existing requests and
+snapshots unchanged; grouped browsing does not merge or rewrite package files.
+
 ## What we added
 
 | Area | Main files | Behavior to retain |

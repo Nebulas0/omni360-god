@@ -4,7 +4,7 @@
 #define SETTINGS_H
 
 #ifndef CURRENT_VERSION
-#define CURRENT_VERSION "1.0.0-alpha.11"
+#define CURRENT_VERSION "1.0.0-alpha.12"
 #endif
 #define UPSTREAM_VERSION "0.13.4-beta"
 

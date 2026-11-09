@@ -6,6 +6,8 @@
 #include <vector>
 struct cJSON;
 
+#define MAX_FOUNDRY_JOBS 65
+
 // Foundry is independent of the Archive.org catalog and credentials.
 bool StartFoundry(const char *gamesRoot, const char *contentRoot);
 void StopFoundry(DWORD timeoutMs);
@@ -29,6 +31,7 @@ void PrefetchFoundryStore(const std::string &path);
 void ClearFoundryStoreCache();
 void FoundryInstallFromStore(const std::string &release, const std::string &name,
                             const char *gamesRoot, const char *contentRoot, bool digital, const std::string &forTitle=std::string());
+int SnapshotFoundryActiveJob(QueueJobSnapshot *out);
 int SnapshotFoundryJobs(QueueJobSnapshot *out, int maximum);
 bool TakeFinishedFoundryJob(QueueJobSnapshot *out);
 bool IsFoundryJobId(int id);

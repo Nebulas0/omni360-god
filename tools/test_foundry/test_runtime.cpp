@@ -103,6 +103,7 @@ static void Case(const char *name)
 {
     hostRoot=std::string(getenv("FOUNDRY_TEST_ROOT"))+"/"+name;assert(mkdir(hostRoot.c_str(),0700)==0);
     assert(mkdir((hostRoot+"/game").c_str(),0700)==0);assert(mkdir((hostRoot+"/Hdd1").c_str(),0700)==0);
+    g_waiting.clear();g_finished.clear();g_queueIds.clear();g_inboxLoaded=false;g_nextQueueId=JOB_ID;
     g_stop=g_cancel=0;g_started=true;g_used=g_pending=false;g_delivered=false;g_work=Work();crashAfterMove=-1;avatarTestXuid=0;
     g_transferBase=g_transferTotal=g_transferJobDone=g_transferJobTotal=0;g_transferFile=g_transferFiles=0;
     diskAvailable=100ULL*1024*1024*1024;diskQueries=0;
@@ -343,6 +344,39 @@ static void PreparedInbox()
     assert(!g_device.autoInbox);g_device.autoInbox=true;assert(SaveDevice());g_device=Device();LoadDevice();assert(g_device.autoInbox);
     SetFoundryInstallPaths("Usb0:\\Games","Usb0:\\Content\\0000000000000000");assert(g_defaultGames=="Usb0:\\Games");
 }
+static void VisiblePreparedQueue()
+{
+    Case("visible-prepared-queue");std::string error;std::vector<Work> items;
+    for(int i=0;i<4;++i){Work w;w.inbox=true;w.request=std::string(32,'1'+i);w.name=i<2?"Selected DLC":"Selected game";w.addon=i<2;w.art=0x415607E1;
+        w.games=w.content="Hdd1:\\Content\\0000000000000000";w.origin=g_device.origin;w.device=g_device.id;w.body="{}";items.push_back(w);}
+    assert(QueuePrepared(items,&error));QueueJobSnapshot snaps[MAX_FOUNDRY_JOBS];int count=SnapshotFoundryJobs(snaps,MAX_FOUNDRY_JOBS);assert(count==4);
+    assert(snaps[0].kind==QUEUE_JOB_GAME_INSTALL&&snaps[1].kind==QUEUE_JOB_GAME_INSTALL&&snaps[2].kind==QUEUE_JOB_DLC_PACK);
+    for(int i=0;i<count;++i){assert(snaps[i].titleId==0x415607E1);for(int j=0;j<i;++j)assert(snaps[i].id!=snaps[j].id);}
+    int firstId=snaps[0].id,waitingId=snaps[3].id;
+    assert(StartNextPrepared(&error));g_snap.state=QUEUE_ACTIVE;assert(SnapshotFoundryJobs(snaps,MAX_FOUNDRY_JOBS)==4&&snaps[0].id==firstId&&snaps[0].state==QUEUE_ACTIVE);
+    Work restored;assert(LoadWork(&restored)&&restored.art==0x415607E1&&!restored.addon);
+    std::vector<Work> pending;assert(LoadInbox(&pending)&&pending.size()==3);assert(SaveInbox(pending,g_work.request));DeleteFileA(JOB);Finish(true,"");
+    assert(SnapshotFoundryJobs(snaps,MAX_FOUNDRY_JOBS)==4&&snaps[3].id==firstId&&snaps[3].state==QUEUE_FINISHED);
+    QueueJobSnapshot delivered;assert(TakeFinishedFoundryJob(&delivered)&&delivered.id==firstId);assert(StartNextPrepared(&error));g_snap.state=QUEUE_ACTIVE;
+    assert(SnapshotFoundryJobs(snaps,MAX_FOUNDRY_JOBS)==4&&snaps[0].id!=firstId&&snaps[3].id==firstId);
+    int active=snaps[0].id;CancelFoundryJob(waitingId);assert(!g_cancel&&LoadInbox(&pending)&&pending.size()==1);
+    CancelFoundryJob(active);assert(g_cancel);Finish(false,"Paused for test");assert(SnapshotFoundryJobs(snaps,MAX_FOUNDRY_JOBS)==3&&snaps[0].id==active);
+    // History survives restart; dismissing a row keeps its no-reinstall receipt.
+    std::string completed=g_finished[0].work.request;g_finished.clear();g_inboxLoaded=false;assert(LoadInbox(&pending)&&g_finished.size()==1);
+    assert(g_finished[0].snap.titleId==0x415607E1&&FoundryPreparedCompleted(completed));
+    RemoveFoundryJob(g_finished[0].snap.id);assert(g_finished.empty()&&FoundryPreparedCompleted(completed));
+    Case("prepared-group-selection");
+    cJSON *reply=cJSON_Parse("{\"items\":[{\"id\":\"11111111111111111111111111111111\",\"group_id\":\"33333333333333333333333333333333\",\"name\":\"DLC\",\"content_kind\":\"addon\",\"art_title_id\":\"415607E1\",\"state\":\"ready\",\"selection\":{}},{\"id\":\"33333333333333333333333333333333\",\"group_id\":\"33333333333333333333333333333333\",\"name\":\"Game\",\"content_kind\":\"game\",\"state\":\"ready\",\"selection\":{}},{\"id\":\"44444444444444444444444444444444\",\"name\":\"Other game\",\"content_kind\":\"game\",\"state\":\"ready\",\"selection\":{}}]}");
+    std::vector<Work> ready;assert(ReadPrepared(reply,items[0].games.c_str(),items[0].content.c_str(),&ready));
+    FilterPrepared(reply,std::string(32,'3'),&ready);assert(ready.size()==2&&!ready[0].addon&&ready[1].addon&&ready[1].art==0x415607E1);
+    cJSON_AddBoolToObject(cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(reply,"items"),0),"wait_for_base",true);
+    assert(ReadPrepared(reply,items[0].games.c_str(),items[0].content.c_str(),&ready));FilterPrepared(reply,std::string(32,'3'),&ready);assert(ready.size()==1&&!ready[0].addon);
+    Case("upgrade-saved-queue-metadata");std::vector<Work> legacy;legacy.push_back(items[0]);legacy.push_back(items[2]);
+    for(size_t i=0;i<legacy.size();++i){legacy[i].addon=false;legacy[i].art=0;}
+    assert(QueuePrepared(legacy,&error)&&RefreshQueuedMetadata(reply,&error));
+    assert(SnapshotFoundryJobs(snaps,MAX_FOUNDRY_JOBS)==2&&snaps[0].kind==QUEUE_JOB_GAME_INSTALL&&snaps[1].kind==QUEUE_JOB_DLC_PACK&&snaps[1].titleId==0x415607E1);
+    assert(LoadInbox(&pending)&&pending[0].request==std::string(32,'3')&&pending[1].body=="{}");cJSON_Delete(reply);
+}
 static unsigned long long TestBE64(const std::string &s,size_t at)
 {return (static_cast<unsigned long long>(BE32((const unsigned char*)s.data()+at))<<32)|BE32((const unsigned char*)s.data()+at+4);}
 static void AvatarItems()
@@ -383,6 +417,6 @@ static void AvatarItems()
 }
 int main()
 {
-    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();AggregateProgress();CatalogCache();CatalogTransport();MultiDiscReplacement();PreparedInbox();AvatarItems();
+    assert(getenv("FOUNDRY_TEST_ROOT"));Transfers();PendingJob();Transactions();CacheAndSpace();AggregateProgress();CatalogCache();CatalogTransport();MultiDiscReplacement();PreparedInbox();VisiblePreparedQueue();AvatarItems();
     std::cout<<"Real client runtime: interrupted transfers, in-piece resume, lost POST/reboot idempotency, cross-server guard, GoD/Cache TU power cuts, shared-volume space and durable prepared-inbox checks passed\n";
 }

@@ -26,7 +26,7 @@ static Title ReadTitle(const cJSON *o){Title t;t.id=Text(o,"group_id");t.name=Te
 static std::vector<Title> Titles(const cJSON *array){std::vector<Title> out;for(int i=0;cJSON_IsArray(array)&&i<cJSON_GetArraySize(array)&&i<48;++i){Title t=ReadTitle(cJSON_GetArrayItem(array,i));if(FoundryHex(t.id,32)&&!t.name.empty()&&t.name.size()<=512)out.push_back(t);}return out;}
 static void Tiles(const std::vector<Title> &titles,std::vector<StoreTileView> *out){out->resize(titles.size());for(size_t i=0;i<titles.size();++i){StoreTileView &v=(*out)[i];v.titleId=titles[i].art;v.name=titles[i].name.c_str();v.letter=titles[i].letter;v.indie=false;}}
 static void Pump(){PumpCoverArt();PumpStoreArt();}
-static bool Active(){QueueJobSnapshot s;return SnapshotFoundryJobs(&s,1)&&s.state!=QUEUE_FINISHED;}
+static bool Active(){QueueJobSnapshot s;return SnapshotFoundryActiveJob(&s)&&s.state!=QUEUE_FINISHED;}
 static bool Search(std::string *query){std::string typed;if(OpenKeyboardToString(0,&typed,L"Search Foundry",L"Search your server's games and add-ons",L"")!=ERROR_SUCCESS)return false;*query=typed;ResyncUiInput();return true;}
 static bool Browse(const char *games,const char *content,const std::string &kind,char letter,const std::string &query,const std::string &forTitle=std::string(),const std::string &parent=std::string());
 
@@ -98,7 +98,7 @@ static bool Game(const Title &title,const char *games,const char *content,const 
         view.description=details.description[0]?details.description:"Choose a version or disc from your server. Artwork is a catalog hint; installation checks the actual package identity.";view.loading=state==STORE_DETAILS_LOADING;
         view.screenshots=details.screenshots;view.screenshotCount=details.screenshotCount;
         view.buttons[0]=Active()?"View active download":"Install from Foundry";view.buttons[1]="Versions / discs";view.buttons[2]=title.addon?"More DLCs for this game":"DLC / add-ons";view.buttons[3]="Download queue";
-        view.install=Active()?STORE_INSTALL_INSTALLING:STORE_INSTALL_AVAILABLE;QueueJobSnapshot snap;view.installFraction=SnapshotFoundryJobs(&snap,1)?snap.fraction:-1;
+        view.install=Active()?STORE_INSTALL_INSTALLING:STORE_INSTALL_AVAILABLE;QueueJobSnapshot snap;view.installFraction=SnapshotFoundryActiveJob(&snap)?snap.fraction:-1;
         view.versions=&versions[0];view.versionCount=(int)versions.size();view.versionChosen=chosen;view.versionsOpen=versionsOpen;view.versionFocus=versionFocus;view.versionScroll=versionScroll;view.scroll=scroll;view.focus=focus;view.focused=true;
         UiHint hints[]={{UI_BUTTON_A,L"Select",NULL},{UI_BUTTON_B,L"Back",NULL},{UI_BUTTON_Y,L"Full source name",L"Details"},{UI_BUTTON_LBRB,L"More source pages",L"Pages"}};
         RenderStoreGameFrame(view,hints,4);scroll=view.scroll;versionScroll=view.versionScroll;
@@ -245,6 +245,7 @@ bool OpenFoundryDlcUI(const char *games,const char *content,const char *name,uns
 bool OpenFoundryPreparedUI(const char *games,const char *content)
 {
     cJSON *reply=NULL;std::vector<Title> titles;std::vector<StoreTileView> tiles;std::vector<std::string> states,details;
+    std::vector<std::vector<std::string> > members,memberStates;
     bool reload=true;int selected=0,scroll=0;DWORD refreshed=0;
     for(;;)
     {
@@ -255,18 +256,25 @@ bool OpenFoundryPreparedUI(const char *games,const char *content)
             if(!FoundryStoreRequest("/inbox",&reply))return false;
             const cJSON *items=cJSON_GetObjectItemCaseSensitive(reply,"items");
             if(!cJSON_IsArray(items)||cJSON_GetArraySize(items)>32){cJSON_Delete(reply);ShowMessageUI("Prepared for Xbox","Invalid prepared list from the server",NULL);return false;}
-            titles.clear();states.clear();details.clear();
+            titles.clear();states.clear();details.clear();members.clear();memberStates.clear();
+            std::vector<unsigned> ready,done,blocked,addons,games;std::vector<unsigned long long> sizes;
             for(int i=0;i<cJSON_GetArraySize(items);++i)
             {
-                const cJSON *o=cJSON_GetArrayItem(items,i);Title t;t.id=Text(o,"id");t.name=Text(o,"name");std::string art=Text(o,"art_title_id");t.art=FoundryHex(art,8)?strtoul(art.c_str(),NULL,16):0;t.letter='*';t.addon=false;
-                if(!FoundryHex(t.id,32)||t.name.empty()||t.name.size()>512)continue;
-                unsigned long long bytes=0;FoundryDecimal(Text(o,"bytes").c_str(),&bytes);char size[48];_snprintf(size,sizeof(size),"%.2f GB",bytes/1073741824.0);size[sizeof(size)-1]=0;
-                std::string state=FoundryPreparedCompleted(t.id)?"installed locally":Text(o,"state");
+                const cJSON *o=cJSON_GetArrayItem(items,i);std::string id=Text(o,"id"),name=Text(o,"name"),group=Text(o,"group_id"),groupName=Text(o,"group_name");
+                if(!FoundryHex(id,32)||name.empty()||name.size()>512)continue;if(!FoundryHex(group,32))group=id;if(groupName.empty()||groupName.size()>512)groupName=name;
+                size_t n=0;while(n<titles.size()&&titles[n].id!=group)++n;
+                std::string art=Text(o,"art_title_id");unsigned long artId=FoundryHex(art,8)?strtoul(art.c_str(),NULL,16):0;
+                if(n==titles.size()){Title t;t.id=group;t.name=groupName;t.art=artId;t.letter='*';t.addon=false;titles.push_back(t);members.push_back(std::vector<std::string>());memberStates.push_back(std::vector<std::string>());ready.push_back(0);done.push_back(0);blocked.push_back(0);addons.push_back(0);games.push_back(0);sizes.push_back(0);}
+                if(!titles[n].art)titles[n].art=artId;
+                std::string state=FoundryPreparedCompleted(id)?"installed locally":Text(o,"state");
+                if(state=="ready"&&cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o,"wait_for_base")))state="waiting for game preparation";
                 if(state=="ready"&&cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o,"contains_avatar"))&&cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(o,"avatar_unlock"))&&!FoundryCanUnlockAvatars())state="needs compatible signed-in profile";
-                std::string detail=state+" - "+size+" - "+(Text(o,"conversion")=="console"?"convert on Xbox":"server prepared");
-                if(state=="expired"||state=="failed")detail+=" - Prepare again on the website";
-                titles.push_back(t);states.push_back(state);details.push_back(detail);
+                ready[n]+=state=="ready";done[n]+=state=="installed locally";blocked[n]+=state!="ready"&&state!="installed locally";
+                if(Text(o,"content_kind")=="game")++games[n];else ++addons[n];
+                unsigned long long bytes=0;FoundryDecimal(Text(o,"bytes").c_str(),&bytes);sizes[n]+=bytes;
+                members[n].push_back(name);memberStates[n].push_back(state);
             }
+            for(size_t i=0;i<titles.size();++i){char text[192];_snprintf(text,sizeof(text),"%u game%s + %u add-on download%s - %u ready, %u installed, %u waiting - %.2f GB",games[i],games[i]==1?"":"s",addons[i],addons[i]==1?"":"s",ready[i],done[i],blocked[i],sizes[i]/1073741824.0);text[sizeof(text)-1]=0;details.push_back(text);states.push_back(ready[i]?"ready":"waiting");}
             Tiles(titles,&tiles);if(selected>=(int)titles.size())selected=0;reload=false;refreshed=GetTickCount();
         }
         Pump();StoreLetterView view;memset(&view,0,sizeof(view));view.letter='*';view.title="Prepared for Xbox";view.section="From your Foundry website";
@@ -280,9 +288,11 @@ bool OpenFoundryPreparedUI(const char *games,const char *content)
         else if(input.pressed&XINPUT_GAMEPAD_START){if(FoundryQueuePrepared(reply,games,content)){cJSON_Delete(reply);return true;}ResyncUiInput();}
         else if((input.pressed&XINPUT_GAMEPAD_A)&&!titles.empty())
         {
-            const char *names[]={"Download this item","Download all ready","Show request details"};const char *subs[]={states[selected]=="ready"?"Adds it to the resumable download list":"Wait for ready, or prepare again on the website","Keeps an interrupted installation first",details[selected].c_str()};
+            const char *names[]={"Download this selection","Download all ready","Show included items"};const char *subs[]={states[selected]=="ready"?"Game first, then ready add-ons; each appears in Queue":"Wait for preparation, or prepare again on the website","Games first; keeps an interrupted installation first",details[selected].c_str()};
             int pick=ShowChoiceUI("Prepared for Xbox",titles[selected].name.c_str(),names,subs,3,L"Choose");
-            if(pick==2)ShowMessageUI(titles[selected].name.c_str(),details[selected].c_str(),"Server copies expire according to the date on Console activity.");
+            if(pick==2){std::vector<const char*> labels,notes;for(size_t i=0;i<members[selected].size();++i){labels.push_back(members[selected][i].c_str());notes.push_back(memberStates[selected][i].c_str());}
+                int child=ShowChoiceUI("Included prepared downloads",titles[selected].name.c_str(),labels.empty()?NULL:&labels[0],notes.empty()?NULL:&notes[0],(int)labels.size(),L"Details");
+                if(child>=0)ShowMessageUI(members[selected][child].c_str(),memberStates[selected][child].c_str(),"Only your selected sources are included. Games install before add-ons.");}
             else if((pick==0||pick==1)&&FoundryQueuePrepared(reply,games,content,pick==0?titles[selected].id:std::string())){cJSON_Delete(reply);return true;}
             ResyncUiInput();
         }

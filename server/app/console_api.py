@@ -489,7 +489,10 @@ class ConsoleService:
                 jobs.append({k: job[k] for k in ('id', 'status', 'stage', 'progress', 'message')})
         result['jobs'] = jobs
         avatars = [v for v in json.loads(artifact['manifest']).get('components', []) if v['kind']=='avatar'] if artifact else []
-        result.update(avatar_count=len(avatars),avatar_unlock=any(v.get('avatar_unlock') for v in avatars))
+        packages = json.loads(artifact['manifest']).get('components', []) if artifact else []
+        counts = {kind: sum(v['kind'] == kind for v in packages) for kind in ('god','xbla','dlc','avatar','title_update')}
+        result.update(avatar_count=len(avatars),avatar_unlock=any(v.get('avatar_unlock') for v in avatars),
+                      component_counts=counts, package_title_ids=sorted({v['title_id'] for v in packages}))
         if row['state'] in {'queued', 'waiting', 'preparing'} and jobs:
             total = max(len(releases), len(jobs))
             result['progress'] = min(99, sum(100 if j['status'] == 'complete' else max(0, min(100, j['progress'] or 0)) for j in jobs) / total)
@@ -512,8 +515,45 @@ class ConsoleService:
             view = self.admin_request_view(dict(row), None)
             items.append({k: view[k] for k in ('id','name','state','message','error_code','conversion','selection','progress','expires_at','accepted_at')})
             items[-1].update(bytes=str(view['prepared_bytes']), art_title_id=artwork.get(view['selection'].get('release_id')))
-            items[-1].update(contains_avatar=view['avatar_count']>0,avatar_unlock=view['avatar_unlock'])
+            entry = items[-1]
+            entry.update(contains_avatar=view['avatar_count']>0,avatar_unlock=view['avatar_unlock'],component_counts=view['component_counts'])
+            ids = view['package_title_ids']
+            try:
+                source = self.item(view['selection']['release_id'])
+                if not ids: ids = self.title_ids(source)
+                base = source['source_kind']=='disc' and not is_addon_source(source['name'])
+            except ConsoleError:
+                base = False
+            entry['content_kind'] = 'game' if base or any(view['component_counts'][k] for k in ('god','xbla')) else 'addon'
+            entry['title_id'] = ids[0] if len(ids)==1 and ids[0] not in {'00000000','AAAAAAAA'} else None
+            if not entry['art_title_id']: entry['art_title_id'] = entry['title_id']
+        self.group_inbox(items)
         return {'items': items, 'limit': 32, 'retention_days': self.retention // 86400}
+
+    def group_inbox(self, items):
+        """Presentation groups only; immutable requests and validation stay separate.
+
+        Attach add-ons only to an unambiguous base with the same actual Title ID.
+        Multiple base editions stay independent; their add-ons get a separate tile.
+        """
+        bases, addons = {}, {}
+        for item in items:
+            tid = item['title_id']
+            if tid:
+                (bases if item['content_kind']=='game' else addons).setdefault(tid, []).append(item)
+            item.update(group_id=item['id'],group_name=item['name'])
+        for tid, rows in addons.items():
+            candidates = bases.get(tid, [])
+            parent = candidates[0] if len(candidates)==1 else rows[0]
+            title = self.database.get_title(tid)
+            name = parent['name'] if len(candidates)==1 else (title['title_name'] if title else parent['name']) + ' · add-ons'
+            for item in rows + (candidates if len(candidates)==1 else []):
+                item.update(group_id=parent['id'],group_name=name)
+                if len(candidates)==1:
+                    item['art_title_id'] = parent['art_title_id'] or item['art_title_id']
+                    if item is not parent:
+                        item['base_request_id']=parent['id']
+                        item['wait_for_base']=parent['state']!='ready'
 
     def delete_request_files(self, rid):
         # Only prepared console snapshots are in scope. Shared library outputs,
@@ -1047,7 +1087,7 @@ def register_console_api(app, config, database, runner, remote, start_background
                        max_file_bytes=str(MAX_FILE), checksums=["sha256"], pairing=True,
                        online_title_updates=config.xboxunity_tu_downloads, store_browsing=True, dlc_multi_select=True, max_dlc_sources=32,
                        disc_multi_select=True, max_disc_sources=8, disc_set_conversion="server",
-                       prepared_inbox=True, max_inbox_items=32,avatar_items=True,avatar_min_client_version="1.0.0-alpha.11",avatar_unlock="online_xuid_on_console")
+                       prepared_inbox=True, prepared_groups=True, max_inbox_items=32,avatar_items=True,avatar_min_client_version="1.0.0-alpha.11",avatar_unlock="online_xuid_on_console")
 
     @api.post("/pairings")
     def pair():

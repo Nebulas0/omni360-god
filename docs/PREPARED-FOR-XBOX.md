@@ -38,6 +38,38 @@ signed in; [Avatar items](AVATAR-ITEMS.md) explains offline-profile limitations.
    The grid refreshes every 15 seconds, or immediately with X. LB/RB opens the
    existing server/pairing menu. Older connection-menu entries remain available.
 
+### Grouped shelf and full queue (alpha.12)
+
+The Xbox shelf shows one game tile with its selected matching add-ons. **Show
+included items** lists each source and its status. This is a presentation group:
+DLC packages still install alongside the game, and only selected sources are
+included. The server groups by actual package Title IDs, never just artwork or
+similar names. Unknown identities and multiple base-game editions stay separate;
+after the base game is installed, remaining matching add-ons form an add-on tile.
+An add-on whose prepared base request is still preparing/failed/expired waits for
+that base; use the website to finish/reprepare or remove the base selection.
+
+Choosing a tile queues its ready game and add-ons. **Download all ready** queues
+all ready selections. Games are ordered before add-ons, including when merging
+with the existing waiting list; an active/interrupted installation keeps priority
+and is never abandoned to reorder a list. DLC-only installs for games already on
+the console remain supported. Profile-incompatible Avatar unlocks stay prepared.
+
+**Queue** shows the active item first, waiting selections next, and completed
+Foundry installs at the bottom. Paused/failed jobs keep their explanation above
+waiting jobs and retain resume data. The current file counts, bytes, speed and
+ETA remain unchanged. Covers use the same artwork hints as Store; images still
+need a successful artwork fetch/cache entry. Artwork never sets install identity.
+**X** on a waiting row removes only that selection; X on the active row pauses
+it. Removing a completed row clears its display history, preserving the receipt
+that prevents an automatic duplicate install. The most recent 32 successful rows
+survive restart in the additive `history` field of `FoundryInbox.json`.
+
+Older saved lists retain their requests/partial files. The client refreshes their
+kind/artwork once before starting the waiting list, and retains existing settings
+paths and completion receipts. The live queue snapshots use a memory cache; the
+render loop does not reread JSON or perform filesystem scans every frame.
+
 The website saves unsent preparation lists and checked add-ons in that browser
 tab's session storage. Reloading the updated page restores the draft, destination,
 license choice and request keys; sent entries leave the saved draft. A tab running

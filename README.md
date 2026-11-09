@@ -6,7 +6,7 @@ packages or download an ISO archive for on-console conversion.
 
 Based on upstream **Omni360 0.13.4-beta** (`6d9c323`), with the Foundry service
 integration and the fork's own signed updater preserved. Fork version:
-**1.0.0-alpha.11**.
+**1.0.0-alpha.12**.
 
 Foundry multi-disc games select the matching edition's discs by default, with
 a checklist before installation. Play discs become GoD; supported content discs
@@ -32,7 +32,9 @@ Physical-console acceptance is still required.
 - Pair on your Foundry website at `/consoles`.
 - [Prepare games on the website while the Xbox is off](docs/PREPARED-FOR-XBOX.md),
   then use **Store → Prepared for Xbox** to download individual items or all ready
-  items. Selections survive restart; automatic downloading is optional.
+  items. Matching selected add-ons share a game tile. Queue shows every waiting,
+  active and completed item with covers, with games before add-ons. Selections
+  survive restart; automatic downloading is optional.
 - Choose server or Xbox conversion for disc games; digital content uses server
   processing. DLC and title updates are selected explicitly.
 - [Maintenance README: our changes and how to merge future official Omni360 updates](docs/MAINTAINING-THE-FOUNDRY-FORK.md)

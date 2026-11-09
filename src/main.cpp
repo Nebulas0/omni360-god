@@ -57,6 +57,7 @@ end-to-end on real hardware against a real 27-game library.
 extern "C" BOOL XexCheckExecutablePrivilege(DWORD privilege);
 extern "C" NTSTATUS XexGetModuleHandle(PSZ moduleName, PHANDLE outHandle);
 
+#include <algorithm>
 #include <xtl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2465,7 +2466,7 @@ static void WaitForExit()
 // ---------------------------------------------------------------------------
 
 // Downloads and disc installs, on one Queue page.
-#define MAX_QUEUE_ROWS (MAX_QUEUE_JOBS + MAX_DISC_JOBS + MAX_GAME_JOBS + 1)
+#define MAX_QUEUE_ROWS (MAX_QUEUE_JOBS + MAX_DISC_JOBS + MAX_GAME_JOBS + MAX_FOUNDRY_JOBS)
 
 // One tile of the Queue page's "Recently installed" row. The name is kept
 // rather than pointed at, because the job it came from is removed the
@@ -6055,9 +6056,11 @@ static void UpdateQueueRecents(Shell &shell, const QueueJobSnapshot *disc, int d
 // install and game installs still to do first, then the downloads as the
 // download queue orders them, then whatever finished without installing.
 // What installed goes to the row above them instead - see queueRecents.
+static bool QueueActiveFirst(const QueueJobSnapshot &a,const QueueJobSnapshot &b)
+{int ar=a.state==QUEUE_ACTIVE?0:a.state==QUEUE_WAITING?2:JobInstalled(a)?3:1,br=b.state==QUEUE_ACTIVE?0:b.state==QUEUE_WAITING?2:JobInstalled(b)?3:1;return ar<br;}
 static void SnapshotQueue(Shell &shell, const Library &lib)
 {
-    QueueJobSnapshot foundryJob;
+    static QueueJobSnapshot foundryJobs[MAX_FOUNDRY_JOBS];
     static QueueJobSnapshot discJobs[MAX_DISC_JOBS];
     static QueueJobSnapshot gameJobs[MAX_GAME_JOBS];
     static QueueJobSnapshot dlJobs[MAX_QUEUE_JOBS];
@@ -6091,8 +6094,9 @@ static void SnapshotQueue(Shell &shell, const Library &lib)
         if (discJobs[i].state == QUEUE_FINISHED && !JobInstalled(discJobs[i]))
             shell.queueJobs[n++] = discJobs[i];
     }
-    if (n < MAX_QUEUE_ROWS && SnapshotFoundryJobs(&foundryJob, 1))
-        shell.queueJobs[n++] = foundryJob;
+    const int foundryCount=SnapshotFoundryJobs(foundryJobs,MAX_FOUNDRY_JOBS);
+    for(int i=0;i<foundryCount&&n<MAX_QUEUE_ROWS;++i)shell.queueJobs[n++]=foundryJobs[i];
+    std::stable_sort(shell.queueJobs,shell.queueJobs+n,QueueActiveFirst);
     shell.queueCount = n;
 
     UpdateQueueRecents(shell, discJobs, discCount, gameJobs, gameCount, dlJobs, dlCount);
