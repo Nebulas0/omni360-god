@@ -356,7 +356,7 @@ static void AvatarItems()
     assert(!FoundryCanUnlockAvatars()&&!PatchAvatarForInstall(w,aid,&patched,&error));assert(Get(source)==raw);
     avatarTestXuid=0x0009000000000001ULL;assert(FoundryCanUnlockAvatars());patched=original;assert(PatchAvatarForInstall(w,aid,&patched,&error));
     assert(patched.titleId=="AAAAAAAA"&&patched.files[0].path.find("AAAAAAAA/00009000/")==0&&Get(source)==raw);
-    std::string staged=Stage(w.content,aid)+"\\files\\"+Native(patched.files[0].path),bytes=Get(staged);
+    std::string staged=w.content+"\\"+Native(patched.files[0].installSource),bytes=Get(staged);
     assert(bytes.substr(0xB000)=="AVATAR PAYLOAD"&&TestBE64(bytes,0x23C)==avatarTestXuid&&TestBE64(bytes,0x22C)==~0ULL);
     FoundryManifest m;m.id=aid;m.components.push_back(patched);assert(Commit(w,m,&error));
     std::string installed=w.content+"\\"+Native(patched.files[0].path);assert(Get(installed)==bytes);
@@ -375,6 +375,11 @@ static void AvatarItems()
     cJSON *reply=cJSON_Parse("{\"items\":[{\"id\":\"dddddddddddddddddddddddddddddddd\",\"name\":\"Avatar pack\",\"state\":\"ready\",\"contains_avatar\":true,\"avatar_unlock\":true,\"selection\":{\"release_id\":\"catalog-1\"}}]}");
     std::vector<Work> ready;avatarTestXuid=0;assert(ReadPrepared(reply,w.games.c_str(),w.content.c_str(),&ready)&&ready.empty());
     avatarTestXuid=0x0009000000000001ULL;assert(ReadPrepared(reply,w.games.c_str(),w.content.c_str(),&ready)&&ready.size()==1);cJSON_Delete(reply);
+    // Re-importing an already canonical item must also retain its raw download.
+    FoundryComponent canonical=patched;canonical.avatarUnlock=true;canonical.files[0].installSource.clear();
+    std::string canonicalSource=Stage(w.content,aid)+"\\files\\"+Native(canonical.files[0].path);Put(canonicalSource,bytes);
+    avatarTestXuid=0x0009000000000004ULL;assert(PatchAvatarForInstall(w,aid,&canonical,&error));
+    assert(Get(canonicalSource)==bytes&&Get(w.content+"\\"+Native(canonical.files[0].installSource))!=bytes);
 }
 int main()
 {

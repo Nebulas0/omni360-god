@@ -526,7 +526,7 @@ static bool PatchAvatarForInstall(const Work &w,const std::string &aid,FoundryCo
             if(AvatarOnlineXuid(x)&&std::find(xuids.begin(),xuids.end(),x)==xuids.end())xuids.push_back(x);}
         if(!AvatarPatchHeader(&header,xuids,&relative,&contentId,error)){fclose(in);return false;}
     }
-    std::string target=Stage(w.content,aid)+"\\files\\"+Native(relative),temporary=target+".tmp";
+    std::string target=Stage(w.content,aid)+"\\avatar\\"+Native(relative),temporary=target+".tmp";
     if(!Parents(target)){fclose(in);*error="Could not create Avatar staging folder";return false;}
     HANDLE out=CreateFileA(temporary.c_str(),GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);DWORD written=0;
     ok=out!=INVALID_HANDLE_VALUE&&WriteFile(out,&header[0],end,&written,NULL)&&written==end;
@@ -535,6 +535,7 @@ static bool PatchAvatarForInstall(const Work &w,const std::string &aid,FoundryCo
     if(!ok){DeleteFileA(temporary.c_str());*error="Could not stage Avatar ownership; checked downloads are kept";return false;}
     DeleteFileA(target.c_str());if(!MoveFileA(temporary.c_str(),target.c_str())){*error="Could not publish staged Avatar item";return false;}
     component->titleId="AAAAAAAA";component->contentId=contentId;component->files[0].path=relative;
+    component->files[0].installSource="_Foundry/"+aid+"/avatar/"+relative;
     return Length(target)==component->files[0].bytes&&CheckPackage(target,*component,error);
 }
 static bool SaveJournal(const Work &w,const std::string &aid,const std::vector<Move> &moves,bool committed)
@@ -631,7 +632,7 @@ static bool Commit(const Work &w,const FoundryManifest &m,std::string *error)
         {
             const std::string &rel=c.files[0].path;
             if(Exists(Root(w,root)+"\\"+Native(rel)))AddMove(&moves,root,rel,staging+"/rollback/"+rel);
-            AddMove(&moves,root,staging+"/files/"+rel,rel);
+            AddMove(&moves,root,c.files[0].installSource.empty()?staging+"/files/"+rel:c.files[0].installSource,rel);
         }
     }
     for(size_t i=0;i<moves.size();++i)

@@ -8,6 +8,8 @@
 struct FoundryFile
 {
     std::string id, root, path, role, sha256;
+    // Installer-only source override; never read from the server manifest.
+    std::string installSource;
     unsigned long long bytes;
 };
 
